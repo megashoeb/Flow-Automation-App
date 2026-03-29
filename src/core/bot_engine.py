@@ -659,6 +659,40 @@ class GoogleLabsBot:
 
         self._warmed_page_ids.add(page_marker)
 
+    def _log_session_diagnostics(self, log_callback=None):
+        if not callable(log_callback):
+            return
+        tag = f"[DEBUG:{self.account_name}]"
+        sp = os.path.abspath(str(self.session_path or ""))
+        log_callback(f"{tag} Session path: {sp}")
+        log_callback(f"{tag} Session dir exists: {os.path.isdir(sp)}")
+        if not os.path.isdir(sp):
+            return
+        top_items = sorted(os.listdir(sp))[:15]
+        log_callback(f"{tag} Session root contents: {top_items}")
+        default_dir = os.path.join(sp, "Default")
+        if not os.path.isdir(default_dir):
+            log_callback(f"{tag} Default/ dir NOT FOUND in session!")
+            return
+        default_items = sorted(os.listdir(default_dir))[:20]
+        log_callback(f"{tag} Default/ contents: {default_items}")
+        for cookie_rel in ("Default/Network/Cookies", "Default/Cookies", "Network/Cookies", "Cookies"):
+            cp = os.path.join(sp, cookie_rel)
+            if os.path.exists(cp):
+                sz = os.path.getsize(cp)
+                log_callback(f"{tag} Cookies FOUND: {cookie_rel} ({sz} bytes)")
+                break
+        else:
+            log_callback(f"{tag} Cookies NOT FOUND in any location!")
+        ls_dir = os.path.join(default_dir, "Local Storage")
+        if os.path.isdir(ls_dir):
+            log_callback(f"{tag} Local Storage: {len(os.listdir(ls_dir))} files")
+        else:
+            log_callback(f"{tag} Local Storage: NOT FOUND")
+        for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lp = os.path.join(sp, lock_name)
+            log_callback(f"{tag} {lock_name}: exists={os.path.exists(lp)}, symlink={os.path.islink(lp)}")
+
     async def initialize(self, playwright_instance, log_callback=None, fingerprint_label="Fingerprint"):
         if self.context is not None or self.browser is not None or self.chrome_process is not None or self.page is not None:
             try:
@@ -666,6 +700,7 @@ class GoogleLabsBot:
             except Exception:
                 pass
         self._cleanup_stale_profile_artifacts()
+        self._log_session_diagnostics(log_callback)
         self._prepare_session_fingerprint(log_callback, label=fingerprint_label)
         if self.browser_mode == "cloakbrowser":
             await self._initialize_cloakbrowser(playwright_instance, log_callback)

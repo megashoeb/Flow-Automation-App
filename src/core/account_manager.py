@@ -1035,6 +1035,16 @@ class AccountManager:
                     f"[{final_name}] Warning: no cookies file found after close. Login may not persist in headless mode."
                 )
             update_log_callback(f"[{final_name}] Session saved to {final_session_path}")
+            # ── Session debug diagnostics after login ──
+            if os.path.isdir(final_session_path):
+                top_items = sorted(os.listdir(final_session_path))[:15]
+                update_log_callback(f"[DEBUG:{final_name}] Session root contents: {top_items}")
+                default_dir = os.path.join(final_session_path, "Default")
+                if os.path.isdir(default_dir):
+                    default_items = sorted(os.listdir(default_dir))[:20]
+                    update_log_callback(f"[DEBUG:{final_name}] Default/ contents: {default_items}")
+                else:
+                    update_log_callback(f"[DEBUG:{final_name}] Default/ dir NOT FOUND after login!")
         if callable(session_saved_callback):
             session_saved_callback(final_name, final_session_path, detected_email or "")
         if not (callable(should_stop) and should_stop()):
