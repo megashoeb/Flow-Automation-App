@@ -284,3 +284,34 @@ class ProcessTracker:
 
 
 process_tracker = ProcessTracker()
+
+
+def cleanup_session_locks(session_path):
+    """
+    Delete Chrome/Chromium lock files from a session directory.
+    These stale files prevent new browser instances from accessing the profile.
+    Safe to delete — Chrome recreates them on every launch.
+
+    On macOS, SingletonLock is often a symlink; os.path.exists() returns False
+    for broken symlinks, so os.path.lexists() is used to catch both cases.
+    """
+    if not session_path or not os.path.isdir(session_path):
+        return 0
+
+    lock_rel_paths = (
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        "lockfile",
+        os.path.join("Default", "LOCK"),
+    )
+    deleted = 0
+    for rel in lock_rel_paths:
+        target = os.path.join(session_path, rel)
+        try:
+            if os.path.lexists(target):
+                os.remove(target)
+                deleted += 1
+        except Exception:
+            pass
+    return deleted

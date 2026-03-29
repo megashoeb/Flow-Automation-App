@@ -25,7 +25,7 @@ from src.db.db_manager import (
 )
 from src.core.bot_engine import GoogleLabsBot
 from src.core.cookie_warmup import light_cookie_warmup
-from src.core.process_tracker import process_tracker
+from src.core.process_tracker import process_tracker, cleanup_session_locks
 
 
 class QueueSignals(QObject):
@@ -583,6 +583,9 @@ class AsyncQueueManager(QThread):
         if not base_session_path or not os.path.isdir(base_session_path):
             raise RuntimeError(f"base session path missing: {base_session_path}")
 
+        # Clean source locks before cloning (Mac symlinks would copy as broken links).
+        cleanup_session_locks(base_session_path)
+
         os.makedirs(self.session_clone_root, exist_ok=True)
         safe_name = self._sanitize_account_name(account_name)
         clone_path = os.path.join(
@@ -592,19 +595,8 @@ class AsyncQueueManager(QThread):
         os.makedirs(clone_path, exist_ok=False)
         copied_count, skipped_files = self._copy_session_tree_best_effort(base_session_path, clone_path)
 
-        stale_locks = (
-            "SingletonLock",
-            "SingletonCookie",
-            "SingletonSocket",
-            os.path.join("Default", "LOCK"),
-        )
-        for rel_path in stale_locks:
-            target = os.path.join(clone_path, rel_path)
-            if os.path.exists(target):
-                try:
-                    os.remove(target)
-                except Exception:
-                    pass
+        # Clean destination locks (handles Mac symlinks via lexists).
+        cleanup_session_locks(clone_path)
 
         return clone_path, copied_count, skipped_files
 

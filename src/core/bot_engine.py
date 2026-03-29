@@ -25,7 +25,7 @@ from src.core.cloakbrowser_support import (
     load_cloakbrowser_api,
 )
 from src.core.fingerprint_generator import FingerprintGenerator
-from src.core.process_tracker import process_tracker
+from src.core.process_tracker import process_tracker, cleanup_session_locks
 from src.db.db_manager import get_output_directory, get_setting, update_job_runtime_state
 
 
@@ -334,21 +334,16 @@ class GoogleLabsBot:
         if not profile_dir or not os.path.isdir(profile_dir):
             return
 
-        stale_rel_paths = (
-            "SingletonLock",
-            "SingletonCookie",
-            "SingletonSocket",
-            "DevToolsActivePort",
-            "RunningChromeVersion",
-            os.path.join("Default", "LOCK"),
-        )
-        for rel in stale_rel_paths:
+        # Clean lock files (handles Mac symlinks via os.path.lexists).
+        cleanup_session_locks(profile_dir)
+
+        # Also remove stale Chrome runtime markers.
+        for rel in ("DevToolsActivePort", "RunningChromeVersion"):
             target = os.path.join(profile_dir, rel)
             try:
                 if os.path.lexists(target):
                     os.remove(target)
             except Exception:
-                # Ignore if actual live process still owns lock/socket.
                 pass
 
     def _build_proxy_config(self):

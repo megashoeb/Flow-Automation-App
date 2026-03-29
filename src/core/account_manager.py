@@ -21,7 +21,7 @@ from src.core.cloakbrowser_support import (
 )
 from src.core.cloak_downloader import download_cloakbrowser_with_progress
 from src.core.cookie_warmup import heavy_cookie_warmup
-from src.core.process_tracker import process_tracker
+from src.core.process_tracker import process_tracker, cleanup_session_locks
 from src.db.db_manager import get_account_flag, get_bool_setting, get_setting, set_account_flag
 
 try:
@@ -690,6 +690,9 @@ class AccountManager:
             if context_flushed:
                 logger(f"[{account_label}] Warm-up browser closed. Cookies updated.")
             AccountManager._unregister_context_process(context)
+            locks = cleanup_session_locks(session_path)
+            if locks and callable(update_log_callback):
+                update_log_callback(f"[{account_label}] Cleaned {locks} lock file(s) after warmup.")
 
             if chrome_process is not None and chrome_process.poll() is None:
                 try:
@@ -987,6 +990,9 @@ class AccountManager:
                     except Exception:
                         pass
                 process_tracker.unregister(getattr(chrome_process, "pid", None))
+                locks = cleanup_session_locks(session_dir)
+                if locks and callable(update_log_callback):
+                    update_log_callback(f"[{temp_name}] Cleaned {locks} lock file(s) from session.")
 
         final_name = str(detected_email or account_hint or temp_name).strip()
         final_name = final_name or temp_name
