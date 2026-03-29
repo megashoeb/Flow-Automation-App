@@ -1,0 +1,39 @@
+# ─── Build artifacts ───
+dist/
+build/
+*.spec.bak
+
+# ─── Playwright bundled browsers (~2GB+) ───
+playwright-browsers/
+playwright-browsers.tar.gz
+
+# ─── Runtime data (sessions, cookies, DB) ───
+data/
+outputs/
+
+# ─── Python cache ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+
+# ─── Virtual environment ───
+venv/
+.venv/
+env/
+
+# ─── OS junk ───
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── IDE ───
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Claude Code ───
+.claude/

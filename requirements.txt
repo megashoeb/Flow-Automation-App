@@ -1,0 +1,7 @@
+PySide6==6.10.2
+playwright==1.58.0
+playwright-stealth
+fake-useragent==2.2.0
+cloakbrowser>=0.3.18
+requests>=2.31.0
+pyinstaller>=6.0
