@@ -826,13 +826,29 @@ class GoogleLabsBot:
         headless = self.cloak_display == "headless"
         seed = self._build_cloak_fingerprint_seed()
         cloak_args = self._build_cloak_launch_args(seed)
+        is_mac = platform.system() == "Darwin"
+
+        # Mac hybrid: CloakBrowser uses a fresh profile dir, NOT Real Chrome's session.
+        # Real Chrome's session has Chrome-specific files that confuse CloakBrowser.
+        # Cookies are transferred via exported_cookies.json instead.
+        if is_mac:
+            cloak_profile = os.path.abspath(str(self.session_path or "")) + "_cloak"
+            os.makedirs(cloak_profile, exist_ok=True)
+            cleanup_session_locks(cloak_profile)
+        else:
+            cloak_profile = self.session_path
+
         if callable(log_callback):
-            log_callback(f"[{self.account_name}] CloakBrowser mode (seed={seed}, headless={headless}, args={cloak_args})")
+            mode_label = "Mac hybrid (fresh profile + cookie import)" if is_mac else "standard"
+            log_callback(
+                f"[{self.account_name}] CloakBrowser mode: {mode_label} "
+                f"(seed={seed}, headless={headless}, profile={cloak_profile})"
+            )
 
         last_error = None
         try:
             self.context = await cloak_persistent_async(
-                self.session_path,
+                cloak_profile,
                 headless=headless,
                 args=cloak_args,
                 proxy=(self.proxy or None),

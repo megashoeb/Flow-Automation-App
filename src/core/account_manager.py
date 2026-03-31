@@ -537,6 +537,10 @@ class AccountManager:
         browser_mode = str(forced_browser_mode or get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
         if browser_mode == "playwright":
             browser_mode = "visible"
+        # Mac hybrid: force Real Chrome for warmup — same as login, cookies save reliably.
+        if browser_mode == "cloakbrowser" and platform.system() == "Darwin":
+            logger(f"[{account_label}] Mac hybrid mode: using Real Chrome for warmup.")
+            browser_mode = "real_chrome"
         cloak_display = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
 
         logger(f"[{account_label}] Starting cookie warm-up (one-time)...")
@@ -772,6 +776,16 @@ class AccountManager:
             context_closed_cleanly = False
             try:
                 browser_mode = str(get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
+                # Mac hybrid: force Real Chrome for login — CloakBrowser can't persist sessions on macOS.
+                # Generation will still use CloakBrowser with imported cookies.
+                if browser_mode == "cloakbrowser" and platform.system() == "Darwin":
+                    if update_log_callback:
+                        update_log_callback(
+                            f"[{account_hint or temp_name}] Mac hybrid mode: "
+                            "using Real Chrome for login (better session persistence). "
+                            "CloakBrowser will be used for generation."
+                        )
+                    browser_mode = "real_chrome"
                 if browser_mode == "cloakbrowser":
                     cloak_api = load_cloakbrowser_api()
                     cloak_persistent_async = cloak_api.get("persistent_async")
