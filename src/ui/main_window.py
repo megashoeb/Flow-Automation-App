@@ -152,34 +152,20 @@ class LoginCheckWorker(QThread):
 
 
 class CleanupThread(QThread):
+    """Kept for backward compat but no longer used by closeEvent."""
     def __init__(self, queue_manager, parent=None):
         super().__init__(parent)
         self.queue_manager = queue_manager
 
     def run(self):
-        import time
-
         try:
             if self.queue_manager and self.queue_manager.isRunning():
                 try:
                     self.queue_manager.stop()
                 except Exception:
                     pass
-                try:
-                    self.queue_manager.wait(2000)
-                except Exception:
-                    pass
-                try:
-                    if self.queue_manager.isRunning():
-                        self.queue_manager.force_stop()
-                        self.queue_manager.wait(2000)
-                except Exception:
-                    pass
         except Exception:
             pass
-
-        time.sleep(2)
-
         try:
             process_tracker.kill_all()
         except Exception:
@@ -7717,62 +7703,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_cleanup_done(self):
-        try:
-            QApplication.quit()
-        except Exception:
-            self._force_quit()
-
-    def _force_quit(self):
+    def closeEvent(self, event):
+        """Immediate exit — kill browsers, force terminate. No crash dialog."""
+        event.accept()
         try:
             process_tracker.kill_all()
         except Exception:
             pass
-        # os._exit bypasses Python cleanup — prevents Mac "quit unexpectedly" crash dialog.
-        # sys.exit() raises SystemExit which Qt catches and re-throws on macOS.
         os._exit(0)
-
-    def closeEvent(self, event):
-        if self._cleanup_started:
-            event.accept()
-            return
-
-        self._cleanup_started = True
-        self._app_closing = True
-
-        # Hide window IMMEDIATELY — user sees instant close.
-        self.hide()
-        self.setEnabled(False)
-
-        # Stop all timers.
-        self.account_runtime_timer.stop()
-        for timer_name in (
-            "account_status_timer", "live_refresh_timer", "queue_snapshot_timer",
-            "failed_jobs_refresh_timer", "progress_timer",
-        ):
-            timer = getattr(self, timer_name, None)
-            if timer is not None:
-                timer.stop()
-        for updater_name in ("table_updater", "stats_updater"):
-            updater = getattr(self, updater_name, None)
-            if updater is not None and hasattr(updater, "timer"):
-                updater.timer.stop()
-
-        # Shutdown stray worker threads quickly.
-        for worker_name in ("login_check_worker", "login_worker", "relogin_worker", "bulk_queue_add_worker"):
-            worker = getattr(self, worker_name, None)
-            self._shutdown_worker_thread(worker, timeout_ms=500)
-            setattr(self, worker_name, None)
-
-        # Background cleanup — kills queue + browsers.
-        self._cleanup_thread = CleanupThread(self.queue_manager, self)
-        self._cleanup_thread.finished.connect(self._on_cleanup_done)
-        self._cleanup_thread.start()
-
-        # Force exit after 3 seconds — guaranteed no hang, no crash dialog.
-        QTimer.singleShot(3000, self._force_quit)
-
-        event.accept()
 
     def _kill_zombie_browsers(self, startup=False):
         try:
