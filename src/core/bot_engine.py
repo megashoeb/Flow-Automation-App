@@ -318,6 +318,20 @@ class GoogleLabsBot:
         seed_base = str(self.account_name or "slot").strip() or "slot"
         return int(hashlib.md5(seed_base.encode("utf-8")).hexdigest()[:8], 16) % 99999
 
+    @staticmethod
+    def _build_cloak_launch_args(seed):
+        """Build CloakBrowser launch args with Mac-specific compatibility fixes."""
+        args = [f"--fingerprint={seed}"]
+        if platform.system() == "Darwin":
+            args.extend([
+                "--disable-http2",
+                "--fingerprint-storage-quota=5000",
+                "--fingerprint-platform=windows",
+                "--fingerprint-gpu-vendor=NVIDIA Corporation",
+                "--fingerprint-gpu-renderer=NVIDIA GeForce RTX 3070",
+            ])
+        return args
+
     async def _goto_flow_page(self, page=None, target_url=None, wait_until="domcontentloaded", timeout=None):
         active_page = page or self.page
         if active_page is None:
@@ -811,15 +825,16 @@ class GoogleLabsBot:
 
         headless = self.cloak_display == "headless"
         seed = self._build_cloak_fingerprint_seed()
+        cloak_args = self._build_cloak_launch_args(seed)
         if callable(log_callback):
-            log_callback(f"[{self.account_name}] CloakBrowser mode (seed={seed}, headless={headless})")
+            log_callback(f"[{self.account_name}] CloakBrowser mode (seed={seed}, headless={headless}, args={cloak_args})")
 
         last_error = None
         try:
             self.context = await cloak_persistent_async(
                 self.session_path,
                 headless=headless,
-                args=[f"--fingerprint={seed}"],
+                args=cloak_args,
                 proxy=(self.proxy or None),
                 humanize=True,
             )

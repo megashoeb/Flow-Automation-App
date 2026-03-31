@@ -95,6 +95,20 @@ class AccountManager:
         return {"server": proxy_text}
 
     @staticmethod
+    def _build_cloak_launch_args(seed):
+        """Build CloakBrowser launch args with Mac-specific compatibility fixes."""
+        args = [f"--fingerprint={seed}"]
+        if platform.system() == "Darwin":
+            args.extend([
+                "--disable-http2",
+                "--fingerprint-storage-quota=5000",
+                "--fingerprint-platform=windows",
+                "--fingerprint-gpu-vendor=NVIDIA Corporation",
+                "--fingerprint-gpu-renderer=NVIDIA GeForce RTX 3070",
+            ])
+        return args
+
+    @staticmethod
     def _persistent_context_launch_options(headless, proxy_value=None):
         launch_options = {
             "headless": bool(headless),
@@ -555,9 +569,15 @@ class AccountManager:
                             await loop.run_in_executor(None, cloak_ensure_binary)
                             logger(f"[{account_label}] CloakBrowser binary ready!")
 
+                        import hashlib as _hashlib
+                        _seed_base = str(account_label or "slot").strip() or "slot"
+                        _seed = int(_hashlib.md5(_seed_base.encode("utf-8")).hexdigest()[:8], 16) % 99999
+                        _cloak_args = AccountManager._build_cloak_launch_args(_seed)
+                        logger(f"[{account_label}] CloakBrowser warmup (seed={_seed}, args={_cloak_args})")
                         context = await cloak_persistent_async(
                             session_path,
                             headless=headless,
+                            args=_cloak_args,
                             proxy=(str(proxy or "").strip() or None),
                             humanize=True,
                         )
@@ -800,9 +820,16 @@ class AccountManager:
                                 update_log_callback(f"[{account_hint or temp_name}] CloakBrowser binary ready!")
 
                         if browser_mode == "cloakbrowser":
+                            import hashlib as _hashlib
+                            _seed_base = str(account_hint or temp_name or "slot").strip() or "slot"
+                            _seed = int(_hashlib.md5(_seed_base.encode("utf-8")).hexdigest()[:8], 16) % 99999
+                            _cloak_args = AccountManager._build_cloak_launch_args(_seed)
+                            if update_log_callback:
+                                update_log_callback(f"[{account_hint or temp_name}] CloakBrowser login (seed={_seed}, args={_cloak_args})")
                             context = await cloak_persistent_async(
                                 session_dir,
                                 headless=False,
+                                args=_cloak_args,
                                 proxy=(str(proxy or "").strip() or None),
                                 humanize=True,
                             )
