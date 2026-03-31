@@ -678,6 +678,18 @@ class AccountManager:
             if callable(warmup_complete_callback):
                 warmup_complete_callback(account_label, False, "Warm-up failed")
         finally:
+            # Export cookies BEFORE closing context (essential for Mac CloakBrowser).
+            try:
+                if context is not None:
+                    cookies = await AccountManager._maybe_await(context.cookies())
+                    if cookies:
+                        import json as _json
+                        cookies_path = os.path.join(session_path, "exported_cookies.json")
+                        with open(cookies_path, "w", encoding="utf-8") as _f:
+                            _json.dump(cookies, _f)
+                        logger(f"[{account_label}] Exported {len(cookies)} cookies to JSON after warmup.")
+            except Exception as cookie_export_exc:
+                logger(f"[{account_label}] Cookie export warning: {str(cookie_export_exc)[:80]}")
             context_flushed = False
             try:
                 if context is not None:
@@ -975,6 +987,20 @@ class AccountManager:
                 except Exception:
                     pass
             finally:
+                # Export cookies BEFORE closing context (essential for Mac CloakBrowser).
+                try:
+                    if context is not None:
+                        cookies = await AccountManager._maybe_await(context.cookies())
+                        if cookies:
+                            import json as _json
+                            cookies_path = os.path.join(session_dir, "exported_cookies.json")
+                            with open(cookies_path, "w", encoding="utf-8") as _f:
+                                _json.dump(cookies, _f)
+                            if update_log_callback:
+                                update_log_callback(f"[{temp_name}] Exported {len(cookies)} cookies to JSON.")
+                except Exception as cookie_export_exc:
+                    if update_log_callback:
+                        update_log_callback(f"[{temp_name}] Cookie export warning: {str(cookie_export_exc)[:80]}")
                 try:
                     if context is not None:
                         await AccountManager._close_context_and_flush(context, flush_delay=2)

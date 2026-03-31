@@ -693,6 +693,50 @@ class GoogleLabsBot:
             lp = os.path.join(sp, lock_name)
             log_callback(f"{tag} {lock_name}: exists={os.path.exists(lp)}, symlink={os.path.islink(lp)}")
 
+    EXPORTED_COOKIES_FILENAME = "exported_cookies.json"
+
+    async def _import_exported_cookies(self, log_callback=None):
+        """Import cookies from exported_cookies.json into the live browser context."""
+        if not self.context:
+            return 0
+        cookies_json = os.path.join(os.path.abspath(str(self.session_path or "")), self.EXPORTED_COOKIES_FILENAME)
+        if not os.path.exists(cookies_json):
+            return 0
+        try:
+            import json as _json
+            with open(cookies_json, "r", encoding="utf-8") as f:
+                cookies = _json.load(f)
+            if not cookies or not isinstance(cookies, list):
+                return 0
+            await self._maybe_await(self.context.add_cookies(cookies))
+            if callable(log_callback):
+                log_callback(f"[{self.account_name}] Imported {len(cookies)} cookies from exported_cookies.json.")
+            return len(cookies)
+        except Exception as exc:
+            if callable(log_callback):
+                log_callback(f"[{self.account_name}] Cookie import warning: {str(exc)[:80]}")
+            return 0
+
+    async def _export_cookies_to_json(self, log_callback=None):
+        """Export cookies from the live browser context to exported_cookies.json."""
+        if not self.context:
+            return 0
+        try:
+            cookies = await self._maybe_await(self.context.cookies())
+            if not cookies:
+                return 0
+            import json as _json
+            cookies_json = os.path.join(os.path.abspath(str(self.session_path or "")), self.EXPORTED_COOKIES_FILENAME)
+            with open(cookies_json, "w", encoding="utf-8") as f:
+                _json.dump(cookies, f)
+            if callable(log_callback):
+                log_callback(f"[{self.account_name}] Exported {len(cookies)} cookies to JSON.")
+            return len(cookies)
+        except Exception as exc:
+            if callable(log_callback):
+                log_callback(f"[{self.account_name}] Cookie export warning: {str(exc)[:80]}")
+            return 0
+
     async def initialize(self, playwright_instance, log_callback=None, fingerprint_label="Fingerprint"):
         if self.context is not None or self.browser is not None or self.chrome_process is not None or self.page is not None:
             try:
@@ -727,6 +771,7 @@ class GoogleLabsBot:
         await self._apply_browser_overrides(self.page, log_callback)
         await self._apply_fingerprint(self.page, log_callback)
         await self._apply_stealth_to_page(self.page, log_callback)
+        await self._import_exported_cookies(log_callback)
         await self._emit_launch_debug(self.page, browser_path, log_callback)
 
     async def _initialize_cloakbrowser(self, playwright_instance, log_callback=None):
@@ -786,6 +831,7 @@ class GoogleLabsBot:
             await self._apply_fingerprint(self.page, log_callback)
             await self._apply_stealth_to_page(self.page, log_callback)
             await self._emit_launch_debug(self.page, "cloakbrowser", log_callback)
+            await self._import_exported_cookies(log_callback)
             if callable(log_callback):
                 log_callback(f"[{self.account_name}] CloakBrowser ready! Score expected: 0.9")
             return
@@ -859,6 +905,7 @@ class GoogleLabsBot:
         await self._apply_browser_overrides(self.page, log_callback)
         await self._apply_fingerprint(self.page, log_callback)
         await self._apply_stealth_to_page(self.page, log_callback)
+        await self._import_exported_cookies(log_callback)
         await self._emit_launch_debug(self.page, chrome_path, log_callback)
 
     async def is_session_alive(self):
@@ -963,6 +1010,7 @@ class GoogleLabsBot:
                 await self._goto_flow_page(wait_until="domcontentloaded", timeout=30000)
             await self._apply_stealth_to_page(self.page, log_callback)
             self._warmed_page_ids.discard(id(self.page))
+            await self._export_cookies_to_json(log_callback)
             await asyncio.sleep(2)
             return True
         except Exception as refresh_error:
