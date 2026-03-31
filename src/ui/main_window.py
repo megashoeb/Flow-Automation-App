@@ -7718,14 +7718,19 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_cleanup_done(self):
-        QApplication.quit()
+        try:
+            QApplication.quit()
+        except Exception:
+            self._force_quit()
 
     def _force_quit(self):
         try:
             process_tracker.kill_all()
         except Exception:
             pass
-        sys.exit(0)
+        # os._exit bypasses Python cleanup — prevents Mac "quit unexpectedly" crash dialog.
+        # sys.exit() raises SystemExit which Qt catches and re-throws on macOS.
+        os._exit(0)
 
     def closeEvent(self, event):
         if self._cleanup_started:
@@ -7734,38 +7739,40 @@ class MainWindow(QMainWindow):
 
         self._cleanup_started = True
         self._app_closing = True
-        self.setWindowTitle("G-Labs Automation Studio - Closing...")
-        self.setEnabled(False)
-        self.account_runtime_timer.stop()
-        if hasattr(self, "account_status_timer"):
-            self.account_status_timer.stop()
-        if hasattr(self, "live_refresh_timer"):
-            self.live_refresh_timer.stop()
-        if hasattr(self, "queue_snapshot_timer"):
-            self.queue_snapshot_timer.stop()
-        if hasattr(self, "failed_jobs_refresh_timer"):
-            self.failed_jobs_refresh_timer.stop()
-        if hasattr(self, "progress_timer"):
-            self.progress_timer.stop()
-        if hasattr(self, "table_updater"):
-            self.table_updater.timer.stop()
-        if hasattr(self, "stats_updater"):
-            self.stats_updater.timer.stop()
 
+        # Hide window IMMEDIATELY — user sees instant close.
+        self.hide()
+        self.setEnabled(False)
+
+        # Stop all timers.
+        self.account_runtime_timer.stop()
+        for timer_name in (
+            "account_status_timer", "live_refresh_timer", "queue_snapshot_timer",
+            "failed_jobs_refresh_timer", "progress_timer",
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+        for updater_name in ("table_updater", "stats_updater"):
+            updater = getattr(self, updater_name, None)
+            if updater is not None and hasattr(updater, "timer"):
+                updater.timer.stop()
+
+        # Shutdown stray worker threads quickly.
         for worker_name in ("login_check_worker", "login_worker", "relogin_worker", "bulk_queue_add_worker"):
             worker = getattr(self, worker_name, None)
             self._shutdown_worker_thread(worker, timeout_ms=500)
             setattr(self, worker_name, None)
 
-        if self.queue_manager and self.queue_manager.isRunning():
-            self._set_queue_controls_state("stopping")
-
+        # Background cleanup — kills queue + browsers.
         self._cleanup_thread = CleanupThread(self.queue_manager, self)
         self._cleanup_thread.finished.connect(self._on_cleanup_done)
         self._cleanup_thread.start()
-        QTimer.singleShot(5000, self._force_quit)
-        self.hide()
-        event.ignore()
+
+        # Force exit after 3 seconds — guaranteed no hang, no crash dialog.
+        QTimer.singleShot(3000, self._force_quit)
+
+        event.accept()
 
     def _kill_zombie_browsers(self, startup=False):
         try:
