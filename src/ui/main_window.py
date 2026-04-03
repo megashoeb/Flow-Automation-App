@@ -2533,10 +2533,10 @@ class MainWindow(QMainWindow):
         ], current_data="Imagen 4")
         self.img_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
-            ("Portrait (9:16)", "Portrait (9:16)"),
+            ("Standard (4:3)", "Standard (4:3)"),
             ("Square (1:1)", "Square (1:1)"),
-            ("Landscape (4:3)", "4:3"),
-            ("Portrait (3:4)", "3:4"),
+            ("Portrait (3:4)", "Portrait (3:4)"),
+            ("Tall Portrait (9:16)", "Tall Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.img_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
         self.img_cmb_parallel = self._create_parallel_combo(saved_slots)
@@ -2596,6 +2596,7 @@ class MainWindow(QMainWindow):
         ], current_data="Veo 3.1 - Fast")
         self.t2v_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
+            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.t2v_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
@@ -2642,6 +2643,7 @@ class MainWindow(QMainWindow):
         ], current_data="Veo 3.1 - Fast")
         self.ref_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
+            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.ref_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
@@ -2705,6 +2707,7 @@ class MainWindow(QMainWindow):
         ], current_data="Veo 3.1 - Fast")
         self.frm_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
+            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.frm_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
@@ -2780,10 +2783,10 @@ class MainWindow(QMainWindow):
         ], current_data="Imagen 4")
         self.pipe_cmb_img_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
-            ("Portrait (9:16)", "Portrait (9:16)"),
+            ("Standard (4:3)", "Standard (4:3)"),
             ("Square (1:1)", "Square (1:1)"),
-            ("Landscape (4:3)", "4:3"),
-            ("Portrait (3:4)", "3:4"),
+            ("Portrait (3:4)", "Portrait (3:4)"),
+            ("Tall Portrait (9:16)", "Tall Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         form1.addRow(self._make_setting_label("Image Model:"), self.pipe_cmb_img_model)
         form1.addRow(self._make_setting_label("Image Ratio:"), self.pipe_cmb_img_ratio)
@@ -2836,6 +2839,7 @@ class MainWindow(QMainWindow):
 
         self.pipe_cmb_vid_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
+            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
 

@@ -2026,9 +2026,9 @@ class GoogleLabsBot:
 
         lower = raw.lower()
         if "4:3" in lower:
-            return "IMAGE_ASPECT_RATIO_FOUR_THREE"
+            return "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"
         if "3:4" in lower:
-            return "IMAGE_ASPECT_RATIO_THREE_FOUR"
+            return "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"
         if "portrait" in lower or "9:16" in lower:
             return "IMAGE_ASPECT_RATIO_PORTRAIT"
         if "square" in lower or "1:1" in lower:
