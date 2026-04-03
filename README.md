@@ -41,9 +41,10 @@ Distributable source package for building the desktop app on macOS and Windows.
 4. M-series Macs produce an `arm64` app build; Intel Macs produce an `x86_64` app build.
 
 ### Windows
-1. Open Command Prompt in this folder.
+1. Open Terminal (PowerShell or Command Prompt) in this folder.
 2. Run:
-   - `build_windows.bat`
+   - PowerShell: `.\build_windows.bat`
+   - Command Prompt: `build_windows.bat`
 3. Output is created under `dist\`.
 
 ## Packaging Notes
