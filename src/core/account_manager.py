@@ -1005,6 +1005,7 @@ class AccountManager:
 
                 await AccountManager._goto_flow_page(page)
 
+                cookies_exported_early = False
                 try:
                     # Wait for the user to close the browser manually, or for app shutdown.
                     while True:
@@ -1022,26 +1023,44 @@ class AccountManager:
                                 detected_email = maybe_email
                                 if update_log_callback:
                                     update_log_callback(f"[AUTO] Detected logged-in Google account: {detected_email}")
+                        # Export cookies as soon as login is detected, WHILE browser is still alive.
+                        # The finally block export often fails because user closes browser first.
+                        if detected_email and not cookies_exported_early and context is not None:
+                            try:
+                                live_cookies = await AccountManager._maybe_await(context.cookies())
+                                if live_cookies:
+                                    import json as _json
+                                    _cookies_path = os.path.join(session_dir, "exported_cookies.json")
+                                    with open(_cookies_path, "w", encoding="utf-8") as _f:
+                                        _json.dump(live_cookies, _f)
+                                    cookies_exported_early = True
+                                    if update_log_callback:
+                                        update_log_callback(f"[{detected_email}] Exported {len(live_cookies)} cookies to JSON (live).")
+                            except Exception:
+                                pass
                         if chrome_process is not None and chrome_process.poll() is not None:
                             break
                         await asyncio.sleep(1)
                 except Exception:
                     pass
             finally:
-                # Export cookies BEFORE closing context (essential for Mac CloakBrowser).
-                try:
-                    if context is not None:
-                        cookies = await AccountManager._maybe_await(context.cookies())
-                        if cookies:
-                            import json as _json
-                            cookies_path = os.path.join(session_dir, "exported_cookies.json")
-                            with open(cookies_path, "w", encoding="utf-8") as _f:
-                                _json.dump(cookies, _f)
-                            if update_log_callback:
-                                update_log_callback(f"[{temp_name}] Exported {len(cookies)} cookies to JSON.")
-                except Exception as cookie_export_exc:
-                    if update_log_callback:
-                        update_log_callback(f"[{temp_name}] Cookie export warning: {str(cookie_export_exc)[:80]}")
+                # Try fallback cookie export if early export didn't happen
+                # (e.g. user closed browser before login was detected).
+                if not cookies_exported_early:
+                    try:
+                        if context is not None:
+                            cookies = await AccountManager._maybe_await(context.cookies())
+                            if cookies:
+                                import json as _json
+                                cookies_path = os.path.join(session_dir, "exported_cookies.json")
+                                with open(cookies_path, "w", encoding="utf-8") as _f:
+                                    _json.dump(cookies, _f)
+                                cookies_exported_early = True
+                                if update_log_callback:
+                                    update_log_callback(f"[{temp_name}] Exported {len(cookies)} cookies to JSON (finally).")
+                    except Exception as cookie_export_exc:
+                        if update_log_callback:
+                            update_log_callback(f"[{temp_name}] Cookie export skipped (browser already closed): {str(cookie_export_exc)[:60]}")
                 try:
                     if context is not None:
                         await AccountManager._close_context_and_flush(context, flush_delay=2)
