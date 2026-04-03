@@ -60,14 +60,18 @@ class GoogleLabsBot:
     }
     VIDEO_MODEL_KEYS = {
         ("text_to_video", "fast"): "veo_3_1_t2v_fast_ultra",
+        ("text_to_video", "lite"): "veo_3_1_t2v_lite",
         ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_ultra_relaxed",
         ("text_to_video", "quality"): "veo_3_1_t2v",
         ("ingredients", "fast"): "veo_3_1_r2v_fast_landscape_ultra",
+        ("ingredients", "lite"): "veo_3_1_r2v_fast_landscape_ultra",
         ("ingredients", "lower_pri"): "veo_3_1_r2v_fast_landscape_ultra_relaxed",
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
+        ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
         ("frames_start", "quality"): "veo_3_1_i2v_s",
         ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_ultra_fl",
+        ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_ultra_fl",
         ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
         ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
     }
@@ -2052,6 +2056,8 @@ class GoogleLabsBot:
         source = str(video_model or model or "").strip().lower()
         if not source:
             return "fast"
+        if "lite" in source:
+            return "lite"
         if "lower pri" in source or "lower priority" in source or "relaxed" in source:
             return "lower_pri"
         if "quality" in source:
