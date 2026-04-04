@@ -754,43 +754,78 @@ class AccountManager:
     ))
 
     @staticmethod
+    def _format_raw_cookies(raw_cookies):
+        """Convert raw CDP/Playwright cookie dicts to a uniform export format."""
+        formatted = []
+        for c in raw_cookies:
+            cookie = {
+                "name": c.get("name", ""),
+                "value": c.get("value", ""),
+                "domain": c.get("domain", ""),
+                "path": c.get("path", "/"),
+                "secure": c.get("secure", False),
+                "httpOnly": c.get("httpOnly", False),
+                "sameSite": c.get("sameSite", "None"),
+            }
+            if c.get("expires", -1) > 0:
+                cookie["expires"] = c["expires"]
+            formatted.append(cookie)
+        return formatted
+
+    @staticmethod
+    async def _cdp_get_all_cookies(context, logger=None, label=""):
+        """
+        Use Network.getAllCookies CDP command to get ALL cookies from the
+        entire browser — not just cookies for visited pages.
+        Falls back to context.cookies() if CDP session fails.
+        """
+        # Try CDP Network.getAllCookies first (gets ALL browser cookies)
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+            page = pages[0] if pages else await AccountManager._maybe_await(context.new_page())
+            cdp_session = await page.context.new_cdp_session(page)
+            result = await cdp_session.send("Network.getAllCookies")
+            raw = result.get("cookies", [])
+            await cdp_session.detach()
+            if raw:
+                if logger:
+                    logger(f"[{label}] CDP getAllCookies: {len(raw)} cookies found.")
+                return raw
+        except Exception as e:
+            if logger:
+                logger(f"[{label}] CDP getAllCookies failed: {str(e)[:60]}, falling back to context.cookies()")
+
+        # Fallback: context.cookies() (only returns visited-page cookies)
+        raw = await AccountManager._maybe_await(context.cookies())
+        return raw or []
+
+    @staticmethod
     async def _export_cookies_method1_cdp(context, session_dir, label, logger=None):
         """
-        Method 1 (BEST): Export cookies via CDP context.cookies().
-        Bypasses SQLite encryption — cookies are already decrypted in memory.
+        Method 1 (BEST): Export ALL cookies via CDP Network.getAllCookies.
+        Bypasses SQLite encryption and returns every cookie in the browser.
         MUST be called BEFORE context.close().
         """
         try:
-            cookies = await AccountManager._maybe_await(context.cookies())
-            if not cookies or len(cookies) < 5:
+            raw = await AccountManager._cdp_get_all_cookies(context, logger, label)
+
+            if not raw or len(raw) < 5:
                 if logger:
-                    logger(f"[{label}] Method 1 (CDP): Only {len(cookies) if cookies else 0} cookies — too few.")
+                    logger(f"[{label}] Method 1 (CDP): Only {len(raw)} cookies — too few.")
                 return False
 
-            google_cookies = [c for c in cookies if "google" in (c.get("domain") or "").lower()]
-
-            formatted = []
-            for c in cookies:
-                cookie = {
-                    "name": c.get("name", ""),
-                    "value": c.get("value", ""),
-                    "domain": c.get("domain", ""),
-                    "path": c.get("path", "/"),
-                    "secure": c.get("secure", False),
-                    "httpOnly": c.get("httpOnly", False),
-                    "sameSite": c.get("sameSite", "None"),
-                }
-                if c.get("expires", -1) > 0:
-                    cookie["expires"] = c["expires"]
-                formatted.append(cookie)
+            formatted = AccountManager._format_raw_cookies(raw)
 
             cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
             with open(cookies_json_path, "w", encoding="utf-8") as f:
                 json.dump(formatted, f)
 
+            google_cookies = [c for c in formatted if "google" in (c.get("domain") or "").lower()]
+            auth_cookies = [c for c in formatted if c.get("name") in AccountManager._AUTH_COOKIE_NAMES]
             if logger:
-                logger(f"[{label}] Method 1 (CDP): Exported {len(formatted)} cookies ({len(google_cookies)} Google).")
-            return True
+                logger(f"[{label}] Method 1 (CDP): Exported {len(formatted)} cookies "
+                       f"({len(google_cookies)} Google, {len(auth_cookies)} auth).")
+            return len(auth_cookies) > 0
         except Exception as e:
             if logger:
                 logger(f"[{label}] Method 1 (CDP) failed: {str(e)[:60]}")
@@ -800,8 +835,7 @@ class AccountManager:
     async def _export_cookies_method2_navigate(context, session_dir, label, logger=None):
         """
         Method 2 (FALLBACK): Navigate to key Google domains to trigger cookie
-        setting, then export via CDP.  Some cookies only appear after visiting
-        the domain.
+        setting, then use CDP Network.getAllCookies for complete dump.
         """
         try:
             pages = list(getattr(context, "pages", []) or [])
@@ -809,47 +843,38 @@ class AccountManager:
 
             critical_urls = [
                 "https://accounts.google.com",
+                "https://myaccount.google.com",
+                "https://www.google.com",
                 "https://labs.google.com",
                 "https://labs.google/fx/tools/flow",
-                "https://myaccount.google.com",
             ]
             for url in critical_urls:
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=10000)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1.5)
                 except Exception:
                     pass
 
-            cookies = await AccountManager._maybe_await(context.cookies())
-            if not cookies or len(cookies) < 5:
+            # Use CDP getAllCookies for complete cookie dump
+            raw = await AccountManager._cdp_get_all_cookies(context, logger, label)
+
+            if not raw or len(raw) < 5:
                 if logger:
-                    logger(f"[{label}] Method 2 (Navigate): Only {len(cookies) if cookies else 0} cookies.")
+                    logger(f"[{label}] Method 2 (Navigate): Only {len(raw)} cookies.")
                 return False
 
-            google_cookies = [c for c in cookies if "google" in (c.get("domain") or "").lower()]
-
-            formatted = []
-            for c in cookies:
-                cookie = {
-                    "name": c.get("name", ""),
-                    "value": c.get("value", ""),
-                    "domain": c.get("domain", ""),
-                    "path": c.get("path", "/"),
-                    "secure": c.get("secure", False),
-                    "httpOnly": c.get("httpOnly", False),
-                    "sameSite": c.get("sameSite", "None"),
-                }
-                if c.get("expires", -1) > 0:
-                    cookie["expires"] = c["expires"]
-                formatted.append(cookie)
+            formatted = AccountManager._format_raw_cookies(raw)
 
             cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
             with open(cookies_json_path, "w", encoding="utf-8") as f:
                 json.dump(formatted, f)
 
+            google_cookies = [c for c in formatted if "google" in (c.get("domain") or "").lower()]
+            auth_cookies = [c for c in formatted if c.get("name") in AccountManager._AUTH_COOKIE_NAMES]
             if logger:
-                logger(f"[{label}] Method 2 (Navigate): Exported {len(formatted)} cookies ({len(google_cookies)} Google).")
-            return True
+                logger(f"[{label}] Method 2 (Navigate+CDP): Exported {len(formatted)} cookies "
+                       f"({len(google_cookies)} Google, {len(auth_cookies)} auth).")
+            return len(auth_cookies) > 0
         except Exception as e:
             if logger:
                 logger(f"[{label}] Method 2 (Navigate) failed: {str(e)[:60]}")
