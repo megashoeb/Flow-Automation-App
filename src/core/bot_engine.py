@@ -714,7 +714,8 @@ class GoogleLabsBot:
     EXPORTED_COOKIES_FILENAME = "exported_cookies.json"
 
     async def _import_exported_cookies(self, log_callback=None):
-        """Import cookies from exported_cookies.json into the live browser context."""
+        """Import cookies from exported_cookies.json into the live browser context.
+        Filters out empty, encrypted, or garbage cookie values."""
         if not self.context:
             return 0
         cookies_json = os.path.join(os.path.abspath(str(self.session_path or "")), self.EXPORTED_COOKIES_FILENAME)
@@ -726,10 +727,37 @@ class GoogleLabsBot:
                 cookies = _json.load(f)
             if not cookies or not isinstance(cookies, list):
                 return 0
-            await self._maybe_await(self.context.add_cookies(cookies))
+
+            # Filter out invalid / encrypted / garbage cookies
+            valid_cookies = []
+            skipped = 0
+            for c in cookies:
+                name = c.get("name", "")
+                value = c.get("value", "")
+                domain = c.get("domain", "")
+                if not name or not value or not domain:
+                    skipped += 1
+                    continue
+                # Skip values that look like encrypted blobs (long binary/base64 garbage)
+                if len(value) > 500 and not any(ch in value for ch in ("=", ".", "-", "_")):
+                    skipped += 1
+                    continue
+                valid_cookies.append(c)
+
+            if not valid_cookies:
+                if callable(log_callback):
+                    log_callback(f"[{self.account_name}] No valid cookies after filtering ({skipped} skipped).")
+                return 0
+
+            await self._maybe_await(self.context.add_cookies(valid_cookies))
+            google_count = sum(1 for c in valid_cookies if "google" in (c.get("domain") or "").lower())
             if callable(log_callback):
-                log_callback(f"[{self.account_name}] Imported {len(cookies)} cookies from exported_cookies.json.")
-            return len(cookies)
+                msg = f"[{self.account_name}] Imported {len(valid_cookies)} cookies ({google_count} Google)"
+                if skipped:
+                    msg += f", skipped {skipped} invalid"
+                msg += "."
+                log_callback(msg)
+            return len(valid_cookies)
         except Exception as exc:
             if callable(log_callback):
                 log_callback(f"[{self.account_name}] Cookie import warning: {str(exc)[:80]}")

@@ -705,13 +705,9 @@ class AccountManager:
             # Export cookies BEFORE closing context (essential for Mac CloakBrowser).
             try:
                 if context is not None:
-                    cookies = await AccountManager._maybe_await(context.cookies())
-                    if cookies:
-                        import json as _json
-                        cookies_path = os.path.join(session_path, "exported_cookies.json")
-                        with open(cookies_path, "w", encoding="utf-8") as _f:
-                            _json.dump(cookies, _f)
-                        logger(f"[{account_label}] Exported {len(cookies)} cookies to JSON after warmup.")
+                    await AccountManager._export_login_cookies(
+                        context, session_path, account_label, logger=logger
+                    )
             except Exception as cookie_export_exc:
                 logger(f"[{account_label}] Cookie export warning: {str(cookie_export_exc)[:80]}")
             context_flushed = False
@@ -723,6 +719,12 @@ class AccountManager:
                     await browser.close()
             except Exception:
                 pass
+
+            # SQLite fallback after context close
+            await AccountManager._post_close_sqlite_fallback(
+                session_path, account_label, logger=logger
+            )
+
             if context_flushed:
                 logger(f"[{account_label}] Warm-up browser closed. Cookies updated.")
             AccountManager._unregister_context_process(context)
@@ -740,7 +742,271 @@ class AccountManager:
                     except Exception:
                         pass
             process_tracker.unregister(getattr(chrome_process, "pid", None))
-    
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Cookie export methods — 3-tier fallback for cross-platform reliability
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # Critical Google auth cookie names used to verify export quality.
+    _AUTH_COOKIE_NAMES = frozenset((
+        "SID", "SSID", "HSID", "SAPISID", "APISID",
+        "__Secure-1PSID", "__Secure-3PSID",
+    ))
+
+    @staticmethod
+    async def _export_cookies_method1_cdp(context, session_dir, label, logger=None):
+        """
+        Method 1 (BEST): Export cookies via CDP context.cookies().
+        Bypasses SQLite encryption — cookies are already decrypted in memory.
+        MUST be called BEFORE context.close().
+        """
+        try:
+            cookies = await AccountManager._maybe_await(context.cookies())
+            if not cookies or len(cookies) < 5:
+                if logger:
+                    logger(f"[{label}] Method 1 (CDP): Only {len(cookies) if cookies else 0} cookies — too few.")
+                return False
+
+            google_cookies = [c for c in cookies if "google" in (c.get("domain") or "").lower()]
+
+            formatted = []
+            for c in cookies:
+                cookie = {
+                    "name": c.get("name", ""),
+                    "value": c.get("value", ""),
+                    "domain": c.get("domain", ""),
+                    "path": c.get("path", "/"),
+                    "secure": c.get("secure", False),
+                    "httpOnly": c.get("httpOnly", False),
+                    "sameSite": c.get("sameSite", "None"),
+                }
+                if c.get("expires", -1) > 0:
+                    cookie["expires"] = c["expires"]
+                formatted.append(cookie)
+
+            cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+            with open(cookies_json_path, "w", encoding="utf-8") as f:
+                json.dump(formatted, f)
+
+            if logger:
+                logger(f"[{label}] Method 1 (CDP): Exported {len(formatted)} cookies ({len(google_cookies)} Google).")
+            return True
+        except Exception as e:
+            if logger:
+                logger(f"[{label}] Method 1 (CDP) failed: {str(e)[:60]}")
+            return False
+
+    @staticmethod
+    async def _export_cookies_method2_navigate(context, session_dir, label, logger=None):
+        """
+        Method 2 (FALLBACK): Navigate to key Google domains to trigger cookie
+        setting, then export via CDP.  Some cookies only appear after visiting
+        the domain.
+        """
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+            page = pages[0] if pages else await AccountManager._maybe_await(context.new_page())
+
+            critical_urls = [
+                "https://accounts.google.com",
+                "https://labs.google.com",
+                "https://labs.google/fx/tools/flow",
+                "https://myaccount.google.com",
+            ]
+            for url in critical_urls:
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                    await asyncio.sleep(1)
+                except Exception:
+                    pass
+
+            cookies = await AccountManager._maybe_await(context.cookies())
+            if not cookies or len(cookies) < 5:
+                if logger:
+                    logger(f"[{label}] Method 2 (Navigate): Only {len(cookies) if cookies else 0} cookies.")
+                return False
+
+            google_cookies = [c for c in cookies if "google" in (c.get("domain") or "").lower()]
+
+            formatted = []
+            for c in cookies:
+                cookie = {
+                    "name": c.get("name", ""),
+                    "value": c.get("value", ""),
+                    "domain": c.get("domain", ""),
+                    "path": c.get("path", "/"),
+                    "secure": c.get("secure", False),
+                    "httpOnly": c.get("httpOnly", False),
+                    "sameSite": c.get("sameSite", "None"),
+                }
+                if c.get("expires", -1) > 0:
+                    cookie["expires"] = c["expires"]
+                formatted.append(cookie)
+
+            cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+            with open(cookies_json_path, "w", encoding="utf-8") as f:
+                json.dump(formatted, f)
+
+            if logger:
+                logger(f"[{label}] Method 2 (Navigate): Exported {len(formatted)} cookies ({len(google_cookies)} Google).")
+            return True
+        except Exception as e:
+            if logger:
+                logger(f"[{label}] Method 2 (Navigate) failed: {str(e)[:60]}")
+            return False
+
+    @staticmethod
+    async def _export_cookies_method3_sqlite(session_dir, label, logger=None):
+        """
+        Method 3 (LAST RESORT): Read Chrome's SQLite cookie DB directly.
+        Fails on Macs where cookies are encrypted via Keychain.
+        Called AFTER context.close() — doesn't need a live browser.
+        """
+        import sqlite3
+
+        try:
+            cookies_db = os.path.join(session_dir, "Default", "Network", "Cookies")
+            if not os.path.exists(cookies_db):
+                cookies_db = os.path.join(session_dir, "Default", "Cookies")
+            if not os.path.exists(cookies_db):
+                if logger:
+                    logger(f"[{label}] Method 3 (SQLite): Cookies DB not found.")
+                return False
+
+            temp_db = cookies_db + ".export_temp"
+            shutil.copy2(cookies_db, temp_db)
+
+            conn = sqlite3.connect(temp_db)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT host_key, name, value, encrypted_value, path, "
+                "expires_utc, is_secure, is_httponly, samesite FROM cookies"
+            )
+
+            cookies = []
+            encrypted_count = 0
+            for row in cursor.fetchall():
+                host, name, value, encrypted_value = row[0], row[1], row[2], row[3]
+                if not value and encrypted_value:
+                    encrypted_count += 1
+                    continue
+                cookie = {
+                    "name": name,
+                    "value": value,
+                    "domain": host,
+                    "path": row[4] or "/",
+                    "secure": bool(row[6]),
+                    "httpOnly": bool(row[7]),
+                    "sameSite": ["None", "Lax", "Strict"][row[8]] if isinstance(row[8], int) and row[8] < 3 else "None",
+                }
+                if row[5] and row[5] > 0:
+                    chrome_epoch = 11644473600
+                    expires_unix = (row[5] / 1000000) - chrome_epoch
+                    if expires_unix > 0:
+                        cookie["expires"] = expires_unix
+                cookies.append(cookie)
+
+            conn.close()
+            try:
+                os.remove(temp_db)
+            except Exception:
+                pass
+
+            if encrypted_count > 0 and logger:
+                logger(f"[{label}] Method 3: {encrypted_count} encrypted cookies skipped (Keychain protected).")
+
+            if not cookies or len(cookies) < 3:
+                if logger:
+                    logger(f"[{label}] Method 3: Only {len(cookies)} readable cookies — encryption likely blocking.")
+                return False
+
+            cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+            with open(cookies_json_path, "w", encoding="utf-8") as f:
+                json.dump(cookies, f)
+
+            google_cookies = [c for c in cookies if "google" in (c.get("domain") or "").lower()]
+            if logger:
+                logger(f"[{label}] Method 3 (SQLite): Exported {len(cookies)} cookies "
+                       f"({len(google_cookies)} Google), skipped {encrypted_count} encrypted.")
+            return True
+        except Exception as e:
+            if logger:
+                logger(f"[{label}] Method 3 (SQLite) failed: {str(e)[:60]}")
+            return False
+
+    @staticmethod
+    async def _export_login_cookies(context, session_dir, label, logger=None):
+        """
+        Master cookie export — tries CDP first, then Navigate+CDP.
+        MUST be called BEFORE context.close().
+        Method 3 (SQLite) is called separately after context close.
+        """
+        success = await AccountManager._export_cookies_method1_cdp(
+            context, session_dir, label, logger
+        )
+
+        if not success:
+            if logger:
+                logger(f"[{label}] Trying Method 2 (navigate + export)...")
+            success = await AccountManager._export_cookies_method2_navigate(
+                context, session_dir, label, logger
+            )
+
+        # Verify auth cookie quality even if export "succeeded"
+        cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+        if success and os.path.exists(cookies_json_path):
+            try:
+                with open(cookies_json_path, "r", encoding="utf-8") as f:
+                    exported = json.load(f)
+                has_auth = any(
+                    c.get("name") in AccountManager._AUTH_COOKIE_NAMES for c in exported
+                )
+                if not has_auth:
+                    if logger:
+                        logger(f"[{label}] No Google auth cookies (SID/SSID) found — trying Method 2 as backup...")
+                    await AccountManager._export_cookies_method2_navigate(
+                        context, session_dir, label, logger
+                    )
+                    # Re-check
+                    with open(cookies_json_path, "r", encoding="utf-8") as f:
+                        exported = json.load(f)
+                    has_auth = any(
+                        c.get("name") in AccountManager._AUTH_COOKIE_NAMES for c in exported
+                    )
+                    if has_auth and logger:
+                        logger(f"[{label}] Auth cookies found after Method 2!")
+                    elif not has_auth and logger:
+                        logger(f"[{label}] Still no auth cookies — generation may require re-login.")
+            except Exception:
+                pass
+
+        return success
+
+    @staticmethod
+    async def _post_close_sqlite_fallback(session_dir, label, logger=None):
+        """
+        Called AFTER context.close(). If no exported_cookies.json exists,
+        attempts Method 3 (SQLite) as a last resort.
+        """
+        cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+        if not os.path.exists(cookies_json_path):
+            if logger:
+                logger(f"[{label}] CDP export failed. Trying SQLite fallback...")
+            await AccountManager._export_cookies_method3_sqlite(session_dir, label, logger)
+
+        # Final verification
+        if os.path.exists(cookies_json_path):
+            try:
+                with open(cookies_json_path, "r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                if logger:
+                    logger(f"[{label}] exported_cookies.json: {len(cookies)} cookies on disk.")
+            except Exception:
+                pass
+        else:
+            if logger:
+                logger(f"[{label}] NO exported cookies. Generation will rely on persistent context only.")
+
     @staticmethod
     async def login_and_save_session(
         account_name: str,
@@ -1024,18 +1290,12 @@ class AccountManager:
                                 if update_log_callback:
                                     update_log_callback(f"[AUTO] Detected logged-in Google account: {detected_email}")
                         # Export cookies as soon as login is detected, WHILE browser is still alive.
-                        # The finally block export often fails because user closes browser first.
+                        # Uses 3-tier fallback: CDP → Navigate+CDP → (SQLite after close).
                         if detected_email and not cookies_exported_early and context is not None:
                             try:
-                                live_cookies = await AccountManager._maybe_await(context.cookies())
-                                if live_cookies:
-                                    import json as _json
-                                    _cookies_path = os.path.join(session_dir, "exported_cookies.json")
-                                    with open(_cookies_path, "w", encoding="utf-8") as _f:
-                                        _json.dump(live_cookies, _f)
-                                    cookies_exported_early = True
-                                    if update_log_callback:
-                                        update_log_callback(f"[{detected_email}] Exported {len(live_cookies)} cookies to JSON (live).")
+                                cookies_exported_early = await AccountManager._export_login_cookies(
+                                    context, session_dir, detected_email, logger=update_log_callback
+                                )
                             except Exception:
                                 pass
                         if chrome_process is not None and chrome_process.poll() is not None:
@@ -1049,18 +1309,16 @@ class AccountManager:
                 if not cookies_exported_early:
                     try:
                         if context is not None:
-                            cookies = await AccountManager._maybe_await(context.cookies())
-                            if cookies:
-                                import json as _json
-                                cookies_path = os.path.join(session_dir, "exported_cookies.json")
-                                with open(cookies_path, "w", encoding="utf-8") as _f:
-                                    _json.dump(cookies, _f)
-                                cookies_exported_early = True
-                                if update_log_callback:
-                                    update_log_callback(f"[{temp_name}] Exported {len(cookies)} cookies to JSON (finally).")
+                            cookies_exported_early = await AccountManager._export_login_cookies(
+                                context, session_dir,
+                                detected_email or temp_name,
+                                logger=update_log_callback,
+                            )
                     except Exception as cookie_export_exc:
                         if update_log_callback:
                             update_log_callback(f"[{temp_name}] Cookie export skipped (browser already closed): {str(cookie_export_exc)[:60]}")
+
+                # Close context and flush session to disk
                 try:
                     if context is not None:
                         await AccountManager._close_context_and_flush(context, flush_delay=2)
@@ -1069,6 +1327,13 @@ class AccountManager:
                         await browser.close()
                 except Exception:
                     pass
+
+                # SQLite fallback AFTER context close (last resort for encrypted Macs)
+                export_label = detected_email or temp_name
+                await AccountManager._post_close_sqlite_fallback(
+                    session_dir, export_label, logger=update_log_callback
+                )
+
                 AccountManager._unregister_context_process(context)
                 if chrome_process is not None and chrome_process.poll() is None:
                     try:
