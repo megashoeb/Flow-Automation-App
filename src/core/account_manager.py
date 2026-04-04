@@ -1116,6 +1116,164 @@ class AccountManager:
         return None
 
     @staticmethod
+    async def _get_cookies_via_live_cdp(cdp_port, logger=None, label=""):
+        """
+        Get ALL cookies from a LIVE Chrome process via Playwright connect_over_cdp.
+        Cookies are decrypted in Chrome's memory — bypasses macOS Keychain encryption.
+        Does NOT control the browser — only reads cookies.
+        """
+        try:
+            if not AccountManager._is_cdp_endpoint_live(cdp_port):
+                return []
+
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+                contexts = list(browser.contexts)
+                if not contexts:
+                    await browser.close()
+                    return []
+
+                context = contexts[0]
+                cookies = []
+
+                # Try CDP Network.getAllCookies (gets ALL browser cookies)
+                try:
+                    pages = list(getattr(context, "pages", []) or [])
+                    page = pages[0] if pages else await AccountManager._maybe_await(context.new_page())
+                    cdp_session = await page.context.new_cdp_session(page)
+
+                    # Try Storage.getCookies first
+                    try:
+                        result = await cdp_session.send("Storage.getCookies")
+                        cookies = result.get("cookies", [])
+                    except Exception:
+                        pass
+
+                    # Fallback / supplement with Network.getAllCookies
+                    if len(cookies) < 10:
+                        try:
+                            result = await cdp_session.send("Network.getAllCookies")
+                            net_cookies = result.get("cookies", [])
+                            if len(net_cookies) > len(cookies):
+                                cookies = net_cookies
+                        except Exception:
+                            pass
+
+                    await cdp_session.detach()
+                except Exception as e:
+                    if logger:
+                        logger(f"[{label}] CDP cookie read error: {str(e)[:50]}")
+
+                # Fallback to context.cookies()
+                if len(cookies) < 10:
+                    try:
+                        ctx_cookies = await AccountManager._maybe_await(context.cookies())
+                        if ctx_cookies and len(ctx_cookies) > len(cookies):
+                            cookies = ctx_cookies
+                    except Exception:
+                        pass
+
+                # Disconnect (does NOT close Chrome — we connected, not launched)
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+                return cookies
+
+        except Exception as e:
+            if logger:
+                logger(f"[{label}] Live CDP connection failed: {str(e)[:60]}")
+            return []
+
+    @staticmethod
+    async def _monitor_chrome_and_extract_cookies(
+        chrome_process, cdp_port, session_dir, label, logger=None, should_stop=None,
+    ):
+        """
+        Monitor Chrome process. Periodically extract cookies via live CDP.
+        Saves cookies as soon as auth cookies appear.
+        Keeps updating until Chrome closes.
+        Returns (cookies_exported: bool, detected_email: str or None).
+        """
+        cookies_saved = False
+        detected_email = None
+        last_cookie_count = 0
+
+        # Wait for CDP to become available
+        await asyncio.sleep(3)
+
+        while chrome_process.poll() is None:
+            # Check for app shutdown
+            if callable(should_stop) and should_stop():
+                if logger:
+                    logger(f"[{label}] Login cancelled — terminating Chrome.")
+                try:
+                    chrome_process.terminate()
+                    chrome_process.wait(timeout=5)
+                except Exception:
+                    try:
+                        chrome_process.kill()
+                    except Exception:
+                        pass
+                break
+
+            # Extract cookies from live Chrome
+            try:
+                raw_cookies = await AccountManager._get_cookies_via_live_cdp(
+                    cdp_port, logger=None, label=label
+                )
+
+                if raw_cookies:
+                    auth_cookies = [
+                        c for c in raw_cookies
+                        if c.get("name", "") in AccountManager._AUTH_COOKIE_NAMES
+                    ]
+                    google_cookies = [
+                        c for c in raw_cookies
+                        if "google" in (c.get("domain") or "").lower()
+                    ]
+
+                    # Log only when cookie count changes
+                    if len(raw_cookies) != last_cookie_count:
+                        last_cookie_count = len(raw_cookies)
+                        if logger:
+                            logger(f"[{label}] Live CDP: {len(raw_cookies)} cookies "
+                                   f"({len(google_cookies)} Google, {len(auth_cookies)} auth)")
+
+                    # Try to detect email from cookie values
+                    if not detected_email:
+                        for c in raw_cookies:
+                            val = str(c.get("value") or "")
+                            emails = EMAIL_RE.findall(val)
+                            if emails:
+                                detected_email = AccountManager._pick_best_email(emails)
+                                if detected_email and logger:
+                                    logger(f"[AUTO] Detected logged-in Google account: {detected_email}")
+                                break
+
+                    # Save cookies when we have auth cookies
+                    if len(auth_cookies) >= 2:
+                        formatted = AccountManager._format_raw_cookies(raw_cookies)
+                        cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+                        with open(cookies_json_path, "w", encoding="utf-8") as f:
+                            json.dump(formatted, f)
+
+                        if not cookies_saved:
+                            if logger:
+                                logger(f"[{label}] Auth cookies captured! "
+                                       f"{len(auth_cookies)} auth cookies saved.")
+                                logger(f"[{label}] You can close Chrome now.")
+                            cookies_saved = True
+            except Exception:
+                pass
+
+            # Poll every 3 seconds
+            await asyncio.sleep(3)
+
+        return cookies_saved, detected_email
+
+    @staticmethod
     async def _export_cookies_via_playwright_headless(session_dir, label, logger=None):
         """
         Briefly launch Playwright persistent context HEADLESS to read ALL cookies
@@ -1144,7 +1302,6 @@ class AccountManager:
                     ignore_default_args=["--enable-automation"],
                 )
 
-                # Try CDP getAllCookies first (gets ALL browser cookies)
                 cookies = []
                 try:
                     pages = list(getattr(ctx, "pages", []) or [])
@@ -1161,7 +1318,6 @@ class AccountManager:
                     if logger:
                         logger(f"[{label}] Headless CDP getAllCookies failed: {str(e)[:50]}")
 
-                # Fallback to context.cookies()
                 if len(cookies) < 5:
                     try:
                         ctx_cookies = await AccountManager._maybe_await(ctx.cookies())
@@ -1170,7 +1326,6 @@ class AccountManager:
                     except Exception:
                         pass
 
-                # Close immediately
                 try:
                     await AccountManager._close_context_and_flush(ctx, flush_delay=1)
                 except Exception:
@@ -1194,8 +1349,6 @@ class AccountManager:
             if logger:
                 logger(f"[{label}] Headless read: {len(formatted)} cookies "
                        f"({len(google_cookies)} Google, {len(auth_cookies)} auth).")
-                if auth_cookies:
-                    logger(f"[{label}] Auth cookies: {', '.join(c['name'] for c in auth_cookies[:5])}")
 
             return len(auth_cookies) > 0
 
@@ -1209,9 +1362,11 @@ class AccountManager:
         session_dir, account_hint, update_log_callback=None, should_stop=None, proxy=None,
     ):
         """
-        Launch Chrome as a PURE subprocess for login — ZERO Playwright hooks.
-        User logs in normally (no redirect loop), then closes Chrome.
-        After Chrome closes, cookies are read from disk.
+        Launch Chrome as a PURE subprocess WITH --remote-debugging-port.
+        ZERO Playwright for login = ZERO automation detection by Google.
+        Cookies are extracted from Chrome's LIVE memory via CDP while user
+        logs in — this bypasses macOS Keychain cookie encryption entirely.
+        After Chrome closes, falls back to headless read / SQLite if needed.
         Returns detected_email or None.
         """
         chrome_path = AccountManager._find_chrome_path()
@@ -1219,6 +1374,7 @@ class AccountManager:
             raise RuntimeError("Google Chrome not found! Please install Chrome.")
 
         label = account_hint or os.path.basename(session_dir)
+        cdp_port = 9220
 
         # Clean lock files before launch
         cleanup_session_locks(session_dir)
@@ -1226,6 +1382,8 @@ class AccountManager:
         chrome_args = [
             chrome_path,
             f"--user-data-dir={session_dir}",
+            f"--remote-debugging-port={cdp_port}",
+            "--remote-debugging-address=127.0.0.1",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-default-apps",
@@ -1238,7 +1396,7 @@ class AccountManager:
             chrome_args.append(f"--proxy-server={proxy}")
 
         if update_log_callback:
-            update_log_callback(f"[{label}] Launching pure Chrome for login (zero automation hooks)...")
+            update_log_callback(f"[{label}] Launching pure Chrome with CDP port {cdp_port}...")
             update_log_callback(f"[{label}] Please log in to Google, then CLOSE Chrome when done.")
 
         creationflags = 0
@@ -1249,6 +1407,9 @@ class AccountManager:
             popen_kwargs["stdout"] = subprocess.DEVNULL
             popen_kwargs["stderr"] = subprocess.DEVNULL
 
+        # Kill anything on the CDP port first
+        AccountManager._kill_chrome_on_port(cdp_port)
+
         chrome_process = subprocess.Popen(
             chrome_args,
             creationflags=creationflags,
@@ -1257,57 +1418,51 @@ class AccountManager:
         process_tracker.register(getattr(chrome_process, "pid", None))
 
         if update_log_callback:
-            update_log_callback(f"[{label}] Chrome opened (PID: {chrome_process.pid}). Waiting for user to close...")
+            update_log_callback(f"[{label}] Chrome opened (PID: {chrome_process.pid}).")
 
-        # Wait for Chrome to close (user closes it after login)
-        loop = asyncio.get_running_loop()
-        try:
-            while True:
-                if chrome_process.poll() is not None:
-                    break
-                if callable(should_stop) and should_stop():
-                    if update_log_callback:
-                        update_log_callback(f"[{label}] Login cancelled — terminating Chrome.")
-                    try:
-                        chrome_process.terminate()
-                        await loop.run_in_executor(None, lambda: chrome_process.wait(timeout=5))
-                    except Exception:
-                        try:
-                            chrome_process.kill()
-                        except Exception:
-                            pass
-                    break
-                await asyncio.sleep(1)
-        finally:
-            process_tracker.unregister(getattr(chrome_process, "pid", None))
+        # Monitor Chrome and extract cookies from LIVE process via CDP
+        cookies_exported, detected_email = await AccountManager._monitor_chrome_and_extract_cookies(
+            chrome_process, cdp_port, session_dir, label,
+            logger=update_log_callback,
+            should_stop=should_stop,
+        )
+
+        process_tracker.unregister(getattr(chrome_process, "pid", None))
 
         if update_log_callback:
-            update_log_callback(f"[{label}] Chrome closed by user. Reading session...")
+            update_log_callback(f"[{label}] Chrome closed by user.")
 
-        # Give Chrome time to flush everything to disk
+        # Give Chrome time to flush to disk
         await asyncio.sleep(2)
         cleanup_session_locks(session_dir)
 
-        # Detect which account was logged in
-        detected_email = await AccountManager._detect_account_from_session(session_dir, logger=update_log_callback)
+        # Try to detect account from session files if not detected from live cookies
+        if not detected_email:
+            detected_email = await AccountManager._detect_account_from_session(
+                session_dir, logger=update_log_callback
+            )
+            if detected_email and update_log_callback:
+                update_log_callback(f"[AUTO] Detected account from session files: {detected_email}")
 
-        if detected_email and update_log_callback:
-            update_log_callback(f"[AUTO] Detected account from session: {detected_email}")
-        elif not detected_email and update_log_callback:
+        if not detected_email and update_log_callback:
             update_log_callback(f"[{label}] Could not auto-detect account. Make sure you logged into Google.")
 
         export_label = detected_email or label
 
-        # Export cookies: Playwright headless → SQLite fallback
-        exported = await AccountManager._export_cookies_via_playwright_headless(
-            session_dir, export_label, logger=update_log_callback
-        )
-        if not exported:
+        # If live CDP extraction failed, try post-close fallbacks
+        if not cookies_exported:
             if update_log_callback:
-                update_log_callback(f"[{export_label}] Playwright headless read failed. Trying SQLite...")
-            await AccountManager._export_cookies_method3_sqlite(
+                update_log_callback(f"[{export_label}] Live CDP export missed. Trying headless Playwright read...")
+
+            exported = await AccountManager._export_cookies_via_playwright_headless(
                 session_dir, export_label, logger=update_log_callback
             )
+            if not exported:
+                if update_log_callback:
+                    update_log_callback(f"[{export_label}] Headless read failed. Trying SQLite...")
+                await AccountManager._export_cookies_method3_sqlite(
+                    session_dir, export_label, logger=update_log_callback
+                )
 
         # Final verification
         cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
@@ -1315,8 +1470,10 @@ class AccountManager:
             try:
                 with open(cookies_json_path, "r", encoding="utf-8") as f:
                     cookies = json.load(f)
+                auth = [c for c in cookies if c.get("name") in AccountManager._AUTH_COOKIE_NAMES]
                 if update_log_callback:
-                    update_log_callback(f"[{export_label}] exported_cookies.json: {len(cookies)} cookies on disk.")
+                    update_log_callback(f"[{export_label}] exported_cookies.json: "
+                                        f"{len(cookies)} cookies ({len(auth)} auth) on disk.")
             except Exception:
                 pass
         else:
