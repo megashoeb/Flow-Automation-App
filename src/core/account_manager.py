@@ -1032,6 +1032,299 @@ class AccountManager:
             if logger:
                 logger(f"[{label}] NO exported cookies. Generation will rely on persistent context only.")
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # Pure Chrome subprocess login — ZERO Playwright = ZERO automation detection
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def _detect_account_from_session(session_dir, logger=None):
+        """Detect Google account email from Chrome session files on disk."""
+        import sqlite3
+
+        # Try Preferences JSON (most reliable — Chrome writes account_info here)
+        prefs = os.path.join(session_dir, "Default", "Preferences")
+        if os.path.exists(prefs):
+            try:
+                with open(prefs, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                account_info = data.get("account_info", [])
+                if account_info and isinstance(account_info, list):
+                    email = account_info[0].get("email", "")
+                    if email and "@" in email:
+                        return email
+                signin = data.get("signin", {})
+                allowed = signin.get("allowed")
+                if allowed:
+                    for key in ("account_id_migration_state",):
+                        val = str(data.get(key, ""))
+                        if "@" in val:
+                            return val
+            except Exception:
+                pass
+
+        # Try Login Data database
+        login_db = os.path.join(session_dir, "Default", "Login Data")
+        if os.path.exists(login_db):
+            try:
+                temp = login_db + ".detect_temp"
+                shutil.copy2(login_db, temp)
+                conn = sqlite3.connect(temp)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT username_value FROM logins "
+                    "WHERE origin_url LIKE '%google%' AND username_value LIKE '%@%' LIMIT 1"
+                )
+                row = cursor.fetchone()
+                conn.close()
+                try:
+                    os.remove(temp)
+                except Exception:
+                    pass
+                if row and row[0]:
+                    return row[0]
+            except Exception:
+                pass
+
+        # Try cookies for email patterns
+        cookies_db = os.path.join(session_dir, "Default", "Network", "Cookies")
+        if not os.path.exists(cookies_db):
+            cookies_db = os.path.join(session_dir, "Default", "Cookies")
+        if os.path.exists(cookies_db):
+            try:
+                temp = cookies_db + ".detect_temp"
+                shutil.copy2(cookies_db, temp)
+                conn = sqlite3.connect(temp)
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM cookies WHERE host_key LIKE '%google%' AND value LIKE '%@%' LIMIT 10")
+                for row in cursor.fetchall():
+                    emails = EMAIL_RE.findall(str(row[0] or ""))
+                    if emails:
+                        conn.close()
+                        try:
+                            os.remove(temp)
+                        except Exception:
+                            pass
+                        return AccountManager._pick_best_email(emails)
+                conn.close()
+                try:
+                    os.remove(temp)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        return None
+
+    @staticmethod
+    async def _export_cookies_via_playwright_headless(session_dir, label, logger=None):
+        """
+        Briefly launch Playwright persistent context HEADLESS to read ALL cookies
+        via CDP Network.getAllCookies. Chrome is already closed, so no conflict.
+        Closes Playwright immediately after reading.
+        """
+        try:
+            chrome_path = AccountManager._find_chrome_path()
+            if not chrome_path:
+                if logger:
+                    logger(f"[{label}] Chrome not found for headless cookie read.")
+                return False
+
+            cleanup_session_locks(session_dir)
+
+            async with async_playwright() as pw:
+                ctx = await pw.chromium.launch_persistent_context(
+                    session_dir,
+                    executable_path=chrome_path,
+                    headless=True,
+                    args=[
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                    ignore_default_args=["--enable-automation"],
+                )
+
+                # Try CDP getAllCookies first (gets ALL browser cookies)
+                cookies = []
+                try:
+                    pages = list(getattr(ctx, "pages", []) or [])
+                    page = pages[0] if pages else await AccountManager._maybe_await(ctx.new_page())
+                    cdp_session = await page.context.new_cdp_session(page)
+                    result = await cdp_session.send("Network.getAllCookies")
+                    cdp_cookies = result.get("cookies", [])
+                    await cdp_session.detach()
+                    if cdp_cookies:
+                        cookies = cdp_cookies
+                        if logger:
+                            logger(f"[{label}] Headless CDP getAllCookies: {len(cookies)} cookies.")
+                except Exception as e:
+                    if logger:
+                        logger(f"[{label}] Headless CDP getAllCookies failed: {str(e)[:50]}")
+
+                # Fallback to context.cookies()
+                if len(cookies) < 5:
+                    try:
+                        ctx_cookies = await AccountManager._maybe_await(ctx.cookies())
+                        if ctx_cookies and len(ctx_cookies) > len(cookies):
+                            cookies = ctx_cookies
+                    except Exception:
+                        pass
+
+                # Close immediately
+                try:
+                    await AccountManager._close_context_and_flush(ctx, flush_delay=1)
+                except Exception:
+                    pass
+
+            cleanup_session_locks(session_dir)
+
+            if not cookies or len(cookies) < 5:
+                if logger:
+                    logger(f"[{label}] Headless cookie read: only {len(cookies)} cookies.")
+                return False
+
+            formatted = AccountManager._format_raw_cookies(cookies)
+
+            cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+            with open(cookies_json_path, "w", encoding="utf-8") as f:
+                json.dump(formatted, f)
+
+            google_cookies = [c for c in formatted if "google" in (c.get("domain") or "").lower()]
+            auth_cookies = [c for c in formatted if c.get("name") in AccountManager._AUTH_COOKIE_NAMES]
+            if logger:
+                logger(f"[{label}] Headless read: {len(formatted)} cookies "
+                       f"({len(google_cookies)} Google, {len(auth_cookies)} auth).")
+                if auth_cookies:
+                    logger(f"[{label}] Auth cookies: {', '.join(c['name'] for c in auth_cookies[:5])}")
+
+            return len(auth_cookies) > 0
+
+        except Exception as e:
+            if logger:
+                logger(f"[{label}] Headless cookie read failed: {str(e)[:60]}")
+            return False
+
+    @staticmethod
+    async def _pure_chrome_login(
+        session_dir, account_hint, update_log_callback=None, should_stop=None, proxy=None,
+    ):
+        """
+        Launch Chrome as a PURE subprocess for login — ZERO Playwright hooks.
+        User logs in normally (no redirect loop), then closes Chrome.
+        After Chrome closes, cookies are read from disk.
+        Returns detected_email or None.
+        """
+        chrome_path = AccountManager._find_chrome_path()
+        if not chrome_path:
+            raise RuntimeError("Google Chrome not found! Please install Chrome.")
+
+        label = account_hint or os.path.basename(session_dir)
+
+        # Clean lock files before launch
+        cleanup_session_locks(session_dir)
+
+        chrome_args = [
+            chrome_path,
+            f"--user-data-dir={session_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--disable-sync",
+            "--window-size=1920,1080",
+            "https://accounts.google.com",
+        ]
+        if proxy:
+            chrome_args.append(f"--proxy-server={proxy}")
+
+        if update_log_callback:
+            update_log_callback(f"[{label}] Launching pure Chrome for login (zero automation hooks)...")
+            update_log_callback(f"[{label}] Please log in to Google, then CLOSE Chrome when done.")
+
+        creationflags = 0
+        popen_kwargs = {}
+        if platform.system() == "Windows":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            popen_kwargs["stdout"] = subprocess.DEVNULL
+            popen_kwargs["stderr"] = subprocess.DEVNULL
+
+        chrome_process = subprocess.Popen(
+            chrome_args,
+            creationflags=creationflags,
+            **popen_kwargs,
+        )
+        process_tracker.register(getattr(chrome_process, "pid", None))
+
+        if update_log_callback:
+            update_log_callback(f"[{label}] Chrome opened (PID: {chrome_process.pid}). Waiting for user to close...")
+
+        # Wait for Chrome to close (user closes it after login)
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                if chrome_process.poll() is not None:
+                    break
+                if callable(should_stop) and should_stop():
+                    if update_log_callback:
+                        update_log_callback(f"[{label}] Login cancelled — terminating Chrome.")
+                    try:
+                        chrome_process.terminate()
+                        await loop.run_in_executor(None, lambda: chrome_process.wait(timeout=5))
+                    except Exception:
+                        try:
+                            chrome_process.kill()
+                        except Exception:
+                            pass
+                    break
+                await asyncio.sleep(1)
+        finally:
+            process_tracker.unregister(getattr(chrome_process, "pid", None))
+
+        if update_log_callback:
+            update_log_callback(f"[{label}] Chrome closed by user. Reading session...")
+
+        # Give Chrome time to flush everything to disk
+        await asyncio.sleep(2)
+        cleanup_session_locks(session_dir)
+
+        # Detect which account was logged in
+        detected_email = await AccountManager._detect_account_from_session(session_dir, logger=update_log_callback)
+
+        if detected_email and update_log_callback:
+            update_log_callback(f"[AUTO] Detected account from session: {detected_email}")
+        elif not detected_email and update_log_callback:
+            update_log_callback(f"[{label}] Could not auto-detect account. Make sure you logged into Google.")
+
+        export_label = detected_email or label
+
+        # Export cookies: Playwright headless → SQLite fallback
+        exported = await AccountManager._export_cookies_via_playwright_headless(
+            session_dir, export_label, logger=update_log_callback
+        )
+        if not exported:
+            if update_log_callback:
+                update_log_callback(f"[{export_label}] Playwright headless read failed. Trying SQLite...")
+            await AccountManager._export_cookies_method3_sqlite(
+                session_dir, export_label, logger=update_log_callback
+            )
+
+        # Final verification
+        cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
+        if os.path.exists(cookies_json_path):
+            try:
+                with open(cookies_json_path, "r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                if update_log_callback:
+                    update_log_callback(f"[{export_label}] exported_cookies.json: {len(cookies)} cookies on disk.")
+            except Exception:
+                pass
+        else:
+            if update_log_callback:
+                update_log_callback(f"[{export_label}] NO exported cookies. Generation will rely on persistent context only.")
+
+        return detected_email
+
     @staticmethod
     async def login_and_save_session(
         account_name: str,
@@ -1048,43 +1341,73 @@ class AccountManager:
         Launches a visible browser for the user to login.
         Saves the persistent browser context to the data directory so future
         headless runs can stay logged in.
+
+        Mac / Real Chrome: Uses PURE subprocess Chrome (zero Playwright)
+        to avoid Google detecting automation hooks.
+        Windows CloakBrowser: Uses CloakBrowser persistent context.
         """
         account_hint = str(account_name or "").strip()
         temp_name = AccountManager._safe_session_dir_name(account_hint or f"account_{int(time.time())}")
         session_dir = os.path.join(DATA_DIR, temp_name)
         os.makedirs(session_dir, exist_ok=True)
         detected_email = None
-        
+
         if update_log_callback:
             visible_name = account_hint or temp_name
             update_log_callback(f"[{visible_name}] Launching browser for manual login...")
-            
-        async with async_playwright() as p:
-            context = None
-            browser = None
-            chrome_process = None
-            using_cloak = False
+
+        # ── Decide browser mode ──
+        browser_mode = str(get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
+
+        # Mac hybrid: force pure Chrome for login (CloakBrowser can't persist on macOS,
+        # and Playwright launch_persistent_context triggers Google's automation detection).
+        if platform.system() == "Darwin":
+            if update_log_callback:
+                update_log_callback(
+                    f"[{account_hint or temp_name}] Mac: using pure Chrome for login "
+                    "(zero automation detection). CloakBrowser will be used for generation."
+                )
+            browser_mode = "pure_chrome"
+
+        # Real Chrome mode also uses pure subprocess (no Playwright hooks)
+        if browser_mode == "real_chrome":
+            browser_mode = "pure_chrome"
+
+        # ══════════════════════════════════════════════════════════════════
+        # PATH A: Pure Chrome subprocess login (Mac + Real Chrome)
+        # ══════════════════════════════════════════════════════════════════
+        if browser_mode == "pure_chrome":
+            detected_email = await AccountManager._pure_chrome_login(
+                session_dir, account_hint,
+                update_log_callback=update_log_callback,
+                should_stop=should_stop,
+                proxy=proxy,
+            )
+
+        # ══════════════════════════════════════════════════════════════════
+        # PATH B: CloakBrowser login (Windows — existing flow)
+        # ══════════════════════════════════════════════════════════════════
+        elif browser_mode == "cloakbrowser":
             context_closed_cleanly = False
-            try:
-                browser_mode = str(get_setting("browser_mode", "cloakbrowser") or "cloakbrowser").strip().lower()
-                # Mac hybrid: force Real Chrome for login — CloakBrowser can't persist sessions on macOS.
-                # Generation will still use CloakBrowser with imported cookies.
-                if browser_mode == "cloakbrowser" and platform.system() == "Darwin":
-                    if update_log_callback:
-                        update_log_callback(
-                            f"[{account_hint or temp_name}] Mac hybrid mode: "
-                            "using Real Chrome for login (better session persistence). "
-                            "CloakBrowser will be used for generation."
-                        )
-                    browser_mode = "real_chrome"
-                if browser_mode == "cloakbrowser":
+            async with async_playwright() as p:
+                context = None
+                browser = None
+                chrome_process = None
+                using_cloak = False
+                try:
                     cloak_api = load_cloakbrowser_api()
                     cloak_persistent_async = cloak_api.get("persistent_async")
                     cloak_binary_info = cloak_api.get("binary_info")
                     if not cloak_api.get("available") or cloak_persistent_async is None:
                         if update_log_callback:
-                            update_log_callback("[FALLBACK] CloakBrowser not installed. Using Real Chrome CDP.")
-                        browser_mode = "real_chrome"
+                            update_log_callback("[FALLBACK] CloakBrowser not available. Using pure Chrome login.")
+                        # Fallback to pure Chrome
+                        detected_email = await AccountManager._pure_chrome_login(
+                            session_dir, account_hint,
+                            update_log_callback=update_log_callback,
+                            should_stop=should_stop,
+                            proxy=proxy,
+                        )
                     else:
                         using_cloak = True
                         if update_log_callback:
@@ -1114,17 +1437,16 @@ class AccountManager:
                                 download_complete_callback(
                                     bool(download_ok),
                                     "CloakBrowser ready! Opening login browser..." if download_ok
-                                    else "Download failed. Using Real Chrome CDP.",
+                                    else "Download failed. Using pure Chrome login.",
                                 )
                             if not download_ok:
                                 if update_log_callback:
-                                    update_log_callback("[FALLBACK] CloakBrowser download failed. Using Real Chrome CDP.")
-                                browser_mode = "real_chrome"
+                                    update_log_callback("[FALLBACK] CloakBrowser download failed. Using pure Chrome login.")
                                 using_cloak = False
                             elif update_log_callback:
                                 update_log_callback(f"[{account_hint or temp_name}] CloakBrowser binary ready!")
 
-                        if browser_mode == "cloakbrowser":
+                        if using_cloak:
                             import hashlib as _hashlib
                             _seed_base = str(account_hint or temp_name or "slot").strip() or "slot"
                             _seed = int(_hashlib.md5(_seed_base.encode("utf-8")).hexdigest()[:8], 16) % 99999
@@ -1139,237 +1461,106 @@ class AccountManager:
                                 humanize=True,
                             )
                             AccountManager._register_context_process(context)
-                            browser_path = "cloakbrowser"
 
-                if browser_mode == "real_chrome" and context is None:
-                    chrome_path = AccountManager._find_chrome_path()
-                    if not chrome_path:
-                        raise RuntimeError("Chrome not found! Install Google Chrome.")
-                    chrome_args = [
-                        chrome_path,
-                        "--remote-debugging-port=9220",
-                        "--remote-debugging-address=127.0.0.1",
-                        f"--user-data-dir={session_dir}",
-                        "--no-first-run",
-                        "--disable-blink-features=AutomationControlled",
-                        "--window-size=1920,1080",
-                    ]
-                    if proxy:
-                        chrome_args.append(f"--proxy-server={proxy}")
-                    if update_log_callback:
-                        update_log_callback(f"[DEBUG] Real Chrome executable: {chrome_path}")
-                        update_log_callback("[DEBUG] Real Chrome CDP port: 9220")
-                        update_log_callback("[DEBUG] Chrome display: visible")
-                    creationflags = 0
-                    popen_kwargs = {}
-                    if platform.system() == "Windows":
-                        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    else:
-                        popen_kwargs["stdout"] = subprocess.DEVNULL
-                        popen_kwargs["stderr"] = subprocess.DEVNULL
-                    chrome_process = subprocess.Popen(
-                        chrome_args,
-                        creationflags=creationflags,
-                        **popen_kwargs,
-                    )
-                    process_tracker.register(getattr(chrome_process, "pid", None))
-                    await asyncio.sleep(3)
-                    if not AccountManager._is_cdp_endpoint_live(9220):
+                    # If CloakBrowser context was created, run Playwright-based login loop
+                    if context is not None:
+                        pages = list(getattr(context, "pages", []) or [])
+                        page = pages[0] if len(pages) > 0 else await AccountManager._maybe_await(context.new_page())
+                        await AccountManager._apply_browser_overrides(context, page)
+                        await AccountManager._apply_stealth_to_page(page)
                         if update_log_callback:
-                            update_log_callback("[DEBUG] CDP endpoint 9220 was not ready. Restarting Chrome...")
-                        try:
-                            if chrome_process is not None and chrome_process.poll() is None:
-                                chrome_process.terminate()
-                                chrome_process.wait(timeout=5)
-                        except Exception:
                             try:
-                                if chrome_process is not None and chrome_process.poll() is None:
-                                    chrome_process.kill()
-                            except Exception:
-                                pass
-                        process_tracker.unregister(getattr(chrome_process, "pid", None))
-                        AccountManager._kill_chrome_on_port(9220)
-                        chrome_process = subprocess.Popen(
-                            chrome_args,
-                            creationflags=creationflags,
-                            **popen_kwargs,
-                        )
-                        process_tracker.register(getattr(chrome_process, "pid", None))
-                        await asyncio.sleep(3)
-                    if not AccountManager._is_cdp_endpoint_live(9220):
-                        raise RuntimeError("Chrome CDP did not start on port 9220.")
-                    browser = await p.chromium.connect_over_cdp("http://127.0.0.1:9220")
-                    contexts = list(browser.contexts)
-                    if not contexts:
-                        raise RuntimeError("Real Chrome CDP connected but no browser context was available.")
-                    context = contexts[0]
-                    browser_path = chrome_path
-                elif context is None:
-                    launch_options = AccountManager._persistent_context_launch_options(headless=False, proxy_value=proxy)
-                    browser_path = AccountManager._resolve_browser_path(p)
-                    if browser_path:
-                        launch_options["executable_path"] = browser_path
-                    if update_log_callback:
-                        update_log_callback(f"[DEBUG] Using browser: {browser_path or '<default>'}")
-                        update_log_callback(f"[DEBUG] ignore_default_args = {['--enable-automation']}")
-                        update_log_callback(f"[DEBUG] headless = {False}")
-                    try:
-                        context = await p.chromium.launch_persistent_context(
-                            user_data_dir=session_dir,
-                            **launch_options,
-                        )
-                        AccountManager._register_context_process(context)
-                    except Exception as playwright_error:
-                        error_text = str(playwright_error or "")
-                        if "doesn't exist" in error_text or "Executable doesn't exist" in error_text:
-                            if update_log_callback:
-                                update_log_callback("[FALLBACK] Playwright Chromium not found. Using Real Chrome CDP.")
-                            chrome_path = AccountManager._find_chrome_path()
-                            if not chrome_path:
-                                raise RuntimeError("Playwright Chromium not found and Google Chrome is not installed.")
-                            chrome_args = [
-                                chrome_path,
-                                "--remote-debugging-port=9220",
-                                "--remote-debugging-address=127.0.0.1",
-                                f"--user-data-dir={session_dir}",
-                                "--no-first-run",
-                                "--disable-blink-features=AutomationControlled",
-                                "--window-size=1920,1080",
-                            ]
-                            if proxy:
-                                chrome_args.append(f"--proxy-server={proxy}")
-                            creationflags = 0
-                            popen_kwargs = {}
-                            if platform.system() == "Windows":
-                                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                            else:
-                                popen_kwargs["stdout"] = subprocess.DEVNULL
-                                popen_kwargs["stderr"] = subprocess.DEVNULL
-                            chrome_process = subprocess.Popen(
-                                chrome_args,
-                                creationflags=creationflags,
-                                **popen_kwargs,
-                            )
-                            process_tracker.register(getattr(chrome_process, "pid", None))
-                            await asyncio.sleep(3)
-                            if not AccountManager._is_cdp_endpoint_live(9220):
-                                AccountManager._kill_chrome_on_port(9220)
-                                chrome_process = subprocess.Popen(
-                                    chrome_args,
-                                    creationflags=creationflags,
-                                    **popen_kwargs,
-                                )
-                                process_tracker.register(getattr(chrome_process, "pid", None))
-                                await asyncio.sleep(3)
-                            if not AccountManager._is_cdp_endpoint_live(9220):
-                                raise RuntimeError("Chrome CDP did not start on port 9220.")
-                            browser = await p.chromium.connect_over_cdp("http://127.0.0.1:9220")
-                            contexts = list(browser.contexts)
-                            if not contexts:
-                                raise RuntimeError("Real Chrome CDP connected but no browser context was available.")
-                            context = contexts[0]
-                            browser_path = chrome_path
-                        else:
-                            raise
+                                ua = await AccountManager._maybe_await(page.evaluate("navigator.userAgent"))
+                            except Exception as ua_error:
+                                ua = f"<error: {ua_error}>"
+                            try:
+                                webdriver_flag = await AccountManager._maybe_await(page.evaluate("navigator.webdriver"))
+                            except Exception as wd_error:
+                                webdriver_flag = f"<error: {wd_error}>"
+                            update_log_callback(f"[DEBUG] User-Agent: {ua}")
+                            update_log_callback(f"[DEBUG] navigator.webdriver: {webdriver_flag}")
+                            update_log_callback(f"[{account_hint or temp_name}] CloakBrowser login browser opened. Please log in.")
 
-                pages = list(getattr(context, "pages", []) or [])
-                page = pages[0] if len(pages) > 0 else await AccountManager._maybe_await(context.new_page())
-                await AccountManager._apply_browser_overrides(context, page)
-                await AccountManager._apply_stealth_to_page(page)
-                if update_log_callback:
-                    try:
-                        ua = await AccountManager._maybe_await(page.evaluate("navigator.userAgent"))
-                    except Exception as ua_error:
-                        ua = f"<error: {ua_error}>"
-                    try:
-                        webdriver_flag = await AccountManager._maybe_await(page.evaluate("navigator.webdriver"))
-                    except Exception as wd_error:
-                        webdriver_flag = f"<error: {wd_error}>"
-                    update_log_callback(f"[DEBUG] User-Agent: {ua}")
-                    update_log_callback(f"[DEBUG] navigator.webdriver: {webdriver_flag}")
-                    if using_cloak:
-                        update_log_callback(f"[{account_hint or temp_name}] CloakBrowser login browser opened. Please log in.")
+                        if update_log_callback:
+                            visible_name = account_hint or temp_name
+                            update_log_callback(f"[{visible_name}] Please log in to Google and go to Labs. Close the browser when done.")
 
-                if update_log_callback:
-                    visible_name = account_hint or temp_name
-                    update_log_callback(f"[{visible_name}] Please log in to Google and go to Labs. Close the browser when done.")
+                        await AccountManager._goto_flow_page(page)
 
-                await AccountManager._goto_flow_page(page)
+                        cookies_exported_early = False
+                        try:
+                            while True:
+                                open_pages = [pg for pg in list(getattr(context, "pages", []) or []) if not pg.is_closed()]
+                                if not open_pages:
+                                    break
+                                if callable(should_stop) and should_stop():
+                                    if update_log_callback:
+                                        visible_name = account_hint or temp_name
+                                        update_log_callback(f"[{visible_name}] Login browser closed due to app shutdown.")
+                                    break
+                                if not detected_email:
+                                    maybe_email = await AccountManager._detect_logged_in_email(context)
+                                    if maybe_email:
+                                        detected_email = maybe_email
+                                        if update_log_callback:
+                                            update_log_callback(f"[AUTO] Detected logged-in Google account: {detected_email}")
+                                if detected_email and not cookies_exported_early and context is not None:
+                                    try:
+                                        cookies_exported_early = await AccountManager._export_login_cookies(
+                                            context, session_dir, detected_email, logger=update_log_callback
+                                        )
+                                    except Exception:
+                                        pass
+                                await asyncio.sleep(1)
+                        except Exception:
+                            pass
 
-                cookies_exported_early = False
-                try:
-                    # Wait for the user to close the browser manually, or for app shutdown.
-                    while True:
-                        open_pages = [pg for pg in list(getattr(context, "pages", []) or []) if not pg.is_closed()]
-                        if not open_pages:
-                            break
-                        if callable(should_stop) and should_stop():
-                            if update_log_callback:
-                                visible_name = account_hint or temp_name
-                                update_log_callback(f"[{visible_name}] Login browser closed due to app shutdown.")
-                            break
-                        if not detected_email:
-                            maybe_email = await AccountManager._detect_logged_in_email(context)
-                            if maybe_email:
-                                detected_email = maybe_email
-                                if update_log_callback:
-                                    update_log_callback(f"[AUTO] Detected logged-in Google account: {detected_email}")
-                        # Export cookies as soon as login is detected, WHILE browser is still alive.
-                        # Uses 3-tier fallback: CDP → Navigate+CDP → (SQLite after close).
-                        if detected_email and not cookies_exported_early and context is not None:
+                finally:
+                    if context is not None:
+                        if not cookies_exported_early:
                             try:
                                 cookies_exported_early = await AccountManager._export_login_cookies(
-                                    context, session_dir, detected_email, logger=update_log_callback
+                                    context, session_dir,
+                                    detected_email or temp_name,
+                                    logger=update_log_callback,
                                 )
+                            except Exception as cookie_export_exc:
+                                if update_log_callback:
+                                    update_log_callback(f"[{temp_name}] Cookie export skipped: {str(cookie_export_exc)[:60]}")
+                        try:
+                            await AccountManager._close_context_and_flush(context, flush_delay=2)
+                            context_closed_cleanly = True
+                        except Exception:
+                            pass
+                        if browser is not None:
+                            try:
+                                await browser.close()
                             except Exception:
                                 pass
-                        if chrome_process is not None and chrome_process.poll() is not None:
-                            break
-                        await asyncio.sleep(1)
-                except Exception:
-                    pass
-            finally:
-                # Try fallback cookie export if early export didn't happen
-                # (e.g. user closed browser before login was detected).
-                if not cookies_exported_early:
-                    try:
-                        if context is not None:
-                            cookies_exported_early = await AccountManager._export_login_cookies(
-                                context, session_dir,
-                                detected_email or temp_name,
-                                logger=update_log_callback,
-                            )
-                    except Exception as cookie_export_exc:
-                        if update_log_callback:
-                            update_log_callback(f"[{temp_name}] Cookie export skipped (browser already closed): {str(cookie_export_exc)[:60]}")
 
-                # Close context and flush session to disk
-                try:
-                    if context is not None:
-                        await AccountManager._close_context_and_flush(context, flush_delay=2)
-                        context_closed_cleanly = True
-                    if browser is not None:
-                        await browser.close()
-                except Exception:
-                    pass
+                        await AccountManager._post_close_sqlite_fallback(
+                            session_dir, detected_email or temp_name, logger=update_log_callback
+                        )
+                        AccountManager._unregister_context_process(context)
 
-                # SQLite fallback AFTER context close (last resort for encrypted Macs)
-                export_label = detected_email or temp_name
-                await AccountManager._post_close_sqlite_fallback(
-                    session_dir, export_label, logger=update_log_callback
-                )
+                    if chrome_process is not None and chrome_process.poll() is None:
+                        try:
+                            chrome_process.terminate()
+                        except Exception:
+                            pass
+                        process_tracker.unregister(getattr(chrome_process, "pid", None))
 
-                AccountManager._unregister_context_process(context)
-                if chrome_process is not None and chrome_process.poll() is None:
-                    try:
-                        chrome_process.terminate()
-                    except Exception:
-                        pass
-                process_tracker.unregister(getattr(chrome_process, "pid", None))
-                locks = cleanup_session_locks(session_dir)
-                if locks and callable(update_log_callback):
-                    update_log_callback(f"[{temp_name}] Cleaned {locks} lock file(s) from session.")
+                    locks = cleanup_session_locks(session_dir)
+                    if locks and callable(update_log_callback):
+                        update_log_callback(f"[{temp_name}] Cleaned {locks} lock file(s) from session.")
 
+            if not using_cloak and detected_email is None:
+                # CloakBrowser wasn't available — pure Chrome already ran above
+                pass
+
+        # ══════════════════════════════════════════════════════════════════
+        # Post-login: rename session dir, diagnostics, warmup
+        # ══════════════════════════════════════════════════════════════════
         final_name = str(detected_email or account_hint or temp_name).strip()
         final_name = final_name or temp_name
 
@@ -1385,17 +1576,15 @@ class AccountManager:
                 except Exception:
                     final_session_path = session_dir
             else:
-                # Keep uniqueness if same account directory already exists.
                 suffix_path = f"{target_session_dir}_{int(time.time())}"
                 try:
                     os.rename(session_dir, suffix_path)
                     final_session_path = suffix_path
                 except Exception:
                     final_session_path = session_dir
-                
+
         if update_log_callback:
-            if context_closed_cleanly:
-                update_log_callback(f"[{final_name}] Login browser closed. Session flushed to disk.")
+            update_log_callback(f"[{final_name}] Login browser closed. Session saved to disk.")
             cookie_file = AccountManager._find_cookie_file(final_session_path)
             if cookie_file:
                 normalized_cookie_file = os.path.normpath(cookie_file)
@@ -1411,7 +1600,6 @@ class AccountManager:
                     f"[{final_name}] Warning: no cookies file found after close. Login may not persist in headless mode."
                 )
             update_log_callback(f"[{final_name}] Session saved to {final_session_path}")
-            # ── Session debug diagnostics after login ──
             if os.path.isdir(final_session_path):
                 top_items = sorted(os.listdir(final_session_path))[:15]
                 update_log_callback(f"[DEBUG:{final_name}] Session root contents: {top_items}")
