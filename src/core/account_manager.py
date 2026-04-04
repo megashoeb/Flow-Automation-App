@@ -167,72 +167,35 @@ class AccountManager:
     @staticmethod
     def _kill_chrome_on_port(port):
         port = int(port or 0)
-        if port <= 0:
+        if port <= 0 or platform.system() != "Windows":
             return
 
-        system_name = platform.system()
-
-        if system_name == "Darwin":
-            # Mac: kill any Chrome using this debug port
-            try:
-                subprocess.run(
-                    ["pkill", "-f", f"remote-debugging-port={port}"],
-                    capture_output=True, timeout=5,
-                )
-                time.sleep(1)
-            except Exception:
-                pass
-            # Also try lsof to find PIDs on the port
-            try:
-                output = subprocess.check_output(
-                    ["lsof", "-ti", f":{port}"],
-                    text=True, timeout=5,
-                ).strip()
-                for pid_str in output.splitlines():
-                    try:
-                        os.kill(int(pid_str.strip()), 9)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        elif system_name == "Windows":
-            try:
-                _no_window = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
-                output = subprocess.check_output(
-                    ["netstat", "-ano"],
-                    text=True,
-                    encoding="utf-8",
-                    errors="ignore",
-                    **_no_window,
-                )
-                target = f":{port}"
-                pids = set()
-                for line in output.splitlines():
-                    if target not in line:
-                        continue
-                    parts = line.split()
-                    if len(parts) >= 5 and parts[-1].isdigit():
-                        pids.add(parts[-1])
-                for pid in sorted(pids):
-                    try:
-                        normalized = int(pid)
-                    except Exception:
-                        continue
-                    if process_tracker.is_tracked(normalized):
-                        process_tracker.kill_pid(normalized)
-            except Exception:
-                pass
-
-        else:
-            # Linux: similar to Mac
-            try:
-                subprocess.run(
-                    ["pkill", "-f", f"remote-debugging-port={port}"],
-                    capture_output=True, timeout=5,
-                )
-            except Exception:
-                pass
+        try:
+            _no_window = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+            output = subprocess.check_output(
+                ["netstat", "-ano"],
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                **_no_window,
+            )
+            target = f":{port}"
+            pids = set()
+            for line in output.splitlines():
+                if target not in line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 5 and parts[-1].isdigit():
+                    pids.add(parts[-1])
+            for pid in sorted(pids):
+                try:
+                    normalized = int(pid)
+                except Exception:
+                    continue
+                if process_tracker.is_tracked(normalized):
+                    process_tracker.kill_pid(normalized)
+        except Exception:
+            pass
 
     @staticmethod
     async def _maybe_await(result):
@@ -1410,22 +1373,11 @@ class AccountManager:
         if not chrome_path:
             raise RuntimeError("Google Chrome not found! Please install Chrome.")
 
-        is_mac = platform.system() == "Darwin"
         label = account_hint or os.path.basename(session_dir)
         cdp_port = 9220
 
-        if update_log_callback:
-            update_log_callback(f"[{label}] Chrome path: {chrome_path}")
-            update_log_callback(f"[{label}] Session dir: {session_dir}")
-            update_log_callback(f"[{label}] CDP port: {cdp_port}")
-
         # Clean lock files before launch
         cleanup_session_locks(session_dir)
-
-        # Kill anything already on the CDP port (Mac + Windows)
-        AccountManager._kill_chrome_on_port(cdp_port)
-        if is_mac:
-            await asyncio.sleep(2)  # Mac needs extra time after killing
 
         chrome_args = [
             chrome_path,
@@ -1437,8 +1389,6 @@ class AccountManager:
             "--disable-default-apps",
             "--disable-extensions",
             "--disable-sync",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
             "--window-size=1920,1080",
             "https://accounts.google.com",
         ]
@@ -1457,6 +1407,9 @@ class AccountManager:
             popen_kwargs["stdout"] = subprocess.DEVNULL
             popen_kwargs["stderr"] = subprocess.DEVNULL
 
+        # Kill anything on the CDP port first
+        AccountManager._kill_chrome_on_port(cdp_port)
+
         chrome_process = subprocess.Popen(
             chrome_args,
             creationflags=creationflags,
@@ -1466,28 +1419,6 @@ class AccountManager:
 
         if update_log_callback:
             update_log_callback(f"[{label}] Chrome opened (PID: {chrome_process.pid}).")
-
-        # Wait for Chrome to start — Mac needs longer
-        startup_wait = 5 if is_mac else 3
-        await asyncio.sleep(startup_wait)
-
-        # Verify CDP endpoint is alive with retries
-        cdp_ready = False
-        for attempt in range(1, 4):
-            if AccountManager._is_cdp_endpoint_live(cdp_port):
-                cdp_ready = True
-                if update_log_callback:
-                    update_log_callback(f"[{label}] CDP endpoint ready on port {cdp_port}.")
-                break
-            if update_log_callback:
-                update_log_callback(f"[{label}] CDP connection attempt {attempt}/3 — waiting...")
-            await asyncio.sleep(3)
-
-        if not cdp_ready:
-            if update_log_callback:
-                update_log_callback(f"[{label}] CDP endpoint not responding on port {cdp_port}. "
-                                    "Will try again during monitoring...")
-            # Don't abort — Chrome is still running, CDP might come up later
 
         # Monitor Chrome and extract cookies from LIVE process via CDP
         cookies_exported, detected_email = await AccountManager._monitor_chrome_and_extract_cookies(
