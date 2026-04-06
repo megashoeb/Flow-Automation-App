@@ -77,6 +77,9 @@ class RecaptchaTokenServer:
         self._cookies_cache = []
         self._last_page_reload = 0
         self._generator_task = None
+        self._bearer_token = None
+        self._bearer_token_time = 0
+        self._chrome_headers = {}
 
     async def start(self, playwright_instance):
         """Start shared browser and begin pre-generating tokens."""
@@ -90,6 +93,9 @@ class RecaptchaTokenServer:
             # Navigate to Flow page
             pages = list(getattr(self._context, "pages", []) or [])
             self._page = pages[0] if pages else await self._context.new_page()
+
+            # Intercept requests to capture Bearer token + Chrome headers
+            await self._setup_request_interception()
 
             await self._page.goto(
                 "https://labs.google/fx/tools/flow",
@@ -108,6 +114,13 @@ class RecaptchaTokenServer:
                 self._log(f"[TokenServer:{self.account_name}] No project ID found. Check login.")
                 return False
 
+            # Capture Bearer token by triggering an API call from the browser
+            if not self._bearer_token:
+                await self._trigger_bearer_capture()
+
+            if not self._bearer_token:
+                self._log(f"[TokenServer:{self.account_name}] Bearer token NOT captured. HTTP workers may fail.")
+
             # Cache cookies for HTTP workers
             await self._refresh_cookies_cache()
 
@@ -116,7 +129,8 @@ class RecaptchaTokenServer:
 
             self._log(
                 f"[TokenServer:{self.account_name}] Ready! "
-                f"Cookies: {len(self._cookies_cache)}"
+                f"Cookies: {len(self._cookies_cache)}, "
+                f"Bearer: {'yes' if self._bearer_token else 'NO'}"
             )
             return True
 
@@ -196,6 +210,128 @@ class RecaptchaTokenServer:
         except Exception as e:
             self._log(f"[TokenServer:{self.account_name}] Browser launch failed: {str(e)[:60]}")
             return False
+
+    async def _setup_request_interception(self):
+        """Intercept browser requests to capture Authorization Bearer token."""
+        def _on_request(request):
+            url = request.url
+            if "aisandbox-pa.googleapis.com" in url and request.method == "POST":
+                headers = request.headers
+                auth = headers.get("authorization", "")
+                if auth.startswith("Bearer "):
+                    self._bearer_token = auth
+                    self._bearer_token_time = time.time()
+
+                    self._chrome_headers = {
+                        "Authorization": auth,
+                        "Content-Type": "text/plain;charset=UTF-8",
+                        "Origin": "https://labs.google",
+                        "Referer": "https://labs.google/",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "cross-site",
+                    }
+                    # Capture optional Chrome-specific headers
+                    for hdr in ("x-browser-channel", "x-browser-copyright",
+                                "x-browser-validation", "x-browser-year",
+                                "x-client-data"):
+                        val = headers.get(hdr, "")
+                        if val:
+                            self._chrome_headers[hdr] = val
+
+                    self._log(
+                        f"[TokenServer:{self.account_name}] "
+                        f"Bearer token captured (len={len(auth)})"
+                    )
+
+        self._page.on("request", _on_request)
+
+    async def _trigger_bearer_capture(self):
+        """Trigger a fetch from browser context to capture Bearer token."""
+        self._log(f"[TokenServer:{self.account_name}] Triggering API request to capture Bearer token...")
+
+        # Method 1: credits endpoint (lightweight GET)
+        try:
+            status = await self._page.evaluate("""
+                async () => {
+                    try {
+                        const r = await fetch(
+                            'https://aisandbox-pa.googleapis.com/v1/credits',
+                            { method: 'GET', credentials: 'include' }
+                        );
+                        return r.status;
+                    } catch(e) { return e.message; }
+                }
+            """)
+            self._log(f"[TokenServer:{self.account_name}] Credits API response: {status}")
+            await asyncio.sleep(2)
+        except Exception as e:
+            self._log(f"[TokenServer:{self.account_name}] Credits call error: {str(e)[:50]}")
+
+        if self._bearer_token:
+            self._log(f"[TokenServer:{self.account_name}] Bearer token ready!")
+            return
+
+        # Method 2: dummy image generation request (POST — guaranteed to trigger auth)
+        try:
+            recap_token = await self._generate_recaptcha_token()
+            if recap_token and self._project_id:
+                await self._page.evaluate(
+                    """
+                    async ([projectId, recaptchaToken]) => {
+                        try {
+                            const r = await fetch(
+                                `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`,
+                                {
+                                    method: 'POST',
+                                    credentials: 'include',
+                                    headers: {'Content-Type': 'text/plain;charset=UTF-8'},
+                                    body: JSON.stringify({
+                                        clientContext: {
+                                            recaptchaContext: {token: recaptchaToken, applicationType: 'RECAPTCHA_APPLICATION_TYPE_WEB'},
+                                            projectId: projectId, tool: 'PINHOLE',
+                                            sessionId: ';' + Date.now()
+                                        },
+                                        mediaGenerationContext: {batchId: crypto.randomUUID()},
+                                        useNewMedia: true,
+                                        requests: [{
+                                            imageModelName: 'NARWHAL',
+                                            imageAspectRatio: 'IMAGE_ASPECT_RATIO_SQUARE',
+                                            structuredPrompt: {parts: [{text: 'test bearer capture'}]},
+                                            seed: Math.floor(Math.random() * 999999),
+                                            imageInputs: []
+                                        }]
+                                    })
+                                }
+                            );
+                            return r.status;
+                        } catch(e) { return e.message; }
+                    }
+                    """,
+                    [self._project_id, recap_token],
+                )
+                await asyncio.sleep(2)
+        except Exception as e:
+            self._log(f"[TokenServer:{self.account_name}] Generation trigger error: {str(e)[:50]}")
+
+        if self._bearer_token:
+            self._log(f"[TokenServer:{self.account_name}] Bearer token ready!")
+        else:
+            self._log(f"[TokenServer:{self.account_name}] Bearer token NOT captured after triggers.")
+
+    async def get_bearer_token(self):
+        """Get current Bearer token. Refresh if older than 30 minutes."""
+        if self._bearer_token and (time.time() - self._bearer_token_time) < 1800:
+            return self._bearer_token
+
+        self._log(f"[TokenServer:{self.account_name}] Bearer token expired. Refreshing...")
+        self._bearer_token = None
+        await self._trigger_bearer_capture()
+        return self._bearer_token
+
+    def get_chrome_headers(self):
+        """Get all captured Chrome headers for HTTP workers."""
+        return dict(self._chrome_headers)
 
     async def _extract_project_id(self):
         """Extract Flow project ID from page URL, DOM, or by creating a new project."""
@@ -541,6 +677,27 @@ class HttpApiWorker:
                 except Exception:
                     pass
 
+    async def _build_headers(self):
+        """Build request headers with Bearer token + Chrome headers."""
+        # Start with captured Chrome headers (includes Bearer)
+        headers = self._token_server.get_chrome_headers()
+
+        # Get fresh Bearer token if needed
+        bearer = await self._token_server.get_bearer_token()
+        if bearer:
+            headers["Authorization"] = bearer
+        else:
+            self._log(f"[{self.slot_id}] No Bearer token available!")
+
+        # Ensure critical headers
+        headers["Content-Type"] = "text/plain;charset=UTF-8"
+        headers["Origin"] = "https://labs.google"
+        headers["Referer"] = "https://labs.google/"
+        headers["Sec-Fetch-Dest"] = "empty"
+        headers["Sec-Fetch-Mode"] = "cors"
+        headers["Sec-Fetch-Site"] = "cross-site"
+        return headers
+
     async def generate_image(self, prompt, model, ratio, references=None):
         """Generate image via pure HTTP API call."""
         self.is_busy = True
@@ -588,26 +745,25 @@ class HttpApiWorker:
                 "requests": [request_item],
             }
 
-            headers = {
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Origin": "https://labs.google",
-                "Referer": "https://labs.google/",
-            }
+            headers = await self._build_headers()
 
+            # Use data= not json= (Content-Type is text/plain, not application/json)
             async with self._session.post(
-                url, json=payload, headers=headers,
+                url, data=json.dumps(payload), headers=headers,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     self.jobs_completed += 1
                     return data, None
+                elif resp.status == 401:
+                    self._log(f"[{self.slot_id}] 401 — requesting Bearer token refresh...")
+                    self._token_server._bearer_token = None  # Force refresh
+                    return None, "auth_failed: Bearer token expired"
                 else:
                     text = await resp.text()
                     if "reCAPTCHA" in text:
                         return None, f"recaptcha_block: {text[:100]}"
-                    if "auth" in text.lower():
-                        return None, f"auth_failed: {text[:100]}"
                     return None, f"HTTP {resp.status}: {text[:100]}"
 
         except asyncio.TimeoutError:
@@ -661,14 +817,10 @@ class HttpApiWorker:
                 "useV2ModelConfig": True,
             }
 
-            headers = {
-                "Content-Type": "text/plain;charset=UTF-8",
-                "Origin": "https://labs.google",
-                "Referer": "https://labs.google/",
-            }
+            headers = await self._build_headers()
 
             async with self._session.post(
-                url, json=payload, headers=headers,
+                url, data=json.dumps(payload), headers=headers,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status == 200:
@@ -680,6 +832,9 @@ class HttpApiWorker:
                             return await self._poll_video_status(media_ids, project_id), None
                     self.jobs_completed += 1
                     return data, None
+                elif resp.status == 401:
+                    self._token_server._bearer_token = None
+                    return None, "auth_failed: Bearer token expired"
                 else:
                     text = await resp.text()
                     return None, f"HTTP {resp.status}: {text[:100]}"
@@ -697,17 +852,13 @@ class HttpApiWorker:
         payload = {
             "media": [{"name": mid, "projectId": project_id} for mid in media_ids],
         }
-        headers = {
-            "Content-Type": "text/plain;charset=UTF-8",
-            "Origin": "https://labs.google",
-            "Referer": "https://labs.google/",
-        }
+        headers = await self._build_headers()
 
         for poll in range(max_polls):
             await asyncio.sleep(5)
             try:
                 async with self._session.post(
-                    url, json=payload, headers=headers,
+                    url, data=json.dumps(payload), headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status != 200:
