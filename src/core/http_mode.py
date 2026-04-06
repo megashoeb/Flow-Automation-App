@@ -132,6 +132,8 @@ class SharedBrowser:
         self._project_id = project_id
         self._jobs_since_reload = 0
         self._last_page_reload = 0
+        self._bearer_token = None
+        self._bearer_token_time = 0
 
     async def start(self, playwright_instance):
         """Start shared browser and navigate to Flow page."""
@@ -144,6 +146,9 @@ class SharedBrowser:
 
             pages = list(getattr(self._context, "pages", []) or [])
             self._page = pages[0] if pages else await self._context.new_page()
+
+            # Intercept requests to capture Bearer token
+            self._setup_request_interception()
 
             await self._page.goto(
                 "https://labs.google/fx/tools/flow",
@@ -167,9 +172,14 @@ class SharedBrowser:
             if not recap_ok:
                 self._log(f"[SharedBrowser:{self.account_name}] reCAPTCHA not loaded on page.")
 
+            # Capture Bearer token by triggering an API call
+            if not self._bearer_token:
+                await self._trigger_bearer_capture()
+
             self._log(
                 f"[SharedBrowser:{self.account_name}] Ready! "
-                f"Project: {self._project_id}, reCAPTCHA: {'yes' if recap_ok else 'NO'}"
+                f"Project: {self._project_id}, reCAPTCHA: {'yes' if recap_ok else 'NO'}, "
+                f"Bearer: {'yes' if self._bearer_token else 'NO'}"
             )
             return True
 
@@ -266,6 +276,89 @@ class SharedBrowser:
         except Exception as e:
             self._log(f"[SharedBrowser:{self.account_name}] Browser launch failed: {str(e)[:60]}")
             return False
+
+    def _setup_request_interception(self):
+        """Intercept browser requests to capture Authorization Bearer token."""
+        def _on_request(request):
+            if "aisandbox-pa.googleapis.com" in request.url and request.method == "POST":
+                auth = request.headers.get("authorization", "")
+                if auth.startswith("Bearer "):
+                    self._bearer_token = auth
+                    self._bearer_token_time = time.time()
+                    self._log(f"[SharedBrowser:{self.account_name}] Bearer token captured (len={len(auth)})")
+        self._page.on("request", _on_request)
+
+    async def _trigger_bearer_capture(self):
+        """Trigger a fetch() from the browser to capture the Bearer token."""
+        self._log(f"[SharedBrowser:{self.account_name}] Triggering API request to capture Bearer token...")
+        try:
+            status = await self._page.evaluate("""
+                async () => {
+                    try {
+                        const r = await fetch(
+                            'https://aisandbox-pa.googleapis.com/v1/credits',
+                            { method: 'GET', credentials: 'include' }
+                        );
+                        return r.status;
+                    } catch(e) { return e.message; }
+                }
+            """)
+            self._log(f"[SharedBrowser:{self.account_name}] Credits API: {status}")
+            await asyncio.sleep(2)
+        except Exception as e:
+            self._log(f"[SharedBrowser:{self.account_name}] Credits call error: {str(e)[:50]}")
+
+        if self._bearer_token:
+            self._log(f"[SharedBrowser:{self.account_name}] Bearer token ready!")
+            return
+
+        # Fallback: dummy generation POST
+        try:
+            recap = await self._page.evaluate("""
+                async () => {
+                    try {
+                        const scripts = document.querySelectorAll("script[src*='recaptcha'][src*='render=']");
+                        let sk = null;
+                        for (const s of scripts) {
+                            const m = s.src.match(/render=([^&]+)/);
+                            if (m && m[1] !== 'explicit') { sk = m[1]; break; }
+                        }
+                        if (!sk || !grecaptcha || !grecaptcha.enterprise) return null;
+                        return await grecaptcha.enterprise.execute(sk, {action: 'generate'});
+                    } catch(e) { return null; }
+                }
+            """)
+            if recap and self._project_id:
+                await self._page.evaluate(
+                    """async ([pid, tok]) => {
+                        try {
+                            await fetch(
+                                `https://aisandbox-pa.googleapis.com/v1/projects/${pid}/flowMedia:batchGenerateImages`,
+                                {method:'POST', credentials:'include',
+                                 headers:{'Content-Type':'text/plain;charset=UTF-8'},
+                                 body:JSON.stringify({clientContext:{recaptchaContext:{token:tok,applicationType:'RECAPTCHA_APPLICATION_TYPE_WEB'},projectId:pid,tool:'PINHOLE',sessionId:';'+Date.now()},mediaGenerationContext:{batchId:crypto.randomUUID()},useNewMedia:true,requests:[{imageModelName:'NARWHAL',imageAspectRatio:'IMAGE_ASPECT_RATIO_SQUARE',structuredPrompt:{parts:[{text:'bearer capture test'}]},seed:12345,imageInputs:[]}]})}
+                            );
+                        } catch(e) {}
+                    }""",
+                    [self._project_id, recap],
+                )
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+        if self._bearer_token:
+            self._log(f"[SharedBrowser:{self.account_name}] Bearer token ready!")
+        else:
+            self._log(f"[SharedBrowser:{self.account_name}] Bearer token NOT captured.")
+
+    async def get_bearer_token(self):
+        """Get Bearer token. Refresh if expired (>30 min)."""
+        if self._bearer_token and (time.time() - self._bearer_token_time) < 1800:
+            return self._bearer_token
+        self._log(f"[SharedBrowser:{self.account_name}] Bearer token expired. Refreshing...")
+        self._bearer_token = None
+        await self._trigger_bearer_capture()
+        return self._bearer_token
 
     async def _extract_project_id(self):
         """Extract Flow project ID from page."""
@@ -461,13 +554,16 @@ class BrowserFetchWorker:
         self.jobs_completed = 0
 
     async def generate_image(self, prompt, model, ratio, references=None):
-        """Generate image: reCAPTCHA + fetch in ONE browser evaluate."""
+        """Generate image: reCAPTCHA + fetch with Bearer token in ONE evaluate."""
         self.is_busy = True
         try:
             page = self._browser.get_page()
             project_id = self._browser.get_project_id()
+            bearer = await self._browser.get_bearer_token()
             if not page or not project_id:
                 return None, "No browser page or project ID"
+            if not bearer:
+                return None, "No Bearer token — auth will fail"
 
             api_model = _resolve_image_model(model)
             api_ratio = _resolve_image_ratio(ratio)
@@ -479,7 +575,7 @@ class BrowserFetchWorker:
 
             result = await page.evaluate(
                 """
-                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, refInputs]) => {
+                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, refInputs, bearerToken]) => {
                     try {
                         // Step 1: Generate reCAPTCHA token (same browser context)
                         let recaptchaToken = null;
@@ -523,12 +619,15 @@ class BrowserFetchWorker:
                             }]
                         };
 
-                        // Step 3: fetch() — browser handles cookies + auth automatically
+                        // Step 3: fetch with Bearer token + cookies
                         const url = `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`;
                         const resp = await fetch(url, {
                             method: 'POST',
                             credentials: 'include',
-                            headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+                            headers: {
+                                'Content-Type': 'text/plain;charset=UTF-8',
+                                'Authorization': bearerToken
+                            },
                             body: JSON.stringify(payload)
                         });
 
@@ -543,7 +642,7 @@ class BrowserFetchWorker:
                     }
                 }
                 """,
-                [project_id, prompt, api_model, api_ratio, seed, session_id, batch_id, references or []],
+                [project_id, prompt, api_model, api_ratio, seed, session_id, batch_id, references or [], bearer],
             )
 
             await self._browser.maybe_reload()
@@ -563,13 +662,16 @@ class BrowserFetchWorker:
             self.is_busy = False
 
     async def generate_video(self, prompt, model, ratio):
-        """Generate video: reCAPTCHA + fetch in ONE browser evaluate."""
+        """Generate video: reCAPTCHA + fetch with Bearer token in ONE evaluate."""
         self.is_busy = True
         try:
             page = self._browser.get_page()
             project_id = self._browser.get_project_id()
+            bearer = await self._browser.get_bearer_token()
             if not page or not project_id:
                 return None, "No browser page or project ID"
+            if not bearer:
+                return None, "No Bearer token — auth will fail"
 
             api_model = _resolve_video_model(model)
             api_ratio = _resolve_video_ratio(ratio)
@@ -581,7 +683,7 @@ class BrowserFetchWorker:
 
             result = await page.evaluate(
                 """
-                async ([projectId, prompt, model, ratio, seed, sessionId, batchId]) => {
+                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, bearerToken]) => {
                     try {
                         let recaptchaToken = null;
                         try {
@@ -629,7 +731,10 @@ class BrowserFetchWorker:
                             {
                                 method: 'POST',
                                 credentials: 'include',
-                                headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+                                headers: {
+                                    'Content-Type': 'text/plain;charset=UTF-8',
+                                    'Authorization': bearerToken
+                                },
                                 body: JSON.stringify(payload)
                             }
                         );
@@ -645,7 +750,7 @@ class BrowserFetchWorker:
                     }
                 }
                 """,
-                [project_id, prompt, api_model, api_ratio, seed, session_id, batch_id],
+                [project_id, prompt, api_model, api_ratio, seed, session_id, batch_id, bearer],
             )
 
             await self._browser.maybe_reload()
@@ -855,6 +960,11 @@ class HttpModeManager:
                     f"[{worker.slot_id}] Attempt {attempt + 1}/{max_retries + 1} "
                     f"failed: {last_error[:200]}"
                 )
+
+                # Force Bearer refresh on 401
+                if "401" in last_error or "auth" in last_error.lower():
+                    self._log(f"[{worker.slot_id}] Auth failure — refreshing Bearer token...")
+                    worker._browser._bearer_token = None
 
                 if attempt < max_retries:
                     await asyncio.sleep(10 * (attempt + 1))
