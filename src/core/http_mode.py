@@ -179,7 +179,15 @@ class SharedBrowser:
 
     async def _launch_browser(self, playwright_instance):
         """Launch CloakBrowser (preferred) or Playwright persistent context."""
+        # Debug: log cookie file status
+        self._log(f"[SharedBrowser:{self.account_name}] Session path: {self._session_path}")
+        self._log(
+            f"[SharedBrowser:{self.account_name}] Cookies JSON: {self._cookies_json} "
+            f"(exists: {os.path.exists(self._cookies_json)})"
+        )
+
         cookies = self._load_exported_cookies()
+        self._log(f"[SharedBrowser:{self.account_name}] Loaded {len(cookies)} cookies from JSON file.")
 
         # Try CloakBrowser
         try:
@@ -189,23 +197,44 @@ class SharedBrowser:
             if cloak_api.get("available") and cloak_persistent:
                 seed = random.randint(10000, 99999)
                 if platform.system() == "Darwin":
+                    # Mac: fresh profile + imported cookies (avoid lock conflicts)
                     profile = self._session_path + "_shared_browser"
                     os.makedirs(profile, exist_ok=True)
                     self._clean_locks(profile)
                 else:
+                    # Windows: use account's session directly (persistent cookies)
                     profile = self._session_path
                     self._clean_locks(profile)
+
+                self._log(f"[SharedBrowser:{self.account_name}] Profile path: {profile}")
 
                 self._context = await cloak_persistent(
                     profile, headless=True,
                     args=[f"--fingerprint={seed}"], humanize=True,
                 )
-                if cookies:
-                    try:
-                        await self._context.add_cookies(cookies)
-                    except Exception:
-                        pass
-                self._log(f"[SharedBrowser:{self.account_name}] CloakBrowser started ({len(cookies)} cookies).")
+
+                # Import cookies — CRITICAL for login session
+                cookies_imported = await self._import_cookies(cookies)
+
+                # Check actual cookie count in browser
+                try:
+                    actual = await self._context.cookies()
+                    actual_count = len(actual)
+                except Exception:
+                    actual_count = cookies_imported
+
+                self._log(
+                    f"[SharedBrowser:{self.account_name}] CloakBrowser started. "
+                    f"Imported: {cookies_imported}, Browser has: {actual_count} cookies."
+                )
+
+                if actual_count == 0:
+                    self._log(
+                        f"[SharedBrowser:{self.account_name}] "
+                        "NO cookies in browser! Login session missing. "
+                        f"Check: {self._cookies_json}"
+                    )
+
                 return True
         except Exception as e:
             self._log(f"[SharedBrowser:{self.account_name}] CloakBrowser not available: {str(e)[:40]}")
@@ -213,17 +242,26 @@ class SharedBrowser:
         # Fallback: Playwright
         try:
             self._clean_locks(self._session_path)
+            self._log(f"[SharedBrowser:{self.account_name}] Profile path: {self._session_path}")
+
             self._context = await playwright_instance.chromium.launch_persistent_context(
                 self._session_path, headless=True,
                 args=["--disable-gpu", "--no-sandbox", "--disable-blink-features=AutomationControlled"],
                 ignore_default_args=["--enable-automation"],
             )
-            if cookies:
-                try:
-                    await self._context.add_cookies(cookies)
-                except Exception:
-                    pass
-            self._log(f"[SharedBrowser:{self.account_name}] Playwright started ({len(cookies)} cookies).")
+
+            cookies_imported = await self._import_cookies(cookies)
+
+            try:
+                actual = await self._context.cookies()
+                actual_count = len(actual)
+            except Exception:
+                actual_count = cookies_imported
+
+            self._log(
+                f"[SharedBrowser:{self.account_name}] Playwright started. "
+                f"Imported: {cookies_imported}, Browser has: {actual_count} cookies."
+            )
             return True
         except Exception as e:
             self._log(f"[SharedBrowser:{self.account_name}] Browser launch failed: {str(e)[:60]}")
@@ -346,13 +384,42 @@ class SharedBrowser:
 
     def _load_exported_cookies(self):
         if not os.path.exists(self._cookies_json):
+            self._log(f"[SharedBrowser:{self.account_name}] exported_cookies.json NOT FOUND at {self._cookies_json}")
             return []
         try:
             with open(self._cookies_json, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
-            return [c for c in cookies if c.get("name") and c.get("value") and c.get("domain")]
-        except Exception:
+            valid = [c for c in cookies if c.get("name") and c.get("value") and c.get("domain")]
+            if len(valid) != len(cookies):
+                self._log(
+                    f"[SharedBrowser:{self.account_name}] "
+                    f"Filtered {len(cookies) - len(valid)} invalid cookies."
+                )
+            return valid
+        except Exception as e:
+            self._log(f"[SharedBrowser:{self.account_name}] Cookie file read error: {str(e)[:50]}")
             return []
+
+    async def _import_cookies(self, cookies):
+        """Import cookies into browser context. Returns count imported."""
+        if not cookies or not self._context:
+            return 0
+        try:
+            await self._context.add_cookies(cookies)
+            return len(cookies)
+        except Exception as e:
+            self._log(f"[SharedBrowser:{self.account_name}] add_cookies error: {str(e)[:80]}")
+            # Try importing one by one to skip bad cookies
+            imported = 0
+            for c in cookies:
+                try:
+                    await self._context.add_cookies([c])
+                    imported += 1
+                except Exception:
+                    pass
+            if imported > 0:
+                self._log(f"[SharedBrowser:{self.account_name}] Imported {imported}/{len(cookies)} cookies (some failed).")
+            return imported
 
     def _clean_locks(self, path):
         for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
