@@ -577,7 +577,7 @@ class BrowserFetchWorker:
                 """
                 async ([projectId, prompt, model, ratio, seed, sessionId, batchId, refInputs, bearerToken]) => {
                     try {
-                        // Step 1: Generate reCAPTCHA token (same browser context)
+                        // Step 1: Generate reCAPTCHA token
                         let recaptchaToken = null;
                         try {
                             const scripts = document.querySelectorAll("script[src*='recaptcha'][src*='render=']");
@@ -593,7 +593,7 @@ class BrowserFetchWorker:
                             return { error: 'reCAPTCHA failed: ' + e.message };
                         }
 
-                        // Step 2: Build payload
+                        // Step 2: Build payload — clientContext at BOTH levels (HAR confirmed)
                         const clientContext = {
                             projectId: projectId,
                             tool: 'PINHOLE',
@@ -611,6 +611,7 @@ class BrowserFetchWorker:
                             mediaGenerationContext: { batchId: batchId },
                             useNewMedia: true,
                             requests: [{
+                                clientContext: clientContext,
                                 imageModelName: model,
                                 imageAspectRatio: ratio,
                                 structuredPrompt: { parts: [{ text: prompt }] },
@@ -619,19 +620,24 @@ class BrowserFetchWorker:
                             }]
                         };
 
-                        // Step 3: Build body and log for debug
-                        const bodyStr = JSON.stringify(payload);
+                        // Step 3: fetch with Bearer token + cookies
                         const url = `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`;
+                        const resp = await fetch(url, {
+                            method: 'POST',
+                            credentials: 'include',
+                            headers: {
+                                'Content-Type': 'text/plain;charset=UTF-8',
+                                'Authorization': bearerToken
+                            },
+                            body: JSON.stringify(payload)
+                        });
 
-                        // DEBUG: Return payload for inspection
-                        return {
-                            debug: true,
-                            debug_url: url,
-                            debug_payload: bodyStr.substring(0, 1000),
-                            debug_length: bodyStr.length,
-                            debug_bearer: bearerToken ? bearerToken.substring(0, 20) + '...' : 'NONE',
-                            debug_recaptcha: recaptchaToken ? recaptchaToken.substring(0, 20) + '...' : 'NONE'
-                        };
+                        if (!resp.ok) {
+                            const errText = await resp.text();
+                            return { error: `HTTP ${resp.status}: ${errText.substring(0, 300)}` };
+                        }
+
+                        return { success: true, data: await resp.json() };
                     } catch(e) {
                         return { error: e.message || String(e) };
                     }
@@ -644,15 +650,6 @@ class BrowserFetchWorker:
 
             if not result:
                 return None, "No response from browser evaluate"
-
-            # DEBUG MODE: log payload and return
-            if result.get("debug"):
-                self._log(f"[{self.slot_id}] DEBUG URL: {result.get('debug_url', '?')}")
-                self._log(f"[{self.slot_id}] DEBUG PAYLOAD ({result.get('debug_length', 0)} chars): {result.get('debug_payload', '?')}")
-                self._log(f"[{self.slot_id}] DEBUG Bearer: {result.get('debug_bearer', '?')}")
-                self._log(f"[{self.slot_id}] DEBUG reCAPTCHA: {result.get('debug_recaptcha', '?')}")
-                return None, "DEBUG MODE — payload logged, API not called"
-
             if result.get("error"):
                 return None, result["error"]
             if result.get("success"):
@@ -721,6 +718,7 @@ class BrowserFetchWorker:
                             mediaGenerationContext: { batchId: batchId },
                             clientContext: clientContext,
                             requests: [{
+                                clientContext: clientContext,
                                 aspectRatio: ratio,
                                 seed: seed,
                                 textInput: { structuredPrompt: { parts: [{ text: prompt }] } },
