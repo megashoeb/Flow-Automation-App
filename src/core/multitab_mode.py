@@ -520,10 +520,31 @@ class AccountBrowser:
             return False
 
     async def _launch_browser(self, playwright_instance):
-        """Launch CloakBrowser or Playwright persistent context."""
+        """Launch CloakBrowser or Playwright for GENERATION only (login already done)."""
         label = f"MultiTab:{self.account_name}"
+
+        # Read display setting — respect visible/headless choice
+        cloak_display = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
+        is_headless = cloak_display != "visible"
+        self._log(f"[{label}] Display: {'headless' if is_headless else 'visible'}")
+
+        # Load cookies from login session
         cookies = _load_cookies_from_json(self._cookies_json, self._log, label)
         self._log(f"[{label}] Cookies JSON: {self._cookies_json} ({len(cookies)} cookies)")
+
+        # Determine profile path:
+        #   Windows: use session_path directly (cookies in persistent context from login)
+        #   Mac: fresh profile + import cookies (Mac hybrid — login was pure Chrome)
+        is_mac = platform.system() == "Darwin"
+        if is_mac:
+            profile = self._session_path + "_multitab"
+            os.makedirs(profile, exist_ok=True)
+            _clean_lock_files(profile)
+        else:
+            profile = self._session_path
+            _clean_lock_files(profile)
+
+        self._log(f"[{label}] Profile: {profile} ({'Mac fresh + cookies' if is_mac else 'Windows session'})")
 
         # Try CloakBrowser
         try:
@@ -532,40 +553,39 @@ class AccountBrowser:
 
             if cloak_api.get("available") and cloak_persistent:
                 seed = random.randint(10000, 99999)
-                if platform.system() == "Darwin":
-                    profile = self._session_path + "_multitab"
-                    os.makedirs(profile, exist_ok=True)
-                    _clean_lock_files(profile)
-                else:
-                    profile = self._session_path
-                    _clean_lock_files(profile)
-
-                self._log(f"[{label}] Profile: {profile}")
                 self._context = await cloak_persistent(
-                    profile, headless=True,
-                    args=[f"--fingerprint={seed}", "--disable-dev-shm-usage"],
+                    profile, headless=is_headless,
+                    args=[
+                        f"--fingerprint={seed}",
+                        "--disable-gpu",
+                        "--disable-software-rasterizer",
+                        "--disable-dev-shm-usage",
+                    ],
                     humanize=True,
                 )
 
-                # Import cookies
+                # Import cookies (essential on Mac, harmless on Windows)
                 imported = await self._import_cookies(cookies)
                 try:
                     actual = await self._context.cookies()
                     actual_count = len(actual)
                 except Exception:
                     actual_count = imported
-                self._log(f"[{label}] CloakBrowser started. Imported: {imported}, Browser: {actual_count} cookies.")
+                self._log(
+                    f"[{label}] CloakBrowser started ({'visible' if not is_headless else 'headless'}). "
+                    f"Imported: {imported}, Browser: {actual_count} cookies."
+                )
                 if actual_count == 0:
                     self._log(f"[{label}] NO cookies! Check: {self._cookies_json}")
                 return True
         except Exception as e:
             self._log(f"[{label}] CloakBrowser not available: {str(e)[:40]}")
 
-        # Fallback: Playwright
+        # Fallback: Playwright persistent context
         try:
             _clean_lock_files(self._session_path)
             self._context = await playwright_instance.chromium.launch_persistent_context(
-                self._session_path, headless=True,
+                self._session_path, headless=is_headless,
                 args=["--disable-gpu", "--no-sandbox", "--disable-blink-features=AutomationControlled",
                       "--disable-dev-shm-usage"],
                 ignore_default_args=["--enable-automation"],
