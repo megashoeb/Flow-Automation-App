@@ -532,19 +532,17 @@ class AccountBrowser:
         cookies = _load_cookies_from_json(self._cookies_json, self._log, label)
         self._log(f"[{label}] Cookies JSON: {self._cookies_json} ({len(cookies)} cookies)")
 
-        # Determine profile path:
-        #   Windows: use session_path directly (cookies in persistent context from login)
-        #   Mac: fresh profile + import cookies (Mac hybrid — login was pure Chrome)
-        is_mac = platform.system() == "Darwin"
-        if is_mac:
-            profile = self._session_path + "_multitab"
-            os.makedirs(profile, exist_ok=True)
-            _clean_lock_files(profile)
-        else:
-            profile = self._session_path
-            _clean_lock_files(profile)
+        # Always use a SEPARATE profile for multi-tab generation.
+        # Login uses pure Chrome which locks the session_path — using the
+        # same path causes "Target page, context" errors from lock conflicts.
+        # Fresh profile + imported cookies works on ALL platforms.
+        profile = self._session_path + "_multitab"
+        os.makedirs(profile, exist_ok=True)
+        _clean_lock_files(profile)
+        # Also clean the source session in case locks leaked
+        _clean_lock_files(self._session_path)
 
-        self._log(f"[{label}] Profile: {profile} ({'Mac fresh + cookies' if is_mac else 'Windows session'})")
+        self._log(f"[{label}] Profile: {profile} (fresh + imported cookies)")
 
         # Try CloakBrowser
         try:
@@ -579,7 +577,7 @@ class AccountBrowser:
                     self._log(f"[{label}] NO cookies! Check: {self._cookies_json}")
                 return True
         except Exception as e:
-            self._log(f"[{label}] CloakBrowser not available: {str(e)[:40]}")
+            self._log(f"[{label}] CloakBrowser failed: {str(e)[:120]}")
 
         # Fallback: Playwright persistent context
         try:
@@ -594,7 +592,7 @@ class AccountBrowser:
             self._log(f"[{label}] Playwright started ({imported} cookies imported).")
             return True
         except Exception as e:
-            self._log(f"[{label}] Browser launch failed: {str(e)[:60]}")
+            self._log(f"[{label}] Browser launch failed: {str(e)[:200]}")
             return False
 
     async def _import_cookies(self, cookies):
