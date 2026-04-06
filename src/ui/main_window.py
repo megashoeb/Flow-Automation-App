@@ -2019,7 +2019,7 @@ class MainWindow(QMainWindow):
         return combo
 
     def _create_parallel_combo(self, saved_slots):
-        combo = self._create_setting_combo([(str(i), i) for i in range(1, 6)], current_data=max(1, min(5, saved_slots)), trigger_sync=False)
+        combo = self._create_setting_combo([(str(i), i) for i in range(1, 31)], current_data=max(1, min(30, saved_slots)), trigger_sync=False)
         combo.currentIndexChanged.connect(lambda _=None: self._update_runtime_badges())
         return combo
 
@@ -3580,6 +3580,28 @@ class MainWindow(QMainWindow):
         browser_layout.addStretch()
         perf_layout.addLayout(browser_layout)
         self._on_browser_mode_changed(self.cmb_browser_mode.currentIndex())
+
+        # ── Generation Mode (Browser vs HTTP) ──
+        gen_mode_layout = QHBoxLayout()
+        gen_mode_layout.addWidget(QLabel("Generation Mode:"))
+        self.cmb_generation_mode = QComboBox()
+        self.cmb_generation_mode.setObjectName("settingInput")
+        self.cmb_generation_mode.setMinimumHeight(38)
+        self.cmb_generation_mode.addItem("Browser per slot (stable, default)", "browser_per_slot")
+        self.cmb_generation_mode.addItem("HTTP + Shared Token Server (experimental, low RAM)", "http_token_server")
+        self.cmb_generation_mode.setToolTip(
+            "Browser per slot: Each parallel slot opens its own browser (~300MB each). Proven stable.\n\n"
+            "HTTP + Token Server: ONE browser generates reCAPTCHA tokens, all slots use pure HTTP (~5MB each).\n"
+            "Allows 20-30 parallel slots in ~500MB RAM. EXPERIMENTAL — may have issues."
+        )
+        saved_gen_mode = str(get_setting("generation_mode", "browser_per_slot") or "browser_per_slot").strip().lower()
+        gen_mode_index = self.cmb_generation_mode.findData(saved_gen_mode)
+        if gen_mode_index < 0:
+            gen_mode_index = 0
+        self.cmb_generation_mode.setCurrentIndex(gen_mode_index)
+        gen_mode_layout.addWidget(self.cmb_generation_mode)
+        gen_mode_layout.addStretch()
+        perf_layout.addLayout(gen_mode_layout)
 
         self.chk_random_fingerprint = QCheckBox("Random fingerprint per session (like GoLogin)")
         self.chk_random_fingerprint.setChecked(get_bool_setting("random_fingerprint_per_session", False))
@@ -5809,6 +5831,7 @@ class MainWindow(QMainWindow):
             "api_humanized_wait_no_ref_min_seconds": str(no_ref_wait_min),
             "api_humanized_wait_no_ref_max_seconds": str(no_ref_wait_max),
             "output_directory": stored_output_dir,
+            "generation_mode": str(getattr(self, "cmb_generation_mode", None) and self.cmb_generation_mode.currentData() or "browser_per_slot"),
         }
         self._start_background_task(
             self._persist_settings_payload,

@@ -40,6 +40,7 @@ DEFAULT_APP_SETTINGS = {
     "auto_restart_recap_fail_window": "10",
     "auto_restart_recap_cooldown_seconds": "30",
     "output_directory": "",
+    "generation_mode": "browser_per_slot",
 }
 
 def ensure_db():

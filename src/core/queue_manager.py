@@ -101,6 +101,10 @@ class AsyncQueueManager(QThread):
             cloak_display_raw = "headless"
         self.cloak_display = cloak_display_raw
         self.light_warmup_enabled = get_bool_setting("light_warmup", True)
+        gen_mode_raw = str(get_setting("generation_mode", "browser_per_slot") or "browser_per_slot").strip().lower()
+        if gen_mode_raw not in {"browser_per_slot", "http_token_server"}:
+            gen_mode_raw = "browser_per_slot"
+        self.generation_mode = gen_mode_raw
         self.scheduler_poll_seconds = 2
         self.inter_job_cooldown_seconds = 1.5
         self.max_consecutive_slot_failures = 2
@@ -351,6 +355,23 @@ class AsyncQueueManager(QThread):
                         pass
 
     async def process_queue(self):
+        if self.generation_mode == "http_token_server":
+            self.signals.log_msg.emit("[SYSTEM] Generation mode: HTTP + Shared Token Server (experimental)")
+            self.signals.log_msg.emit("[SYSTEM] 1 browser per account for reCAPTCHA, pure HTTP for API calls.")
+            try:
+                from src.core.http_mode import HttpModeManager
+                manager = HttpModeManager(self)
+                await manager.run()
+            except ImportError:
+                self.signals.log_msg.emit("[ERROR] HTTP mode module not found (src/core/http_mode.py). Falling back to browser mode.")
+            except Exception as e:
+                self.signals.log_msg.emit(f"[ERROR] HTTP mode failed: {str(e)[:100]}. Falling back to browser mode.")
+            else:
+                return
+            self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
+        else:
+            self.signals.log_msg.emit("[SYSTEM] Generation mode: Browser per slot (stable)")
+
         self.signals.log_msg.emit("[SYSTEM] Queue Manager started. Fetching accounts...")
         GoogleLabsBot.clear_reference_cache()
         self.queue_summary_emitted = False
