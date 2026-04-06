@@ -858,23 +858,16 @@ class GoogleLabsBot:
         headless = self.cloak_display == "headless"
         seed = self._build_cloak_fingerprint_seed()
         cloak_args = self._build_cloak_launch_args(seed)
-        is_mac = platform.system() == "Darwin"
 
-        # Mac hybrid: CloakBrowser uses a fresh profile dir, NOT Real Chrome's session.
-        # Real Chrome's session has Chrome-specific files that confuse CloakBrowser.
-        # Cookies are transferred via exported_cookies.json instead.
-        if is_mac:
-            cloak_profile = os.path.abspath(str(self.session_path or "")) + "_cloak"
-            os.makedirs(cloak_profile, exist_ok=True)
-            cleanup_session_locks(cloak_profile)
-        else:
-            cloak_profile = self.session_path
-
-        # Clean lock files before launching (don't kill other slots' processes)
+        # Login now uses pure Chrome on ALL platforms. Chrome's session files
+        # are incompatible with CloakBrowser. Always use a fresh _cloak profile
+        # and import cookies via exported_cookies.json.
+        cloak_profile = os.path.abspath(str(self.session_path or "")) + "_cloak"
+        os.makedirs(cloak_profile, exist_ok=True)
         cleanup_session_locks(cloak_profile)
 
         if callable(log_callback):
-            mode_label = "Mac hybrid (fresh profile + cookie import)" if is_mac else "standard"
+            mode_label = "fresh profile + cookie import"
             log_callback(
                 f"[{self.account_name}] CloakBrowser mode: {mode_label} "
                 f"(seed={seed}, headless={headless}, profile={cloak_profile})"
