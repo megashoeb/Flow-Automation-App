@@ -142,12 +142,13 @@ class TabWorker:
     credentials: 'include' sends cookies + OAuth automatically.
     """
 
-    def __init__(self, slot_id, page, project_id, log_fn):
+    def __init__(self, slot_id, page, project_id, log_fn, get_bearer=None):
         self.slot_id = slot_id
         self.account_name = slot_id.split("#")[0] if "#" in slot_id else slot_id
         self._page = page
         self._project_id = project_id
         self._log = log_fn
+        self._get_bearer = get_bearer  # Function to get Bearer token from AccountBrowser
         self.is_busy = False
         self.jobs_completed = 0
         self._recaptcha_ready = False
@@ -164,9 +165,13 @@ class TabWorker:
             self._log(f"[{self.slot_id}] reCAPTCHA not ready on tab.")
 
     async def generate_image(self, prompt, model, ratio, references=None):
-        """Generate image: reCAPTCHA + fetch in this tab's browser context."""
+        """Generate image: reCAPTCHA + fetch with Bearer in this tab."""
         self.is_busy = True
         try:
+            bearer = self._get_bearer() if self._get_bearer else None
+            if not bearer:
+                return None, "No Bearer token available"
+
             api_model = _resolve_image_model(model)
             api_ratio = _resolve_image_ratio(ratio)
             seed = random.randint(100000, 999999)
@@ -177,7 +182,7 @@ class TabWorker:
 
             result = await self._page.evaluate(
                 """
-                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, refInputs]) => {
+                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, refInputs, bearerToken]) => {
                     try {
                         // reCAPTCHA token
                         let recaptchaToken = null;
@@ -227,7 +232,10 @@ class TabWorker:
                         const resp = await fetch(url, {
                             method: 'POST',
                             credentials: 'include',
-                            headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+                            headers: {
+                                'Content-Type': 'text/plain;charset=UTF-8',
+                                'Authorization': bearerToken
+                            },
                             body: JSON.stringify(payload)
                         });
 
@@ -242,7 +250,7 @@ class TabWorker:
                 }
                 """,
                 [self._project_id, prompt, api_model, api_ratio, seed, session_id, batch_id,
-                 json.dumps(references) if references else "[]"],
+                 json.dumps(references) if references else "[]", bearer],
             )
 
             return self._handle_result(result)
@@ -254,9 +262,13 @@ class TabWorker:
             await self._maybe_refresh()
 
     async def generate_video(self, prompt, model, ratio):
-        """Generate video: reCAPTCHA + fetch in this tab's browser context."""
+        """Generate video: reCAPTCHA + fetch with Bearer in this tab."""
         self.is_busy = True
         try:
+            bearer = self._get_bearer() if self._get_bearer else None
+            if not bearer:
+                return None, "No Bearer token available"
+
             api_model = _resolve_video_model(model)
             api_ratio = _resolve_video_ratio(ratio)
             seed = random.randint(100000, 999999)
@@ -267,7 +279,7 @@ class TabWorker:
 
             result = await self._page.evaluate(
                 """
-                async ([projectId, prompt, model, ratio, seed, sessionId, batchId]) => {
+                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, bearerToken]) => {
                     try {
                         let recaptchaToken = null;
                         try {
@@ -316,7 +328,10 @@ class TabWorker:
                             {
                                 method: 'POST',
                                 credentials: 'include',
-                                headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+                                headers: {
+                                    'Content-Type': 'text/plain;charset=UTF-8',
+                                    'Authorization': bearerToken
+                                },
                                 body: JSON.stringify(payload)
                             }
                         );
@@ -331,7 +346,7 @@ class TabWorker:
                     }
                 }
                 """,
-                [self._project_id, prompt, api_model, api_ratio, seed, session_id, batch_id],
+                [self._project_id, prompt, api_model, api_ratio, seed, session_id, batch_id, bearer],
             )
 
             return self._handle_result(result)
@@ -386,6 +401,8 @@ class AccountBrowser:
         self._context = None
         self._project_id = None
         self._tabs = []
+        self._bearer_token = None
+        self._bearer_token_time = 0
 
     async def start(self, num_tabs, playwright_instance):
         """Launch browser and create N tabs."""
@@ -399,6 +416,9 @@ class AccountBrowser:
             # Navigate first page to Flow
             pages = list(getattr(self._context, "pages", []) or [])
             first_page = pages[0] if pages else await self._context.new_page()
+
+            # Intercept requests to capture Bearer token
+            self._setup_request_interception(first_page)
 
             try:
                 await first_page.goto(FLOW_URL, wait_until="domcontentloaded", timeout=30000)
@@ -453,8 +473,21 @@ class AccountBrowser:
                 self._log(f"[MultiTab:{self.account_name}] reCAPTCHA not loaded!")
                 return False
 
+            # Capture Bearer token
+            if not self._bearer_token:
+                await self._trigger_bearer_capture(first_page)
+
+            if self._bearer_token:
+                self._log(f"[MultiTab:{self.account_name}] Bearer token ready.")
+            else:
+                self._log(f"[MultiTab:{self.account_name}] Bearer token NOT captured!")
+                return False
+
             # Create Tab 1 from first page
-            tab1 = TabWorker(f"{self.account_name}#t1", first_page, self._project_id, self._log)
+            tab1 = TabWorker(
+                f"{self.account_name}#t1", first_page, self._project_id,
+                self._log, get_bearer=self.get_bearer_token,
+            )
             await tab1.setup()
             self._tabs.append(tab1)
 
@@ -462,9 +495,13 @@ class AccountBrowser:
             for i in range(2, num_tabs + 1):
                 try:
                     page = await self._context.new_page()
+                    self._setup_request_interception(page)
                     await page.goto(FLOW_URL, wait_until="domcontentloaded", timeout=20000)
                     await asyncio.sleep(2)
-                    tab = TabWorker(f"{self.account_name}#t{i}", page, self._project_id, self._log)
+                    tab = TabWorker(
+                        f"{self.account_name}#t{i}", page, self._project_id,
+                        self._log, get_bearer=self.get_bearer_token,
+                    )
                     await tab.setup()
                     self._tabs.append(tab)
                     await asyncio.sleep(0.5)
@@ -474,7 +511,7 @@ class AccountBrowser:
             est_ram = 300 + len(self._tabs) * 30
             self._log(
                 f"[MultiTab:{self.account_name}] {len(self._tabs)} tabs ready. "
-                f"Est. RAM: ~{est_ram}MB"
+                f"Bearer: yes, Est. RAM: ~{est_ram}MB"
             )
             return len(self._tabs) > 0
 
@@ -556,6 +593,63 @@ class AccountBrowser:
                 except Exception:
                     pass
             return imported
+
+    def _setup_request_interception(self, page):
+        """Intercept outgoing requests to capture Bearer token."""
+        def _on_request(request):
+            if "aisandbox-pa.googleapis.com" in request.url and request.method == "POST":
+                auth = request.headers.get("authorization", "")
+                if auth.startswith("Bearer "):
+                    self._bearer_token = auth
+                    self._bearer_token_time = time.time()
+                    self._log(f"[MultiTab:{self.account_name}] Bearer token captured (len={len(auth)})")
+        page.on("request", _on_request)
+
+    async def _trigger_bearer_capture(self, page):
+        """Trigger a fetch from the page to capture Chrome's OAuth Bearer token."""
+        self._log(f"[MultiTab:{self.account_name}] Triggering Bearer capture...")
+        # Method 1: credits endpoint (lightweight GET)
+        try:
+            await page.evaluate("""
+                async () => {
+                    try { await fetch('https://aisandbox-pa.googleapis.com/v1/credits',
+                          {method:'GET', credentials:'include'}); } catch(e) {}
+                }
+            """)
+            await asyncio.sleep(2)
+        except Exception:
+            pass
+
+        if self._bearer_token:
+            return
+
+        # Method 2: dummy POST with reCAPTCHA
+        try:
+            await page.evaluate("""
+                async () => {
+                    try {
+                        const scripts = document.querySelectorAll("script[src*='recaptcha'][src*='render=']");
+                        let sk = null;
+                        for (const s of scripts) {
+                            const m = s.src.match(/render=([^&]+)/);
+                            if (m && m[1] !== 'explicit') { sk = m[1]; break; }
+                        }
+                        if (!sk || !grecaptcha || !grecaptcha.enterprise) return;
+                        const tok = await grecaptcha.enterprise.execute(sk, {action:'generate'});
+                        await fetch('https://aisandbox-pa.googleapis.com/v1/credits',
+                            {method:'POST', credentials:'include',
+                             headers:{'Content-Type':'text/plain;charset=UTF-8'},
+                             body:JSON.stringify({token:tok})});
+                    } catch(e) {}
+                }
+            """)
+            await asyncio.sleep(2)
+        except Exception:
+            pass
+
+    def get_bearer_token(self):
+        """Get captured Bearer token. Called by TabWorkers."""
+        return self._bearer_token
 
     async def _extract_project_id(self, page):
         """Extract project ID from URL or DOM."""
@@ -817,7 +911,15 @@ class MultiTabManager:
                     await tab.reload()
                     await asyncio.sleep(3)
                 elif "401" in last_error or "auth" in last_error.lower():
-                    self._log(f"[{tab.slot_id}] Auth issue — reloading tab...")
+                    self._log(f"[{tab.slot_id}] Auth issue — refreshing Bearer + reloading tab...")
+                    # Force Bearer refresh on the account browser
+                    for browser in self._browsers.values():
+                        if tab.account_name == browser.account_name:
+                            browser._bearer_token = None
+                            first_tab_page = browser.get_all_tabs()[0]._page if browser.get_all_tabs() else None
+                            if first_tab_page:
+                                await browser._trigger_bearer_capture(first_tab_page)
+                            break
                     await tab.reload()
                     await asyncio.sleep(3)
                 elif attempt < max_retries:
