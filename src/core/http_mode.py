@@ -719,37 +719,42 @@ class HttpApiWorker:
             session_id = f";{int(time.time() * 1000)}"
             batch_id = str(uuid.uuid4())
 
-            client_ctx = {
-                "recaptchaContext": {
-                    "token": token,
-                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                },
-                "projectId": project_id,
-                "tool": "PINHOLE",
-                "sessionId": session_id,
-            }
-
-            request_item = {
-                "clientContext": client_ctx,
-                "imageModelName": model,
-                "imageAspectRatio": ratio,
-                "structuredPrompt": {"parts": [{"text": prompt}]},
-                "seed": seed,
-                "imageInputs": references or [],
-            }
-
+            # EXACT payload from HAR — clientContext only at top level
             payload = {
-                "clientContext": client_ctx,
+                "clientContext": {
+                    "recaptchaContext": {
+                        "token": token,
+                        "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                    },
+                    "projectId": project_id,
+                    "tool": "PINHOLE",
+                    "sessionId": session_id,
+                },
                 "mediaGenerationContext": {"batchId": batch_id},
                 "useNewMedia": True,
-                "requests": [request_item],
+                "requests": [
+                    {
+                        "imageModelName": model,
+                        "imageAspectRatio": ratio,
+                        "structuredPrompt": {"parts": [{"text": prompt}]},
+                        "seed": seed,
+                        "imageInputs": references or [],
+                    }
+                ],
             }
 
-            headers = await self._build_headers()
+            # Debug logging
+            self._log(f"[{self.slot_id}] API call: model={model}, ratio={ratio}, seed={seed}")
+            self._log(f"[{self.slot_id}] DEBUG URL: {url}")
+            self._log(f"[{self.slot_id}] DEBUG Payload: {json.dumps(payload, indent=2)[:500]}")
 
-            # Use data= not json= (Content-Type is text/plain, not application/json)
+            headers = await self._build_headers()
+            self._log(f"[{self.slot_id}] DEBUG Headers: {list(headers.keys())}")
+
+            body = json.dumps(payload)
+
             async with self._session.post(
-                url, data=json.dumps(payload), headers=headers,
+                url, data=body, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status == 200:
@@ -817,10 +822,13 @@ class HttpApiWorker:
                 "useV2ModelConfig": True,
             }
 
+            self._log(f"[{self.slot_id}] Video API: model={model}, ratio={ratio}, seed={seed}")
+
             headers = await self._build_headers()
+            body = json.dumps(payload)
 
             async with self._session.post(
-                url, data=json.dumps(payload), headers=headers,
+                url, data=body, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status == 200:
