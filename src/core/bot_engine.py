@@ -870,12 +870,7 @@ class GoogleLabsBot:
         else:
             cloak_profile = self.session_path
 
-        # Kill leftover CloakBrowser/Chromium processes before launching
-        try:
-            process_tracker.kill_all()
-            await asyncio.sleep(1)
-        except Exception:
-            pass
+        # Clean lock files before launching (don't kill other slots' processes)
         cleanup_session_locks(cloak_profile)
 
         if callable(log_callback):
