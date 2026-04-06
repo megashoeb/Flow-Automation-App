@@ -52,6 +52,76 @@ DATA_DIR = str(get_sessions_dir())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Model / aspect ratio resolvers — maps display names to API enum values
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _resolve_image_model(model):
+    """Map display name → API enum. Pass through if already an enum."""
+    lower = str(model or "").lower()
+    if "nano banana pro" in lower:
+        return "GEM_PIX_2"
+    if "nano banana" in lower:
+        return "NARWHAL"
+    if "imagen 4" in lower:
+        return "IMAGEN_4"
+    if "imagen" in lower:
+        return "NARWHAL"
+    # Already an API enum (e.g. NARWHAL, GEM_PIX_2)
+    if model and model == model.upper():
+        return model
+    return "NARWHAL"
+
+
+def _resolve_image_ratio(ratio):
+    """Map display ratio → API enum."""
+    raw = str(ratio or "").strip()
+    if raw.startswith("IMAGE_ASPECT_RATIO_"):
+        return raw
+    lower = raw.lower()
+    if "4:3" in lower:
+        return "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"
+    if "3:4" in lower:
+        return "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"
+    if "portrait" in lower or "9:16" in lower:
+        return "IMAGE_ASPECT_RATIO_PORTRAIT"
+    if "square" in lower or "1:1" in lower:
+        return "IMAGE_ASPECT_RATIO_SQUARE"
+    return "IMAGE_ASPECT_RATIO_LANDSCAPE"
+
+
+def _resolve_video_model(model, video_model=""):
+    """Map display name → API video model key."""
+    source = str(video_model or model or "").strip().lower()
+    if not source:
+        return "veo_3_1_t2v_fast_ultra"
+    if "lite" in source:
+        return "veo_3_1_t2v_lite"
+    if "lower pri" in source or "relaxed" in source:
+        return "veo_3_1_t2v_fast_ultra_relaxed"
+    if "quality" in source:
+        return "veo_3_1_t2v"
+    # Already an API key (contains underscores)
+    if "_" in source:
+        return source
+    return "veo_3_1_t2v_fast_ultra"
+
+
+def _resolve_video_ratio(ratio):
+    """Map display ratio → API enum."""
+    raw = str(ratio or "").strip()
+    if raw.startswith("VIDEO_ASPECT_RATIO_"):
+        return raw
+    if raw.startswith("IMAGE_ASPECT_RATIO_"):
+        return raw.replace("IMAGE_", "VIDEO_", 1)
+    lower = raw.lower()
+    if "portrait" in lower or "9:16" in lower:
+        return "VIDEO_ASPECT_RATIO_PORTRAIT"
+    if "square" in lower or "1:1" in lower:
+        return "VIDEO_ASPECT_RATIO_SQUARE"
+    return "VIDEO_ASPECT_RATIO_LANDSCAPE"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # RecaptchaTokenServer — 1 shared browser per account for reCAPTCHA tokens
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -719,6 +789,10 @@ class HttpApiWorker:
             session_id = f";{int(time.time() * 1000)}"
             batch_id = str(uuid.uuid4())
 
+            # Resolve display names → API enums
+            api_model = _resolve_image_model(model)
+            api_ratio = _resolve_image_ratio(ratio)
+
             # EXACT payload from HAR — clientContext only at top level
             payload = {
                 "clientContext": {
@@ -734,8 +808,8 @@ class HttpApiWorker:
                 "useNewMedia": True,
                 "requests": [
                     {
-                        "imageModelName": model,
-                        "imageAspectRatio": ratio,
+                        "imageModelName": api_model,
+                        "imageAspectRatio": api_ratio,
                         "structuredPrompt": {"parts": [{"text": prompt}]},
                         "seed": seed,
                         "imageInputs": references or [],
@@ -744,7 +818,7 @@ class HttpApiWorker:
             }
 
             # Debug logging
-            self._log(f"[{self.slot_id}] API call: model={model}, ratio={ratio}, seed={seed}")
+            self._log(f"[{self.slot_id}] API call: model={model} -> {api_model}, ratio={api_ratio}, seed={seed}")
             self._log(f"[{self.slot_id}] DEBUG URL: {url}")
             self._log(f"[{self.slot_id}] DEBUG Payload: {json.dumps(payload, indent=2)[:500]}")
 
@@ -796,6 +870,10 @@ class HttpApiWorker:
             session_id = f";{int(time.time() * 1000)}"
             batch_id = str(uuid.uuid4())
 
+            # Resolve display names → API enums
+            api_model = _resolve_video_model(model)
+            api_ratio = _resolve_video_ratio(ratio)
+
             payload = {
                 "mediaGenerationContext": {"batchId": batch_id},
                 "clientContext": {
@@ -810,19 +888,19 @@ class HttpApiWorker:
                 },
                 "requests": [
                     {
-                        "aspectRatio": ratio,
+                        "aspectRatio": api_ratio,
                         "seed": seed,
                         "textInput": {
                             "structuredPrompt": {"parts": [{"text": prompt}]},
                         },
-                        "videoModelKey": model,
+                        "videoModelKey": api_model,
                         "metadata": {},
                     }
                 ],
                 "useV2ModelConfig": True,
             }
 
-            self._log(f"[{self.slot_id}] Video API: model={model}, ratio={ratio}, seed={seed}")
+            self._log(f"[{self.slot_id}] Video API: model={model} -> {api_model}, ratio={api_ratio}, seed={seed}")
 
             headers = await self._build_headers()
             body = json.dumps(payload)
