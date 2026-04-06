@@ -619,24 +619,19 @@ class BrowserFetchWorker:
                             }]
                         };
 
-                        // Step 3: fetch with Bearer token + cookies
+                        // Step 3: Build body and log for debug
+                        const bodyStr = JSON.stringify(payload);
                         const url = `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`;
-                        const resp = await fetch(url, {
-                            method: 'POST',
-                            credentials: 'include',
-                            headers: {
-                                'Content-Type': 'text/plain;charset=UTF-8',
-                                'Authorization': bearerToken
-                            },
-                            body: JSON.stringify(payload)
-                        });
 
-                        if (!resp.ok) {
-                            const errText = await resp.text();
-                            return { error: `HTTP ${resp.status}: ${errText.substring(0, 300)}` };
-                        }
-
-                        return { success: true, data: await resp.json() };
+                        // DEBUG: Return payload for inspection
+                        return {
+                            debug: true,
+                            debug_url: url,
+                            debug_payload: bodyStr.substring(0, 1000),
+                            debug_length: bodyStr.length,
+                            debug_bearer: bearerToken ? bearerToken.substring(0, 20) + '...' : 'NONE',
+                            debug_recaptcha: recaptchaToken ? recaptchaToken.substring(0, 20) + '...' : 'NONE'
+                        };
                     } catch(e) {
                         return { error: e.message || String(e) };
                     }
@@ -649,6 +644,15 @@ class BrowserFetchWorker:
 
             if not result:
                 return None, "No response from browser evaluate"
+
+            # DEBUG MODE: log payload and return
+            if result.get("debug"):
+                self._log(f"[{self.slot_id}] DEBUG URL: {result.get('debug_url', '?')}")
+                self._log(f"[{self.slot_id}] DEBUG PAYLOAD ({result.get('debug_length', 0)} chars): {result.get('debug_payload', '?')}")
+                self._log(f"[{self.slot_id}] DEBUG Bearer: {result.get('debug_bearer', '?')}")
+                self._log(f"[{self.slot_id}] DEBUG reCAPTCHA: {result.get('debug_recaptcha', '?')}")
+                return None, "DEBUG MODE — payload logged, API not called"
+
             if result.get("error"):
                 return None, result["error"]
             if result.get("success"):
