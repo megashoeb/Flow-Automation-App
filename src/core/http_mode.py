@@ -57,8 +57,7 @@ def _resolve_image_model(model):
         return "GEM_PIX_2"
     if "nano banana" in lower:
         return "NARWHAL"
-    if "imagen 4" in lower:
-        return "IMAGEN_4"
+    # ALL Imagen models (including Imagen 4) map to NARWHAL — same as bot_engine
     if "imagen" in lower:
         return "NARWHAL"
     if model and model == model.upper():
