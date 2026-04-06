@@ -62,7 +62,7 @@ class RecaptchaTokenServer:
     All HTTP workers share tokens from this server.
     """
 
-    def __init__(self, account_name, session_path, cookies_json_path, log_fn):
+    def __init__(self, account_name, session_path, cookies_json_path, log_fn, project_id=None):
         self.account_name = account_name
         self._session_path = session_path
         self._cookies_json = cookies_json_path
@@ -73,7 +73,7 @@ class RecaptchaTokenServer:
         self._running = False
         self._token_count = 0
         self._failed_count = 0
-        self._project_id = None
+        self._project_id = project_id  # Can be pre-set from cache
         self._cookies_cache = []
         self._last_page_reload = 0
         self._generator_task = None
@@ -98,11 +98,13 @@ class RecaptchaTokenServer:
             )
             await asyncio.sleep(3)
 
-            # Extract project ID
-            self._project_id = await self._extract_project_id()
+            # Extract project ID (or use pre-set from cache)
             if self._project_id:
-                self._log(f"[TokenServer:{self.account_name}] Project ID: {self._project_id}")
+                self._log(f"[TokenServer:{self.account_name}] Using cached project ID: {self._project_id}")
             else:
+                self._project_id = await self._extract_project_id()
+
+            if not self._project_id:
                 self._log(f"[TokenServer:{self.account_name}] No project ID found. Check login.")
                 return False
 
@@ -196,37 +198,114 @@ class RecaptchaTokenServer:
             return False
 
     async def _extract_project_id(self):
-        """Extract Flow project ID from page URL or content."""
+        """Extract Flow project ID from page URL, DOM, or by creating a new project."""
         if not self._page:
+            self._log(f"[TokenServer:{self.account_name}] No page available!")
             return None
 
         url = self._page.url
+        self._log(f"[TokenServer:{self.account_name}] Current URL: {url}")
+
+        # Check if redirected to sign-in (cookies not working)
+        if "accounts.google.com" in url or "signin" in url.lower():
+            self._log(
+                f"[TokenServer:{self.account_name}] "
+                "Redirected to Google sign-in — cookies not working!"
+            )
+            return None
+
+        # Method 1: /project/{id} in URL (existing bot_engine pattern)
+        match = re.search(r"/project/([a-z0-9-]{16,})", url, re.IGNORECASE)
+        if match:
+            pid = match.group(1)
+            self._log(f"[TokenServer:{self.account_name}] Project ID from URL: {pid}")
+            return pid
+
+        # Method 2: /flow/{uuid} in URL
         match = re.search(r"/flow/([a-f0-9-]{36})", url)
         if match:
-            return match.group(1)
+            pid = match.group(1)
+            self._log(f"[TokenServer:{self.account_name}] Project ID from flow URL: {pid}")
+            return pid
 
-        # Try page content
+        # Method 3: DOM hints (links, scripts — same as bot_engine)
         try:
-            content = await self._page.content()
-            match = re.search(r'"projectId"\s*:\s*"([a-f0-9-]{36})"', content)
-            if match:
-                return match.group(1)
+            pid = await self._page.evaluate("""
+                () => {
+                    const regex = /\\/project\\/([a-z0-9-]{16,})/i;
+                    const candidates = [String(window.location.href || "")];
+
+                    const linkNodes = document.querySelectorAll("a[href*='/project/']");
+                    for (const node of linkNodes) {
+                        candidates.push(String(node.href || node.getAttribute("href") || ""));
+                    }
+
+                    const scriptNodes = document.querySelectorAll("script");
+                    for (const script of scriptNodes) {
+                        const t = String(script.textContent || "");
+                        if (t.includes("/project/")) {
+                            candidates.push(t.slice(0, 6000));
+                        }
+                    }
+
+                    for (const item of candidates) {
+                        const match = item.match(regex);
+                        if (match && match[1]) return match[1];
+                    }
+
+                    // Also try projectId in page content
+                    const body = document.body ? document.body.innerHTML.slice(0, 20000) : '';
+                    const m2 = body.match(/"projectId"\\s*:\\s*"([a-f0-9-]{16,})"/);
+                    if (m2) return m2[1];
+
+                    return null;
+                }
+            """)
+            if pid:
+                self._log(f"[TokenServer:{self.account_name}] Project ID from DOM: {pid}")
+                return pid
+        except Exception as e:
+            self._log(f"[TokenServer:{self.account_name}] DOM extraction error: {str(e)[:50]}")
+
+        # Method 4: Shared cache from bot_engine
+        try:
+            from src.core.bot_engine import GoogleLabsBot
+            cached = GoogleLabsBot._shared_flow_project_id_by_account.get(self.account_name)
+            if cached:
+                self._log(f"[TokenServer:{self.account_name}] Project ID from bot_engine cache: {cached}")
+                return cached
         except Exception:
             pass
 
-        # Try clicking New Project
+        # Method 5: Click "New project" button
         try:
-            new_proj = self._page.locator("text='New project'")
-            if await new_proj.count() > 0:
-                await new_proj.first.click()
-                await asyncio.sleep(3)
+            self._log(f"[TokenServer:{self.account_name}] Trying to click 'New project'...")
+            new_proj_btn = self._page.locator(
+                "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                " 'abcdefghijklmnopqrstuvwxyz'), 'new project')]"
+            ).first
+            try:
+                visible = await new_proj_btn.is_visible()
+            except Exception:
+                visible = False
+
+            if visible:
+                await new_proj_btn.click(force=True)
+                await asyncio.sleep(5)
                 url = self._page.url
+                self._log(f"[TokenServer:{self.account_name}] URL after New Project: {url}")
+                match = re.search(r"/project/([a-z0-9-]{16,})", url, re.IGNORECASE)
+                if match:
+                    return match.group(1)
                 match = re.search(r"/flow/([a-f0-9-]{36})", url)
                 if match:
                     return match.group(1)
-        except Exception:
-            pass
+            else:
+                self._log(f"[TokenServer:{self.account_name}] 'New project' button not visible.")
+        except Exception as e:
+            self._log(f"[TokenServer:{self.account_name}] New project click error: {str(e)[:50]}")
 
+        self._log(f"[TokenServer:{self.account_name}] No project ID found after all methods. Final URL: {self._page.url}")
         return None
 
     async def _token_generator_loop(self):
@@ -726,7 +805,18 @@ class HttpModeManager:
                     session_path = acc.get("session_path", os.path.join(DATA_DIR, name))
                     cookies_json = os.path.join(session_path, "exported_cookies.json")
 
-                    ts = RecaptchaTokenServer(name, session_path, cookies_json, self._log)
+                    # Try to get cached project ID from bot_engine's shared cache
+                    cached_pid = None
+                    try:
+                        from src.core.bot_engine import GoogleLabsBot
+                        cached_pid = GoogleLabsBot._shared_flow_project_id_by_account.get(name)
+                    except Exception:
+                        pass
+
+                    ts = RecaptchaTokenServer(
+                        name, session_path, cookies_json, self._log,
+                        project_id=cached_pid,
+                    )
                     success = await ts.start(p)
 
                     if not success:
