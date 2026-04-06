@@ -763,13 +763,13 @@ class HttpApiWorker:
                 else:
                     text = await resp.text()
                     if "reCAPTCHA" in text:
-                        return None, f"recaptcha_block: {text[:100]}"
-                    return None, f"HTTP {resp.status}: {text[:100]}"
+                        return None, f"recaptcha_block: {text[:300]}"
+                    return None, f"HTTP {resp.status}: {text[:300]}"
 
         except asyncio.TimeoutError:
             return None, "Request timeout (60s)"
         except Exception as e:
-            return None, str(e)[:100]
+            return None, str(e)[:300]
         finally:
             self.is_busy = False
 
@@ -837,12 +837,12 @@ class HttpApiWorker:
                     return None, "auth_failed: Bearer token expired"
                 else:
                     text = await resp.text()
-                    return None, f"HTTP {resp.status}: {text[:100]}"
+                    return None, f"HTTP {resp.status}: {text[:300]}"
 
         except asyncio.TimeoutError:
             return None, "Request timeout (60s)"
         except Exception as e:
-            return None, str(e)[:100]
+            return None, str(e)[:300]
         finally:
             self.is_busy = False
 
@@ -1129,7 +1129,7 @@ class HttpModeManager:
                 last_error = error or "Unknown error"
                 self._log(
                     f"[{worker.slot_id}] Attempt {attempt + 1}/{max_retries + 1} "
-                    f"failed: {last_error[:60]}"
+                    f"failed: {last_error[:200]}"
                 )
 
                 # Refresh cookies on auth failures
@@ -1141,7 +1141,7 @@ class HttpModeManager:
                     await asyncio.sleep(delay)
 
             except Exception as e:
-                last_error = str(e)[:100]
+                last_error = str(e)[:300]
                 self._log(f"[{worker.slot_id}] Attempt {attempt + 1} exception: {last_error}")
                 if attempt < max_retries:
                     await asyncio.sleep(10)
@@ -1149,4 +1149,4 @@ class HttpModeManager:
         # All retries exhausted
         update_job_status(job_id, "failed", account=worker.account_name, error=last_error)
         self.qm.signals.job_updated.emit(job_id, "failed", worker.account_name, last_error)
-        self._log(f"[{worker.slot_id}] Job {job_id[:6]}... FAILED: {last_error[:60]}")
+        self._log(f"[{worker.slot_id}] Job {job_id[:6]}... FAILED: {last_error[:200]}")
