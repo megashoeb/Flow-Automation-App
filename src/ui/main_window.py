@@ -5788,7 +5788,6 @@ class MainWindow(QMainWindow):
 
     def _on_clean_profiles(self):
         """Clean all account browser profiles — remove junk, keep cookies."""
-        print("[DEBUG] _on_clean_profiles called!")  # DEBUG
         from PySide6.QtWidgets import QMessageBox
         try:
             from src.core.profile_cleaner import clean_profile, clean_derived_profiles
@@ -5813,10 +5812,10 @@ class MainWindow(QMainWindow):
 
             if total_deleted > 0:
                 msg = f"Cleaned {total_deleted} items\nFreed {freed_mb:.1f} MB\n\nLogin sessions preserved."
-                self._append_log(f"[CLEAN] {msg}")
+                self.append_log(f"[CLEAN] {msg}")
             else:
                 msg = "All browser profiles are already clean.\nNo junk data found to remove."
-                self._append_log("[CLEAN] All profiles already clean.")
+                self.append_log("[CLEAN] All profiles already clean.")
 
             # Show popup — use None parent to avoid widget hierarchy issues
             box = QMessageBox()
@@ -5826,7 +5825,7 @@ class MainWindow(QMainWindow):
             box.exec()
 
         except Exception as e:
-            self._append_log(f"[CLEAN] Error: {str(e)[:100]}")
+            self.append_log(f"[CLEAN] Error: {str(e)[:100]}")
             box = QMessageBox()
             box.setWindowTitle("Clean Error")
             box.setText(f"Error cleaning profiles:\n{str(e)[:200]}")
@@ -7799,7 +7798,7 @@ class MainWindow(QMainWindow):
 
         if status == "expired":
             self._runtime_auth_status[account_name] = "expired"
-            self._append_log(f"[{account_name}] Session expired: {message}")
+            self.append_log(f"[{account_name}] Session expired: {message}")
         elif status == "logged_in":
             # Clear expired status on successful generation
             self._runtime_auth_status.pop(account_name, None)
