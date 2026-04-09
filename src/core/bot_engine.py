@@ -890,7 +890,10 @@ class GoogleLabsBot:
             await self._apply_fingerprint(self.page, log_callback)
             await self._apply_stealth_to_page(self.page, log_callback)
             await self._emit_launch_debug(self.page, "cloakbrowser", log_callback)
-            await self._import_exported_cookies(log_callback)
+            # Bug #6: Check cookie import result — warn if zero cookies
+            cookie_count = await self._import_exported_cookies(log_callback)
+            if cookie_count == 0 and callable(log_callback):
+                log_callback(f"[{self.account_name}] WARNING: 0 cookies imported! Browser may not be authenticated.")
             if callable(log_callback):
                 log_callback(f"[{self.account_name}] CloakBrowser ready! Score expected: 0.9")
             return
@@ -2830,8 +2833,11 @@ class GoogleLabsBot:
                         data = await resp.body()
                         if not data or len(data) < 1000:
                             continue
-                        with open(output_path, "wb") as f:
+                        # Bug #10: Write to .tmp first, rename on complete
+                        tmp_path = output_path + ".tmp"
+                        with open(tmp_path, "wb") as f:
                             f.write(data)
+                        os.replace(tmp_path, output_path)
                         log_callback(f"[{self.account_name}] Video saved via auth redirect: {output_path}")
                         return output_path
                     except Exception:

@@ -167,6 +167,7 @@ class AsyncQueueManager(QThread):
         self.account_disabled = {}
         self.account_hold_until = {}   # account_name -> timestamp when hold expires
         self.account_hold_reason = {}  # account_name -> reason string
+        self._account_hold_lock = None  # Initialized in process_queue (needs event loop)
         self.account_warmup_ready = {}
         self.account_warmup_tasks = {}
 
@@ -319,7 +320,14 @@ class AsyncQueueManager(QThread):
                 if engine is not None:
                     await asyncio.wait_for(engine.cleanup(), timeout=8)
             except Exception:
-                pass
+                # Bug #9: Force close context if cleanup timed out
+                try:
+                    engine = slot.get("engine")
+                    if engine and getattr(engine, "context", None):
+                        await engine.context.close()
+                        engine.context = None
+                except Exception:
+                    pass
             finally:
                 slot["is_initialized"] = False
                 slot["is_busy"] = False
@@ -328,8 +336,15 @@ class AsyncQueueManager(QThread):
         killed = process_tracker.kill_all()
         self._cleanup_lock_files()
         await asyncio.sleep(1)
-        if killed:
-            self.signals.log_msg.emit(f"[SYSTEM] Force-killed {killed} remaining browser process(es).")
+        # Verify processes actually died (Bug #8 fix)
+        still_alive = process_tracker.kill_all()
+        if still_alive:
+            await asyncio.sleep(2)
+            process_tracker.kill_all()  # Third attempt
+        if killed or still_alive:
+            self.signals.log_msg.emit(
+                f"[SYSTEM] Force-killed {killed + still_alive} browser process(es)."
+            )
         self.signals.log_msg.emit("[SYSTEM] All browser processes cleaned up.")
 
     def _cleanup_lock_files(self):
@@ -354,6 +369,8 @@ class AsyncQueueManager(QThread):
                         pass
 
     async def process_queue(self):
+        if self._account_hold_lock is None:
+            self._account_hold_lock = asyncio.Lock()
 
         self.signals.log_msg.emit("[SYSTEM] Queue Manager started. Fetching accounts...")
         GoogleLabsBot.clear_reference_cache()
@@ -374,16 +391,15 @@ class AsyncQueueManager(QThread):
 
         # Auto-clean profiles that have accumulated junk (prevents reCAPTCHA degradation)
         try:
-            from src.core.profile_cleaner import clean_profile, needs_cleaning
+            from src.core.profile_cleaner import clean_profile, clean_derived_profiles, needs_cleaning
             for acc in all_accs:
                 sp = acc.get("session_path", "")
                 if sp and needs_cleaning(sp):
                     self.signals.log_msg.emit(f"[SYSTEM] Cleaning profile for {acc.get('name', '?')}...")
                     clean_profile(sp, log_fn=lambda msg: self.signals.log_msg.emit(msg))
-                # Also clean _cloak profile
-                cloak_sp = sp + "_cloak" if sp else ""
-                if cloak_sp and needs_cleaning(cloak_sp):
-                    clean_profile(cloak_sp, log_fn=lambda msg: self.signals.log_msg.emit(msg))
+                # Clean _cloak, _multitab, _token_server, _shared_browser profiles
+                if sp:
+                    clean_derived_profiles(sp, log_fn=lambda msg: self.signals.log_msg.emit(msg))
         except Exception:
             pass
 
@@ -1229,10 +1245,10 @@ class AsyncQueueManager(QThread):
                 self.account_recaptcha_streak.pop(account_name, None)
 
     def _put_account_on_hold(self, account_name, reason, hold_seconds):
-        """Put account on hold — stop dispatching jobs to it."""
-        self.account_disabled[account_name] = True
+        """Put account on hold — stop dispatching jobs to it. (Thread-safe via dict atomicity)"""
         self.account_hold_until[account_name] = time.time() + hold_seconds
         self.account_hold_reason[account_name] = reason
+        self.account_disabled[account_name] = True  # Set LAST — readers check this first
         mins = hold_seconds // 60
         secs = hold_seconds % 60
         self.signals.log_msg.emit(
@@ -1334,15 +1350,25 @@ class AsyncQueueManager(QThread):
                     )
                     await asyncio.sleep(wait_seconds)
 
+            # Update stagger BEFORE task creation (Bug #16 fix)
+            self.last_account_dispatch_at[slot["account_name"]] = time.time()
+
             slot["is_busy"] = True
             update_job_status(job_id, "running", account=account_name)
             self.signals.job_updated.emit(job_id, "running", account_name, "")
-            self.last_account_dispatch_at[slot["account_name"]] = time.time()
 
-            task = asyncio.create_task(self.run_bot_job(slot, job, playwright_instance))
-            self.active_tasks.append(task)
-            self.task_job_map[task] = job_id
-            dispatched_count += 1
+            # Wrap task creation — if it fails, reset slot + job (Bug #2 fix)
+            try:
+                task = asyncio.create_task(self.run_bot_job(slot, job, playwright_instance))
+                self.active_tasks.append(task)
+                self.task_job_map[task] = job_id
+                dispatched_count += 1
+            except Exception as dispatch_exc:
+                slot["is_busy"] = False
+                update_job_status(job_id, "pending", account="")
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] Dispatch failed for job {job_id[:6]}: {dispatch_exc}. Reset to pending."
+                )
 
         return len(pending_jobs), dispatched_count
 
@@ -1803,16 +1829,19 @@ class AsyncQueueManager(QThread):
             f"[{label}] Failure detected: category={category}, retryable={'yes' if retryable else 'no'}."
         )
 
-        # Put account on hold for auth/rate-limit errors
+        # Put account on hold for auth/rate-limit errors (Bug #13: all comparisons use .lower())
         msg_lower = (error_msg or "").lower()
         if category in ("auth_missing", "project_resolution_failed"):
             self._put_account_on_hold(account_name, f"session expired ({category})", 300)
         elif "session not signed in" in msg_lower or "not signed in" in msg_lower:
             self._put_account_on_hold(account_name, "session not signed in", 300)
-        elif "rate limit" in msg_lower or "429" in msg_lower or "quota exceeded" in msg_lower:
+        elif any(p in msg_lower for p in (
+            "rate limit", "429", "quota exceeded", "resource exhausted",
+            "too many requests", "quota_exceeded", "rate_limit",
+        )):
             self._put_account_on_hold(account_name, "rate limited", 300)
-        elif "resource exhausted" in msg_lower or "too many requests" in msg_lower:
-            self._put_account_on_hold(account_name, "rate limited", 300)
+        elif "access denied" in msg_lower or "account suspended" in msg_lower:
+            self._put_account_on_hold(account_name, "access denied", 1800)
 
         if category == "audio_filter" and retryable:
             self.signals.log_msg.emit(

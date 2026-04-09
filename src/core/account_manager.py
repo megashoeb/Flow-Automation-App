@@ -1,5 +1,6 @@
 import os
 import platform
+import random
 import re
 import subprocess
 import time
@@ -271,7 +272,7 @@ class AccountManager:
         try:
             await AccountManager._maybe_await(context.close())
         except Exception:
-            raise
+            pass  # Don't re-raise — let cleanup continue
         await asyncio.sleep(max(0, float(flush_delay or 0)))
 
     @staticmethod
@@ -1469,7 +1470,7 @@ class AccountManager:
 
         is_mac = platform.system() == "Darwin"
         label = account_hint or os.path.basename(session_dir)
-        cdp_port = 9220
+        cdp_port = random.randint(9220, 9300)
 
         if update_log_callback:
             update_log_callback(f"[{label}] Chrome path: {chrome_path}")

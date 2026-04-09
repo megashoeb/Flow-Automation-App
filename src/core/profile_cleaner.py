@@ -144,6 +144,21 @@ def clean_profile(session_path, log_fn=None):
     return deleted, freed
 
 
+def clean_derived_profiles(session_path, log_fn=None):
+    """Clean _cloak, _multitab, _token_server, _shared_browser derived profiles."""
+    if not session_path:
+        return 0, 0
+    total_deleted = 0
+    total_freed = 0
+    for suffix in ("_cloak", "_multitab", "_token_server", "_shared_browser"):
+        derived = session_path + suffix
+        if os.path.isdir(derived):
+            d, f = clean_profile(derived, log_fn)
+            total_deleted += d
+            total_freed += f
+    return total_deleted, total_freed
+
+
 def needs_cleaning(session_path):
     """Check if profile needs cleaning based on cache size."""
     if not session_path or not os.path.exists(session_path):
@@ -164,5 +179,11 @@ def needs_cleaning(session_path):
     idb_dir = os.path.join(default_dir, "IndexedDB")
     if os.path.isdir(idb_dir) and _get_dir_size(idb_dir) > 50 * 1024 * 1024:
         return True
+
+    # GrShaderCache or BrowserMetrics > 50MB
+    for junk_dir in ("GrShaderCache", "GraphiteDawnCache", "BrowserMetrics", "Crashpad"):
+        junk_path = os.path.join(session_path, junk_dir)
+        if os.path.isdir(junk_path) and _get_dir_size(junk_path) > 50 * 1024 * 1024:
+            return True
 
     return False
