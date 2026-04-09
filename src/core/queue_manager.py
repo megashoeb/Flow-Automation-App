@@ -1477,6 +1477,10 @@ class AsyncQueueManager(QThread):
         self._emit_queue_summary()
         self.queue_summary_emitted = True
 
+        # Auto-close all browsers after queue completes to free RAM
+        self.signals.log_msg.emit("[SYSTEM] Queue complete — closing all browsers to free RAM...")
+        asyncio.ensure_future(self._cleanup_all_browsers())
+
     def _load_job_payload(self, job_id):
         conn = get_connection()
         try:
