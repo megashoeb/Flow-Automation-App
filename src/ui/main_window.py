@@ -3683,6 +3683,7 @@ class MainWindow(QMainWindow):
         perf_layout.addWidget(self.btn_save_settings)
 
         self.btn_clean_profiles = QPushButton("Clean All Browser Profiles")
+        self.btn_clean_profiles.setProperty("role", "danger")
         self.btn_clean_profiles.setToolTip(
             "Removes accumulated cache, service workers, and tracking data.\n"
             "Preserves login cookies and session.\n"
@@ -3690,11 +3691,13 @@ class MainWindow(QMainWindow):
             "Same effect as reinstalling but without losing accounts."
         )
         self.btn_clean_profiles.setStyleSheet(
-            "QPushButton { background: #DC2626; color: white; padding: 8px 16px; "
-            "border-radius: 6px; font-weight: 600; } "
-            "QPushButton:hover { background: #EF4444; }"
+            "QPushButton { background-color: #DC2626; color: white; padding: 8px 16px; "
+            "border-radius: 6px; font-weight: 600; border: none; min-height: 36px; } "
+            "QPushButton:hover { background-color: #EF4444; } "
+            "QPushButton:pressed { background-color: #B91C1C; }"
         )
-        self.btn_clean_profiles.clicked.connect(self._on_clean_profiles)
+        self.btn_clean_profiles.setCursor(Qt.PointingHandCursor)
+        self.btn_clean_profiles.clicked.connect(lambda: self._on_clean_profiles())
         perf_layout.addWidget(self.btn_clean_profiles)
 
         perf_group.setLayout(perf_layout)
@@ -5785,6 +5788,7 @@ class MainWindow(QMainWindow):
 
     def _on_clean_profiles(self):
         """Clean all account browser profiles — remove junk, keep cookies."""
+        print("[DEBUG] _on_clean_profiles called!")  # DEBUG
         from PySide6.QtWidgets import QMessageBox
         try:
             from src.core.profile_cleaner import clean_profile, clean_derived_profiles
