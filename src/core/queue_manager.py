@@ -368,6 +368,22 @@ class AsyncQueueManager(QThread):
         if not all_accs:
             self.signals.log_msg.emit("[SYSTEM] No Google accounts configured! Please add one in Account Manager.")
             return
+
+        # Auto-clean profiles that have accumulated junk (prevents reCAPTCHA degradation)
+        try:
+            from src.core.profile_cleaner import clean_profile, needs_cleaning
+            for acc in all_accs:
+                sp = acc.get("session_path", "")
+                if sp and needs_cleaning(sp):
+                    self.signals.log_msg.emit(f"[SYSTEM] Cleaning profile for {acc.get('name', '?')}...")
+                    clean_profile(sp, log_fn=lambda msg: self.signals.log_msg.emit(msg))
+                # Also clean _cloak profile
+                cloak_sp = sp + "_cloak" if sp else ""
+                if cloak_sp and needs_cleaning(cloak_sp):
+                    clean_profile(cloak_sp, log_fn=lambda msg: self.signals.log_msg.emit(msg))
+        except Exception:
+            pass
+
         self._initialize_account_warmup_state(all_accs)
 
         self.signals.log_msg.emit(

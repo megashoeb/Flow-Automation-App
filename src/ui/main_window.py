@@ -3681,6 +3681,21 @@ class MainWindow(QMainWindow):
         self.btn_save_settings.clicked.connect(self.save_settings)
         perf_layout.addWidget(self.btn_save_settings)
 
+        self.btn_clean_profiles = QPushButton("Clean All Browser Profiles")
+        self.btn_clean_profiles.setToolTip(
+            "Removes accumulated cache, service workers, and tracking data.\n"
+            "Preserves login cookies and session.\n"
+            "Run this if reCAPTCHA errors are increasing.\n"
+            "Same effect as reinstalling but without losing accounts."
+        )
+        self.btn_clean_profiles.setStyleSheet(
+            "QPushButton { background: #DC2626; color: white; padding: 8px 16px; "
+            "border-radius: 6px; font-weight: 600; } "
+            "QPushButton:hover { background: #EF4444; }"
+        )
+        self.btn_clean_profiles.clicked.connect(self._on_clean_profiles)
+        perf_layout.addWidget(self.btn_clean_profiles)
+
         perf_group.setLayout(perf_layout)
         layout.addWidget(perf_group)
         layout.addStretch()
@@ -5725,6 +5740,32 @@ class MainWindow(QMainWindow):
             self.log_buffer.append(text)
             return
         self.logs_output.append(text)
+
+    def _on_clean_profiles(self):
+        """Clean all account browser profiles — remove junk, keep cookies."""
+        from src.core.profile_cleaner import clean_profile
+        from src.core.app_paths import get_sessions_dir
+
+        sessions_dir = str(get_sessions_dir())
+        total_deleted = 0
+        total_freed = 0
+
+        if os.path.isdir(sessions_dir):
+            for name in os.listdir(sessions_dir):
+                path = os.path.join(sessions_dir, name)
+                if os.path.isdir(path):
+                    d, f = clean_profile(path)
+                    total_deleted += d
+                    total_freed += f
+
+        freed_mb = total_freed / (1024 * 1024)
+        self._append_log(f"[CLEAN] All profiles cleaned: {total_deleted} items, {freed_mb:.1f}MB freed.")
+
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.information(
+            self, "Profiles Cleaned",
+            f"Cleaned {total_deleted} items\nFreed {freed_mb:.1f} MB\n\nLogin sessions preserved.",
+        )
 
     def save_settings(self):
         slots = int(self.spin_slots_per_account.value())
