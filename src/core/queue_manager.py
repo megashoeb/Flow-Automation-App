@@ -102,6 +102,10 @@ class AsyncQueueManager(QThread):
             cloak_display_raw = "headless"
         self.cloak_display = cloak_display_raw
         self.light_warmup_enabled = get_bool_setting("light_warmup", True)
+        gen_mode_raw = str(get_setting("generation_mode", "browser_per_slot") or "browser_per_slot").strip().lower()
+        if gen_mode_raw not in {"browser_per_slot", "cdp_shared"}:
+            gen_mode_raw = "browser_per_slot"
+        self.generation_mode = gen_mode_raw
         self.scheduler_poll_seconds = 2
         self.inter_job_cooldown_seconds = 1.5
         self.max_consecutive_slot_failures = 2
@@ -371,6 +375,23 @@ class AsyncQueueManager(QThread):
     async def process_queue(self):
         if self._account_hold_lock is None:
             self._account_hold_lock = asyncio.Lock()
+
+        # CDP Shared mode — 1 process per account, N contexts
+        if self.generation_mode == "cdp_shared":
+            self.signals.log_msg.emit("[SYSTEM] Generation mode: CDP Shared (1 browser per account, N contexts)")
+            try:
+                from src.core.cdp_shared_mode import CDPSharedManager
+                manager = CDPSharedManager(self)
+                await manager.run()
+            except ImportError:
+                self.signals.log_msg.emit("[ERROR] cdp_shared_mode.py not found. Falling back to browser mode.")
+            except Exception as e:
+                self.signals.log_msg.emit(f"[ERROR] CDP Shared failed: {str(e)[:100]}. Falling back to browser mode.")
+            else:
+                return
+            self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
+        else:
+            self.signals.log_msg.emit("[SYSTEM] Generation mode: Browser per slot (stable)")
 
         self.signals.log_msg.emit("[SYSTEM] Queue Manager started. Fetching accounts...")
         GoogleLabsBot.clear_reference_cache()
