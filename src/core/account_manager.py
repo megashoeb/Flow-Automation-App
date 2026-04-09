@@ -1224,18 +1224,43 @@ class AccountManager:
             return []
 
     @staticmethod
+    async def _navigate_chrome_via_cdp(cdp_port, url, logger=None, label=""):
+        """Navigate a live Chrome tab to a URL via Playwright CDP connection."""
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+                contexts = list(browser.contexts)
+                if contexts:
+                    pages = list(getattr(contexts[0], "pages", []) or [])
+                    page = pages[0] if pages else await contexts[0].new_page()
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    if logger:
+                        logger(f"[{label}] Navigated to {url}")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                return True
+        except Exception as e:
+            if logger:
+                logger(f"[{label}] CDP navigate error: {str(e)[:60]}")
+            return False
+
+    @staticmethod
     async def _monitor_chrome_and_extract_cookies(
         chrome_process, cdp_port, session_dir, label, logger=None, should_stop=None,
     ):
         """
         Monitor Chrome process. Periodically extract cookies via live CDP.
-        Saves cookies as soon as auth cookies appear.
+        After login detected, auto-navigates to Flow page to set all cookies.
         Keeps updating until Chrome closes.
         Returns (cookies_exported: bool, detected_email: str or None).
         """
         cookies_saved = False
         detected_email = None
         last_cookie_count = 0
+        login_detected = False
+        flow_visited = False
 
         # Wait for CDP to become available
         await asyncio.sleep(3)
@@ -1270,6 +1295,10 @@ class AccountManager:
                         c for c in raw_cookies
                         if "google" in (c.get("domain") or "").lower()
                     ]
+                    labs_cookies = [
+                        c for c in raw_cookies
+                        if "labs.google" in (c.get("domain") or "").lower()
+                    ]
 
                     # Log only when cookie count changes
                     if len(raw_cookies) != last_cookie_count:
@@ -1289,7 +1318,30 @@ class AccountManager:
                                     logger(f"[AUTO] Detected logged-in Google account: {detected_email}")
                                 break
 
-                    # Save cookies when we have auth cookies
+                    # Login detected — auto-navigate to Flow page
+                    if len(auth_cookies) >= 2 and not login_detected:
+                        login_detected = True
+                        if logger:
+                            logger(f"[{label}] Google login detected! "
+                                   f"({len(auth_cookies)} auth cookies)")
+                            logger(f"[{label}] Navigating to Flow page to set all cookies...")
+                        await AccountManager._navigate_chrome_via_cdp(
+                            cdp_port, "https://labs.google/fx/tools/flow",
+                            logger=logger, label=label,
+                        )
+                        await asyncio.sleep(5)
+                        # Re-fetch cookies after navigation
+                        continue
+
+                    # Check if Flow cookies appeared
+                    if login_detected and not flow_visited and len(labs_cookies) >= 1:
+                        flow_visited = True
+                        if logger:
+                            logger(f"[{label}] Flow page cookies set! "
+                                   f"({len(labs_cookies)} labs.google cookies)")
+                            logger(f"[{label}] You can close Chrome now.")
+
+                    # Save cookies every poll when we have auth
                     if len(auth_cookies) >= 2:
                         formatted = AccountManager._format_raw_cookies(raw_cookies)
                         cookies_json_path = os.path.join(session_dir, "exported_cookies.json")
@@ -1297,16 +1349,21 @@ class AccountManager:
                             json.dump(formatted, f)
 
                         if not cookies_saved:
-                            if logger:
-                                logger(f"[{label}] Auth cookies captured! "
-                                       f"{len(auth_cookies)} auth cookies saved.")
-                                logger(f"[{label}] You can close Chrome now.")
                             cookies_saved = True
+                            if not flow_visited and logger:
+                                logger(f"[{label}] Auth cookies saved. Waiting for Flow cookies...")
             except Exception:
                 pass
 
             # Poll every 3 seconds
             await asyncio.sleep(3)
+
+        # Chrome closed — final status
+        if logger:
+            if not login_detected:
+                logger(f"[{label}] No Google login detected. Please try again.")
+            elif not flow_visited:
+                logger(f"[{label}] Flow page was not visited. Login may not persist for generation.")
 
         return cookies_saved, detected_email
 
