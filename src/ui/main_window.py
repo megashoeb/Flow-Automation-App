@@ -5808,20 +5808,26 @@ class MainWindow(QMainWindow):
             freed_mb = total_freed / (1024 * 1024)
 
             if total_deleted > 0:
-                self._append_log(f"[CLEAN] All profiles cleaned: {total_deleted} items, {freed_mb:.1f}MB freed.")
-                QMessageBox.information(
-                    self, "Profiles Cleaned",
-                    f"Cleaned {total_deleted} items\nFreed {freed_mb:.1f} MB\n\nLogin sessions preserved.",
-                )
+                msg = f"Cleaned {total_deleted} items\nFreed {freed_mb:.1f} MB\n\nLogin sessions preserved."
+                self._append_log(f"[CLEAN] {msg}")
             else:
-                self._append_log("[CLEAN] All profiles already clean — nothing to remove.")
-                QMessageBox.information(
-                    self, "Profiles Already Clean",
-                    "All browser profiles are already clean.\nNo junk data found to remove.",
-                )
+                msg = "All browser profiles are already clean.\nNo junk data found to remove."
+                self._append_log("[CLEAN] All profiles already clean.")
+
+            # Show popup — use None parent to avoid widget hierarchy issues
+            box = QMessageBox()
+            box.setWindowTitle("Profile Cleaner")
+            box.setText(msg)
+            box.setIcon(QMessageBox.Information)
+            box.exec()
+
         except Exception as e:
             self._append_log(f"[CLEAN] Error: {str(e)[:100]}")
-            QMessageBox.warning(self, "Clean Error", f"Error cleaning profiles:\n{str(e)[:200]}")
+            box = QMessageBox()
+            box.setWindowTitle("Clean Error")
+            box.setText(f"Error cleaning profiles:\n{str(e)[:200]}")
+            box.setIcon(QMessageBox.Warning)
+            box.exec()
 
     def save_settings(self):
         slots = int(self.spin_slots_per_account.value())
