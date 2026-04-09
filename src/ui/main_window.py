@@ -5785,39 +5785,43 @@ class MainWindow(QMainWindow):
 
     def _on_clean_profiles(self):
         """Clean all account browser profiles — remove junk, keep cookies."""
-        from src.core.profile_cleaner import clean_profile, clean_derived_profiles
-        from src.core.app_paths import get_sessions_dir
-
-        sessions_dir = str(get_sessions_dir())
-        total_deleted = 0
-        total_freed = 0
-
-        if os.path.isdir(sessions_dir):
-            for name in os.listdir(sessions_dir):
-                path = os.path.join(sessions_dir, name)
-                if os.path.isdir(path):
-                    d, f = clean_profile(path)
-                    total_deleted += d
-                    total_freed += f
-                    d2, f2 = clean_derived_profiles(path)
-                    total_deleted += d2
-                    total_freed += f2
-
-        freed_mb = total_freed / (1024 * 1024)
-
         from PySide6.QtWidgets import QMessageBox
-        if total_deleted > 0:
-            self._append_log(f"[CLEAN] All profiles cleaned: {total_deleted} items, {freed_mb:.1f}MB freed.")
-            QMessageBox.information(
-                self, "Profiles Cleaned",
-                f"Cleaned {total_deleted} items\nFreed {freed_mb:.1f} MB\n\nLogin sessions preserved.",
-            )
-        else:
-            self._append_log("[CLEAN] All profiles already clean — nothing to remove.")
-            QMessageBox.information(
-                self, "Profiles Already Clean",
-                "All browser profiles are already clean.\nNo junk data found to remove.",
-            )
+        try:
+            from src.core.profile_cleaner import clean_profile, clean_derived_profiles
+            from src.core.app_paths import get_sessions_dir
+
+            sessions_dir = str(get_sessions_dir())
+            total_deleted = 0
+            total_freed = 0
+
+            if os.path.isdir(sessions_dir):
+                for name in os.listdir(sessions_dir):
+                    path = os.path.join(sessions_dir, name)
+                    if os.path.isdir(path):
+                        d, f = clean_profile(path)
+                        total_deleted += d
+                        total_freed += f
+                        d2, f2 = clean_derived_profiles(path)
+                        total_deleted += d2
+                        total_freed += f2
+
+            freed_mb = total_freed / (1024 * 1024)
+
+            if total_deleted > 0:
+                self._append_log(f"[CLEAN] All profiles cleaned: {total_deleted} items, {freed_mb:.1f}MB freed.")
+                QMessageBox.information(
+                    self, "Profiles Cleaned",
+                    f"Cleaned {total_deleted} items\nFreed {freed_mb:.1f} MB\n\nLogin sessions preserved.",
+                )
+            else:
+                self._append_log("[CLEAN] All profiles already clean — nothing to remove.")
+                QMessageBox.information(
+                    self, "Profiles Already Clean",
+                    "All browser profiles are already clean.\nNo junk data found to remove.",
+                )
+        except Exception as e:
+            self._append_log(f"[CLEAN] Error: {str(e)[:100]}")
+            QMessageBox.warning(self, "Clean Error", f"Error cleaning profiles:\n{str(e)[:200]}")
 
     def save_settings(self):
         slots = int(self.spin_slots_per_account.value())
