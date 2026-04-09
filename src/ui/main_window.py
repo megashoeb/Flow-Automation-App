@@ -4875,16 +4875,27 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _delete_account_record(account_id, account_name):
+        # Reassign any pending/running jobs from this account before deleting
+        try:
+            from src.db.db_manager import reassign_account_jobs
+            reassigned = reassign_account_jobs(account_name)
+            if reassigned > 0:
+                pass  # Logged in _on_account_deleted
+        except Exception:
+            reassigned = 0
         MainWindow._clear_account_project_cache_artifacts(account_name)
         clear_account_flags(account_name)
         if int(account_id or 0) > 0:
-            return remove_account_by_id(int(account_id))
-        return remove_account(account_name)
+            remove_account_by_id(int(account_id))
+        else:
+            remove_account(account_name)
+        return reassigned
 
     def _on_account_deleted(self, account_id, account_name):
         self.account_login_state.pop(int(account_id or 0), None)
+        self._runtime_auth_status.pop(account_name, None)
         self._clear_warmup_tracking(account_name)
-        self.append_log(f"Deleted account '{account_name}'")
+        self.append_log(f"Deleted account '{account_name}'. Pending jobs reassigned to other accounts.")
         self.refresh_accounts()
 
     def _sanitize_account_clone_prefix(self, account_name):

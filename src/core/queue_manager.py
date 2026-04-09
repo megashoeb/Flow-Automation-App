@@ -165,6 +165,8 @@ class AsyncQueueManager(QThread):
         self.account_restart_running = set()
         self.account_restart_count = {}
         self.account_disabled = {}
+        self.account_hold_until = {}   # account_name -> timestamp when hold expires
+        self.account_hold_reason = {}  # account_name -> reason string
         self.account_warmup_ready = {}
         self.account_warmup_tasks = {}
 
@@ -460,6 +462,7 @@ class AsyncQueueManager(QThread):
                         continue
 
                     self._announce_recovered_slots(worker_slots)
+                    self._check_account_holds()
                     pending_count, dispatched_count = await self._dispatch_pending_jobs(worker_slots, p)
                     if pending_count > 0 or dispatched_count > 0 or self.active_tasks:
                         self.queue_had_jobs = True
@@ -1225,6 +1228,43 @@ class AsyncQueueManager(QThread):
                 self.account_recap_cooldown_announced.pop(account_name, None)
                 self.account_recaptcha_streak.pop(account_name, None)
 
+    def _put_account_on_hold(self, account_name, reason, hold_seconds):
+        """Put account on hold — stop dispatching jobs to it."""
+        self.account_disabled[account_name] = True
+        self.account_hold_until[account_name] = time.time() + hold_seconds
+        self.account_hold_reason[account_name] = reason
+        mins = hold_seconds // 60
+        secs = hold_seconds % 60
+        self.signals.log_msg.emit(
+            f"[SYSTEM] Account {account_name} ON HOLD: {reason} "
+            f"(resume in {mins}m {secs}s)"
+        )
+        self.signals.account_auth_status.emit(account_name, "expired", f"On hold: {reason}")
+
+        # Reassign pending jobs from this account
+        try:
+            from src.db.db_manager import reassign_account_jobs
+            count = reassign_account_jobs(account_name)
+            if count > 0:
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] Reassigned {count} job(s) from {account_name} to other accounts."
+                )
+        except Exception:
+            pass
+
+    def _check_account_holds(self):
+        """Re-enable accounts whose hold has expired. Called in main loop."""
+        now = time.time()
+        for account_name in list(self.account_hold_until.keys()):
+            if self.account_hold_until[account_name] <= now:
+                self.account_disabled.pop(account_name, None)
+                reason = self.account_hold_reason.pop(account_name, "")
+                self.account_hold_until.pop(account_name, None)
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] Account {account_name} hold expired ({reason}). Reactivated."
+                )
+                self.signals.account_auth_status.emit(account_name, "logged_in", "Hold expired")
+
     def _apply_account_recaptcha_cooldown(self, slot):
         account_name = slot["account_name"]
         streak = self.account_recaptcha_streak.get(account_name, 0) + 1
@@ -1763,17 +1803,16 @@ class AsyncQueueManager(QThread):
             f"[{label}] Failure detected: category={category}, retryable={'yes' if retryable else 'no'}."
         )
 
-        # Emit session expired status on auth-related errors
-        if category in ("auth_missing", "project_resolution_failed"):
-            self.signals.account_auth_status.emit(
-                account_name, "expired",
-                f"Session expired: {category}",
-            )
+        # Put account on hold for auth/rate-limit errors
         msg_lower = (error_msg or "").lower()
-        if "session not signed in" in msg_lower or "not signed in" in msg_lower:
-            self.signals.account_auth_status.emit(
-                account_name, "expired", "Session not signed in"
-            )
+        if category in ("auth_missing", "project_resolution_failed"):
+            self._put_account_on_hold(account_name, f"session expired ({category})", 300)
+        elif "session not signed in" in msg_lower or "not signed in" in msg_lower:
+            self._put_account_on_hold(account_name, "session not signed in", 300)
+        elif "rate limit" in msg_lower or "429" in msg_lower or "quota exceeded" in msg_lower:
+            self._put_account_on_hold(account_name, "rate limited", 300)
+        elif "resource exhausted" in msg_lower or "too many requests" in msg_lower:
+            self._put_account_on_hold(account_name, "rate limited", 300)
 
         if category == "audio_filter" and retryable:
             self.signals.log_msg.emit(

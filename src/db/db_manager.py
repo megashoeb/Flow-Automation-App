@@ -670,6 +670,22 @@ def update_job_status(job_id, status, account=None, error=None):
         )
     _run_write(_op)
 
+def reassign_account_jobs(account_name):
+    """Reassign all pending/running jobs from an account back to unassigned.
+    Returns count of reassigned jobs."""
+    count = [0]
+    def _op(conn):
+        cursor = conn.execute(
+            "UPDATE jobs SET assigned_account = NULL, status = 'pending', "
+            "error_message = '' "
+            "WHERE assigned_account = ? AND status IN ('pending', 'running')",
+            (account_name,),
+        )
+        count[0] = cursor.rowcount
+    _run_write(_op)
+    return count[0]
+
+
 def update_job_runtime_state(
     job_id,
     *,
