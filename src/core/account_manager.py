@@ -793,17 +793,26 @@ class AccountManager:
 
     @staticmethod
     def _format_raw_cookies(raw_cookies):
-        """Convert raw CDP/Playwright cookie dicts to a uniform export format."""
+        """Convert raw CDP/Playwright cookie dicts to a uniform export format.
+        Fixes sameSite/secure mismatch that causes Playwright to reject cookies."""
         formatted = []
         for c in raw_cookies:
+            same_site = c.get("sameSite", "Lax")
+            secure = c.get("secure", False)
+            # Fix: sameSite=None requires secure=True — otherwise Playwright rejects
+            if same_site == "None" and not secure:
+                same_site = "Lax"
+            # Validate sameSite value
+            if same_site not in ("Strict", "Lax", "None"):
+                same_site = "Lax"
             cookie = {
                 "name": c.get("name", ""),
                 "value": c.get("value", ""),
                 "domain": c.get("domain", ""),
                 "path": c.get("path", "/"),
-                "secure": c.get("secure", False),
+                "secure": secure,
                 "httpOnly": c.get("httpOnly", False),
-                "sameSite": c.get("sameSite", "None"),
+                "sameSite": same_site,
             }
             if c.get("expires", -1) > 0:
                 cookie["expires"] = c["expires"]

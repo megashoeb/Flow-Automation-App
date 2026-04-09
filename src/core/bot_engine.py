@@ -715,7 +715,7 @@ class GoogleLabsBot:
 
     async def _import_exported_cookies(self, log_callback=None):
         """Import cookies from exported_cookies.json into the live browser context.
-        Filters out empty, encrypted, or garbage cookie values."""
+        Fixes sameSite/secure mismatches that cause Playwright to silently reject cookies."""
         if not self.context:
             return 0
         cookies_json = os.path.join(os.path.abspath(str(self.session_path or "")), self.EXPORTED_COOKIES_FILENAME)
@@ -728,9 +728,9 @@ class GoogleLabsBot:
             if not cookies or not isinstance(cookies, list):
                 return 0
 
-            # Filter out invalid / encrypted / garbage cookies
             valid_cookies = []
             skipped = 0
+            fixed = 0
             for c in cookies:
                 name = c.get("name", "")
                 value = c.get("value", "")
@@ -738,10 +738,19 @@ class GoogleLabsBot:
                 if not name or not value or not domain:
                     skipped += 1
                     continue
-                # Skip values that look like encrypted blobs (long binary/base64 garbage)
-                if len(value) > 500 and not any(ch in value for ch in ("=", ".", "-", "_")):
-                    skipped += 1
-                    continue
+
+                # Fix: sameSite=None requires secure=True — Playwright silently
+                # rejects cookies that violate this. Convert to Lax to preserve them.
+                same_site = c.get("sameSite", "")
+                secure = c.get("secure", False)
+                if same_site == "None" and not secure:
+                    c["sameSite"] = "Lax"
+                    fixed += 1
+
+                # Validate sameSite value
+                if c.get("sameSite", "") not in ("Strict", "Lax", "None", ""):
+                    c["sameSite"] = "Lax"
+
                 valid_cookies.append(c)
 
             if not valid_cookies:
@@ -753,8 +762,10 @@ class GoogleLabsBot:
             google_count = sum(1 for c in valid_cookies if "google" in (c.get("domain") or "").lower())
             if callable(log_callback):
                 msg = f"[{self.account_name}] Imported {len(valid_cookies)} cookies ({google_count} Google)"
+                if fixed:
+                    msg += f", fixed {fixed} sameSite"
                 if skipped:
-                    msg += f", skipped {skipped} invalid"
+                    msg += f", skipped {skipped} empty"
                 msg += "."
                 log_callback(msg)
             return len(valid_cookies)
