@@ -1218,6 +1218,7 @@ class MainWindow(QMainWindow):
         self._pending_settings_sync_ready = False
         self.account_runtime_state = {}
         self.account_login_state = {}
+        self._runtime_auth_status = {}  # account_name -> "expired" (cleared on success)
         self.warmup_widgets = {}
         self.active_warmup_progress = {}
         self._pending_login_add = None
@@ -4294,10 +4295,40 @@ class MainWindow(QMainWindow):
         return session_path
 
     def _get_login_status(self, account):
+        import time as _time
+
         session_dir = self._resolve_account_session_dir(account)
         if not session_dir.exists():
             return False, "❌ Logged Out", ""
 
+        # Check if runtime auth status override exists (from generation errors)
+        acc_name = str(account.get("name") or "").strip()
+        runtime_status = getattr(self, "_runtime_auth_status", {}).get(acc_name)
+        if runtime_status == "expired":
+            return False, "⚠ Session Expired", "Re-login required — generation auth failed"
+
+        # Check exported_cookies.json for auth cookie validity
+        cookies_json = session_dir / "exported_cookies.json"
+        if cookies_json.exists():
+            try:
+                import json as _json
+                with open(str(cookies_json), "r", encoding="utf-8") as f:
+                    cookies = _json.load(f)
+                auth_names = {"SID", "SSID", "HSID", "SAPISID", "__Secure-1PSID"}
+                auth_cookies = [c for c in cookies if c.get("name") in auth_names]
+                if auth_cookies:
+                    now = _time.time()
+                    expired = [
+                        c for c in auth_cookies
+                        if c.get("expires", 0) > 0 and c["expires"] < now
+                    ]
+                    if len(expired) >= 2:
+                        return False, "⚠ Cookies Expired", f"{len(expired)} auth cookies expired"
+                    return True, "✅ Logged In", f"{len(auth_cookies)} auth cookies"
+            except Exception:
+                pass
+
+        # Fallback: check session files
         local_storage_dir = session_dir / "Default" / "Local Storage"
         if local_storage_dir.exists():
             try:
@@ -7593,6 +7624,7 @@ class MainWindow(QMainWindow):
         self.queue_manager.signals.log_msg.connect(self.append_log, Qt.QueuedConnection)
         self.queue_manager.signals.job_updated.connect(self.on_job_updated, Qt.QueuedConnection)
         self.queue_manager.signals.account_runtime.connect(self.on_account_runtime, Qt.QueuedConnection)
+        self.queue_manager.signals.account_auth_status.connect(self._on_account_auth_status, Qt.QueuedConnection)
         self.queue_manager.signals.show_warning.connect(self._show_session_warning, Qt.QueuedConnection)
         self.queue_manager.signals.warmup_progress.connect(self.warmup_progress_signal.emit, Qt.QueuedConnection)
         self.queue_manager.signals.warmup_complete.connect(self.warmup_complete_signal.emit, Qt.QueuedConnection)
@@ -7724,6 +7756,21 @@ class MainWindow(QMainWindow):
             self._adjust_mode_tabs_height()
         if hasattr(self, "tabs") and self.tabs.currentWidget() is getattr(self, "tab_live_generation", None):
             self.ui_throttler.schedule("live_grid_resize", self._refresh_live_grid)
+
+    def _on_account_auth_status(self, account_name, status, message):
+        """Handle auth status changes from queue manager (logged_in / expired)."""
+        if not hasattr(self, "_runtime_auth_status"):
+            self._runtime_auth_status = {}
+
+        if status == "expired":
+            self._runtime_auth_status[account_name] = "expired"
+            self._append_log(f"[{account_name}] Session expired: {message}")
+        elif status == "logged_in":
+            # Clear expired status on successful generation
+            self._runtime_auth_status.pop(account_name, None)
+
+        # Trigger immediate status refresh
+        self._refresh_login_statuses()
 
     def on_account_runtime(self, account_name, runtime_status, cooldown_until_ts, active_slots, total_slots, detail):
         self.account_runtime_state[str(account_name)] = {

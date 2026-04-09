@@ -32,6 +32,7 @@ class QueueSignals(QObject):
     log_msg = Signal(str)
     job_updated = Signal(str, str, str, str)  # job_id, status, account, error_msg
     account_runtime = Signal(str, str, float, int, int, str)  # account, status, cooldown_until_ts, active_slots, total_slots, detail
+    account_auth_status = Signal(str, str, str)  # account_name, status ("logged_in"/"expired"), message
     show_warning = Signal(str)
     warmup_progress = Signal(str, int, str)
     warmup_complete = Signal(str, bool, str)
@@ -1762,6 +1763,18 @@ class AsyncQueueManager(QThread):
             f"[{label}] Failure detected: category={category}, retryable={'yes' if retryable else 'no'}."
         )
 
+        # Emit session expired status on auth-related errors
+        if category in ("auth_missing", "project_resolution_failed"):
+            self.signals.account_auth_status.emit(
+                account_name, "expired",
+                f"Session expired: {category}",
+            )
+        msg_lower = (error_msg or "").lower()
+        if "session not signed in" in msg_lower or "not signed in" in msg_lower:
+            self.signals.account_auth_status.emit(
+                account_name, "expired", "Session not signed in"
+            )
+
         if category == "audio_filter" and retryable:
             self.signals.log_msg.emit(
                 f"[{label}] Audio filter triggered — will retry with fresh generation."
@@ -1926,6 +1939,7 @@ class AsyncQueueManager(QThread):
                 self.job_retry_after.pop(job_id, None)
                 update_job_status(job_id, "completed", account=account_name)
                 self.signals.job_updated.emit(job_id, "completed", account_name, "")
+                self.signals.account_auth_status.emit(account_name, "logged_in", "Last success: just now")
                 self.signals.log_msg.emit(f"[{label}] Job {job_id[:6]}... finished successfully!")
             else:
                 await self._handle_job_failure(slot, job_id, error_msg or "Unknown generation error.")
