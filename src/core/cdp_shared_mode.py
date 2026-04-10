@@ -772,6 +772,11 @@ class CDPBrowserServer:
         self._jobs_completed = 0
         self._is_cleaning = False
         self._clean_count = 0  # how many hard cleans have happened (for stats)
+        # Clean markers — stored OUTSIDE the profile dir (sibling files) so
+        # they survive full profile deletion. Populated in start() once
+        # _profile_path is known.
+        self._clean_marker_path = None  # sibling file: <profile>.last_clean
+        self._jobs_marker_path = None   # sibling file: <profile>.jobs_count
 
     async def start(self, num_slots, total_jobs=0):
         """Start CloakBrowser process and create min(num_slots, total_jobs) contexts.
@@ -807,11 +812,21 @@ class CDPBrowserServer:
 
         # Use _cloak profile to avoid lock conflicts with login Chrome
         self._profile_path = self._session_path + "_cloak"
+        # Marker files live NEXT TO the profile dir (not inside it) so a full
+        # profile delete does not wipe the jobs_count / last_clean history.
+        self._clean_marker_path = self._profile_path + ".last_clean"
+        self._jobs_marker_path = self._profile_path + ".jobs_count"
+
         os.makedirs(self._profile_path, exist_ok=True)
         cleanup_session_locks(self._profile_path)
 
         self._log(f"[CDPServer:{self.account_name}] Profile: {self._profile_path}")
         self._log(f"[CDPServer:{self.account_name}] Display: {'headless' if self._is_headless else 'visible'}")
+
+        # Startup profile check: delete profile if it's old/large/job-heavy
+        # so we never start generation on a junk profile with degraded
+        # reCAPTCHA telemetry. Runs BEFORE browser launch.
+        await self._check_startup_clean()
 
         # Launch browser process (extracted so hard-clean can reuse)
         launched = self._launch_browser_process()
@@ -1025,7 +1040,178 @@ class CDPBrowserServer:
         Returns True if a hard clean should be triggered now.
         """
         self._jobs_completed += 1
+        # Persist jobs count to disk so startup check can detect job-heavy
+        # profiles after an app restart.
+        self._update_jobs_count()
         return self._jobs_completed >= self.HARD_CLEAN_EVERY_N_JOBS and not self._is_cleaning
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Startup profile check + clean markers
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _check_startup_clean(self):
+        """Delete profile on startup if it's stale (job-heavy / old / bloated).
+
+        Triggers:
+          1. Jobs count since last clean >= 200
+          2. Hours since last clean >= 24
+          3. No marker AND Cache folder > 50 MB (junk legacy profile)
+
+        Markers are stored OUTSIDE the profile dir (sibling files) so they
+        survive a full profile delete.
+        """
+        if not self._profile_path:
+            return
+
+        needs_clean = False
+        reason = ""
+
+        # Check 1: jobs count from last session
+        try:
+            if self._jobs_marker_path and os.path.exists(self._jobs_marker_path):
+                with open(self._jobs_marker_path, "r") as f:
+                    last_count = int((f.read() or "0").strip() or "0")
+                if last_count >= 200:
+                    needs_clean = True
+                    reason = f"{last_count} jobs since last clean"
+        except Exception:
+            pass
+
+        # Check 2: time since last clean
+        try:
+            if (
+                not needs_clean
+                and self._clean_marker_path
+                and os.path.exists(self._clean_marker_path)
+            ):
+                with open(self._clean_marker_path, "r") as f:
+                    last_time = float((f.read() or "0").strip() or "0")
+                hours_ago = (time.time() - last_time) / 3600
+                if hours_ago >= 24:
+                    needs_clean = True
+                    reason = f"{hours_ago:.0f} hours since last clean"
+        except Exception:
+            pass
+
+        # Check 3: no marker at all → look for legacy junk (Cache > 50 MB)
+        try:
+            if not needs_clean and self._clean_marker_path and not os.path.exists(self._clean_marker_path):
+                cache_dir = os.path.join(self._profile_path, "Default", "Cache")
+                if os.path.isdir(cache_dir):
+                    cache_size = 0
+                    for dp, _dn, fns in os.walk(cache_dir):
+                        for fn in fns:
+                            try:
+                                cache_size += os.path.getsize(os.path.join(dp, fn))
+                            except Exception:
+                                pass
+                    if cache_size > 50 * 1024 * 1024:  # 50 MB
+                        needs_clean = True
+                        reason = f"Cache is {cache_size / 1024 / 1024:.0f}MB (no clean marker)"
+        except Exception:
+            pass
+
+        if not needs_clean:
+            self._log(
+                f"[CDPServer:{self.account_name}] Startup clean not needed — profile is fresh."
+            )
+            return
+
+        self._log(
+            f"[CDPServer:{self.account_name}] Startup clean needed: {reason} — deleting profile..."
+        )
+
+        # Delete full profile (same logic as hard clean Step 4)
+        import shutil
+
+        total_size = 0
+        if os.path.isdir(self._profile_path):
+            try:
+                for dp, _dn, fns in os.walk(self._profile_path):
+                    for fn in fns:
+                        try:
+                            total_size += os.path.getsize(os.path.join(dp, fn))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        deleted = False
+        for attempt in range(5):
+            try:
+                shutil.rmtree(self._profile_path, ignore_errors=False)
+                deleted = True
+                break
+            except Exception as e:
+                if attempt < 4:
+                    await asyncio.sleep(0.5)
+                else:
+                    self._log(
+                        f"[CDPServer:{self.account_name}] Startup delete retry exhausted: "
+                        f"{str(e)[:80]} — using ignore_errors fallback"
+                    )
+                    shutil.rmtree(self._profile_path, ignore_errors=True)
+                    deleted = True
+
+        try:
+            os.makedirs(self._profile_path, exist_ok=True)
+        except Exception as e:
+            self._log(
+                f"[CDPServer:{self.account_name}] Startup clean makedirs failed: {str(e)[:60]}"
+            )
+            return
+
+        freed_mb = total_size / (1024 * 1024)
+        self._log(
+            f"[CDPServer:{self.account_name}] Startup clean done! Freed {freed_mb:.1f}MB. "
+            f"Fresh profile will be initialized by Chromium on launch."
+        )
+
+        # Save markers immediately so the NEXT startup check sees a fresh clean.
+        # Reset in-memory jobs counter too.
+        self._jobs_completed = 0
+        self._save_clean_markers()
+
+    def _save_clean_markers(self):
+        """Write .last_clean (unix ts) and .jobs_count (0) next to the profile dir.
+
+        Called after every clean — both hard clean and startup clean. Files
+        live OUTSIDE the profile dir so profile deletion does not erase them.
+        """
+        try:
+            if self._clean_marker_path:
+                with open(self._clean_marker_path, "w") as f:
+                    f.write(str(time.time()))
+            if self._jobs_marker_path:
+                with open(self._jobs_marker_path, "w") as f:
+                    f.write("0")
+        except Exception as e:
+            self._log(
+                f"[CDPServer:{self.account_name}] save_clean_markers failed: {str(e)[:60]}"
+            )
+
+    def _update_jobs_count(self):
+        """Increment .jobs_count on disk after a successful job.
+
+        Keeps counter durable across app restarts so startup check can detect
+        job-heavy profiles even if the app crashed without a clean shutdown.
+        """
+        try:
+            if not self._jobs_marker_path:
+                return
+            count = 0
+            if os.path.exists(self._jobs_marker_path):
+                try:
+                    with open(self._jobs_marker_path, "r") as f:
+                        count = int((f.read() or "0").strip() or "0")
+                except Exception:
+                    count = 0
+            count += 1
+            with open(self._jobs_marker_path, "w") as f:
+                f.write(str(count))
+        except Exception:
+            # Silent — disk marker is best-effort, never block the job flow.
+            pass
 
     async def _maybe_hard_clean(self):
         """Full browser restart after N completed jobs.
@@ -1309,9 +1495,12 @@ class CDPBrowserServer:
                         f"[CDPServer:{self.account_name}] slot {slot.slot_id} recreate failed: {str(e)[:60]}"
                     )
 
-            # ── Step 11: Reset counter ──
+            # ── Step 11: Reset counter + persist clean markers ──
             self._jobs_completed = 0
             self._clean_count += 1
+            # Persist .last_clean + reset .jobs_count on disk so the next
+            # app startup sees this recent clean and skips startup-clean.
+            self._save_clean_markers()
             elapsed = time.time() - start_ts
             self._log(
                 f"[CDPServer:{self.account_name}] HARD CLEAN #{clean_num} DONE in {elapsed:.1f}s. "
