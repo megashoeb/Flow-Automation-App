@@ -847,7 +847,10 @@ class CDPBrowserServer:
                 pass
         page1 = await ctx1.new_page()
         await page1.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
+        # Reduced from 3s to 1.5s — domcontentloaded + 1.5s is enough for Flow
+        # page's JS to register grecaptcha + auth. If project ID extraction
+        # fails below, the retry fallbacks handle it.
+        await asyncio.sleep(1.5)
 
         # Check login
         if "accounts.google.com" in page1.url:
@@ -873,15 +876,34 @@ class CDPBrowserServer:
         slot1 = CDPSlotWorker(f"{self.account_name}#c1", ctx1, page1, self._project_id, self._log)
         self._slots.append(slot1)
 
-        # Remaining slots (only up to actual_slots, not num_slots)
-        for i in range(2, actual_slots + 1):
-            try:
-                slot = await self._create_new_slot(index=i)
-                if slot is None:
-                    self._log(f"[CDPServer:{self.account_name}] Slot {i} creation returned None")
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                self._log(f"[CDPServer:{self.account_name}] Slot {i} failed: {str(e)[:60]}")
+        # PARALLEL SLOT CREATION — slots 2..N created concurrently using
+        # asyncio.gather(). Previously sequential with 0.5s stagger, causing
+        # 5 extra slots to take ~35s. Now ~5-8s total (bottleneck is the
+        # per-slot page.goto which runs in parallel against the same browser).
+        remaining = actual_slots - 1
+        if remaining > 0:
+            self._log(
+                f"[CDPServer:{self.account_name}] Creating {remaining} additional slot(s) in parallel..."
+            )
+
+            async def _build_slot(slot_index):
+                try:
+                    return await self._create_new_slot(index=slot_index)
+                except Exception as e:
+                    self._log(
+                        f"[CDPServer:{self.account_name}] Slot {slot_index} failed: {str(e)[:60]}"
+                    )
+                    return None
+
+            parallel_slots = await asyncio.gather(
+                *[_build_slot(i) for i in range(2, actual_slots + 1)],
+                return_exceptions=False,
+            )
+            none_count = sum(1 for s in parallel_slots if s is None)
+            if none_count:
+                self._log(
+                    f"[CDPServer:{self.account_name}] {none_count}/{remaining} additional slot(s) failed"
+                )
 
         est_ram = 300 + len(self._slots) * 30
         self._log(
@@ -891,7 +913,11 @@ class CDPBrowserServer:
         return len(self._slots) > 0
 
     async def _create_new_slot(self, index=None):
-        """Create a new context slot. Returns the slot or None on failure."""
+        """Create a new context slot. Returns the slot or None on failure.
+
+        Used both for initial parallel slot creation in start() and for
+        on-demand slot creation via get_or_create_slot().
+        """
         if self._browser is None or self._project_id is None:
             return None
         try:
@@ -907,7 +933,10 @@ class CDPBrowserServer:
                 wait_until="domcontentloaded",
                 timeout=15000,
             )
-            await asyncio.sleep(2)
+            # Reduced from 2s to 1s — the slot's first real API call includes
+            # its own reCAPTCHA init + grecaptcha.ready wait inside the JS,
+            # so an extra 2s here was redundant padding.
+            await asyncio.sleep(1)
             slot_index = index if index is not None else (len(self._slots) + 1)
             slot = CDPSlotWorker(
                 f"{self.account_name}#c{slot_index}",
@@ -1534,27 +1563,47 @@ class CDPSharedManager:
         )
 
         try:
+            # PARALLEL ACCOUNT STARTUP — all accounts start their browsers
+            # simultaneously instead of one-by-one. 3 accounts × 60s sequential
+            # → max(60s) ≈ 60s total. Each account is independent, so there's
+            # no resource conflict (each has its own port + profile).
+            pre_start_info = []  # [(name, server), ...]
             for i, acc in enumerate(all_accs):
                 name = acc.get("name", "unknown")
                 session_path = acc.get("session_path", os.path.join(DATA_DIR, name))
                 cookies_json = os.path.join(session_path, "exported_cookies.json")
                 port = base_port + i
-
                 server = CDPBrowserServer(name, session_path, cookies_json, port, self._log)
+                pre_start_info.append((name, server))
+
+            self._log(
+                f"[CDPShared] Launching {len(pre_start_info)} account(s) in parallel..."
+            )
+
+            async def _start_one(name, server):
+                """Start one account; never raise so other accounts keep going."""
                 try:
-                    success = await server.start(
+                    ok = await server.start(
                         num_slots=slots_per_account,
                         total_jobs=jobs_per_account_hint,
                     )
+                    return name, server, ok, None
                 except Exception as e:
-                    self._log(f"[CDPShared] {name}: start() exception: {str(e)[:100]}")
-                    success = False
+                    return name, server, False, str(e)[:120]
 
-                if success:
+            start_results = await asyncio.gather(
+                *[_start_one(name, server) for name, server in pre_start_info],
+                return_exceptions=False,
+            )
+
+            for name, server, ok, err in start_results:
+                if ok:
                     self._servers[name] = server
                     self._rr_order.append(name)
+                    self._log(f"[CDPShared] {name}: ready ✓")
                 else:
-                    # One account failed → keep going with others, don't stop all
+                    if err:
+                        self._log(f"[CDPShared] {name}: start() exception: {err}")
                     self._log(f"[CDPShared] {name}: Failed to start — skipped.")
                     try:
                         await server.stop()
