@@ -1751,6 +1751,18 @@ class AsyncQueueManager(QThread):
             "failed to create a processsingleton",
             "profile directory is already in use",
             "process_singleton_posix",
+            # Google Flow backend transient errors — CDP Shared mode and
+            # multitab mode surface these frequently. Old browser-per-slot
+            # mode rarely triggered them due to natural per-slot spacing,
+            # but they ARE retryable (usually clears on next attempt).
+            "internal error encountered",
+            "internal error",
+            "backend error",
+            "service unavailable",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
         )
         return any(token in msg for token in retryable_hints)
 
@@ -1791,6 +1803,17 @@ class AsyncQueueManager(QThread):
             return "api_generation_failure"
         if "generation or download failed" in msg:
             return "generation_pipeline_failure"
+        if (
+            "internal error encountered" in msg
+            or "internal error" in msg
+            or "backend error" in msg
+            or "service unavailable" in msg
+            or "http 500" in msg
+            or "http 502" in msg
+            or "http 503" in msg
+            or "http 504" in msg
+        ):
+            return "backend_internal_error"
         return "unclassified_failure"
 
     def _is_high_priority_retry_error(self, error_msg):
@@ -1826,6 +1849,22 @@ class AsyncQueueManager(QThread):
             base = max(base, 30)
         elif "download failed" in msg or "generation or download failed" in msg:
             base = max(base, 25)
+        elif (
+            "internal error encountered" in msg
+            or "internal error" in msg
+            or "backend error" in msg
+            or "service unavailable" in msg
+            or "http 500" in msg
+            or "http 502" in msg
+            or "http 503" in msg
+            or "http 504" in msg
+        ):
+            # Google Flow backend needs time to recover from transient
+            # 5xx errors. Longer backoff than generic retries — 20 s, 40 s,
+            # 60 s. During this wait the dispatcher will route the retry
+            # to a DIFFERENT slot (possibly different account), naturally
+            # rotating away from any degraded backend assignment.
+            base = max(base, 20)
         return base * retry_count
 
     async def _cleanup_slot_session(self, slot, reason=None):

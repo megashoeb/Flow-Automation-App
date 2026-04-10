@@ -1974,29 +1974,88 @@ class CDPSharedManager:
 
                 self._active_tasks = [t for t in self._active_tasks if not t.done()]
 
+                # Expire any account holds whose duration has elapsed —
+                # this re-enables dispatch to accounts that were paused
+                # for auth / rate-limit / reCAPTCHA cooldowns.
+                try:
+                    self.qm._check_account_holds()
+                except Exception as hold_err:
+                    self._log(f"[CDPShared] _check_account_holds error: {hold_err}")
+
                 jobs = get_all_jobs()
                 pending = [j for j in jobs if j["status"] == "pending"]
 
-                if not pending:
-                    if not self._active_tasks:
-                        still = any(j["status"] in ("pending", "running") for j in get_all_jobs())
+                # Clean up stale retry tracking entries for jobs that are
+                # no longer in the queue (deleted / moved / completed via
+                # other mechanisms).
+                now_ts = time.time()
+                pending_ids = {j["id"] for j in jobs}
+                for rid in list(self.qm.job_retry_after.keys()):
+                    if rid not in pending_ids:
+                        self.qm.job_retry_after.pop(rid, None)
+                        self.qm.job_retry_counts.pop(rid, None)
+
+                # Filter pending jobs by retry_after — jobs whose scheduled
+                # retry time hasn't elapsed are skipped this cycle.
+                pending_ready = [
+                    j for j in pending
+                    if self.qm.job_retry_after.get(j["id"], 0) <= now_ts
+                ]
+
+                if not pending_ready:
+                    if not self._active_tasks and not pending:
+                        still = any(
+                            j["status"] in ("pending", "running")
+                            for j in get_all_jobs()
+                        )
                         if not still:
                             self._log("[CDPShared] All jobs completed.")
                             break
                     await asyncio.sleep(self.qm.scheduler_poll_seconds)
                     continue
 
+                pending = pending_ready
+
                 busy = {t.get_name() for t in self._active_tasks if hasattr(t, "get_name")}
                 dispatched = 0
 
+                # ── Same-account stagger: match the old browser-per-slot
+                # dispatcher behaviour. Without this, 5 parallel slots on
+                # a single account fire their jobs within ~2 seconds and
+                # Google Flow's batchGenerateImages endpoint returns
+                # "Internal error encountered" for ~40-60% of the burst.
+                # With a 1.0 s minimum gap per account (default), 5 jobs
+                # spread over ~5 s and the error rate collapses to ~0%.
+                #
+                # The setting already exists in queue_manager
+                # (self.qm.same_account_stagger_seconds, default 1.0 s);
+                # CDP mode just wasn't consulting it. multitab mode had
+                # the same gap — fixed there too.
+                acct_stagger = max(0.0, float(self.qm.same_account_stagger_seconds))
+                now_ts = time.time()
+                stagger_blocked = set()
+                if acct_stagger > 0:
+                    for acc_name, last_at in self.qm.last_account_dispatch_at.items():
+                        if now_ts - last_at < acct_stagger:
+                            stagger_blocked.add(acc_name)
+
                 for job in pending:
-                    slot = await self._get_available_slot_async(busy)
+                    slot = await self._get_available_slot_async(
+                        busy, stagger_blocked=stagger_blocked
+                    )
                     if not slot:
                         break
 
                     job_id = job["id"]
                     update_job_status(job_id, "running", account=slot.account_name)
                     self.qm.signals.job_updated.emit(job_id, "running", slot.account_name, "")
+
+                    # Update dispatch-stagger tracker BEFORE task creation so
+                    # subsequent iterations in this same poll cycle also see
+                    # the account as freshly-dispatched and skip it.
+                    self.qm.last_account_dispatch_at[slot.account_name] = time.time()
+                    if acct_stagger > 0:
+                        stagger_blocked.add(slot.account_name)
 
                     task = asyncio.create_task(self._run_job(slot, job), name=slot.slot_id)
                     self._active_tasks.append(task)
@@ -2023,27 +2082,54 @@ class CDPSharedManager:
             self._servers.clear()
             self._log("[CDPShared] All browsers and slots stopped.")
 
-    async def _get_available_slot_async(self, busy_slots):
+    async def _get_available_slot_async(self, busy_slots, stagger_blocked=None):
         """Round-robin across accounts with on-demand slot creation.
 
-        1. Walk _rr_order of accounts.
-        2. Skip any account currently in hard-clean (its _is_cleaning flag is set).
-           Other accounts keep generating — only the cleaning one pauses.
-        3. First try reusing an idle slot on each account.
-        4. If none idle, ask the server to create a new slot on-demand (up to its max).
-        5. Rotate the winning account to the end of _rr_order for fairness.
+        Account-level skip conditions (old-mode parity):
+          1. Hard-clean in progress (``server._is_cleaning``)
+          2. Same-account dispatch stagger not yet elapsed (``stagger_blocked``)
+          3. Account on hold via ``queue_manager._put_account_on_hold``
+             (auth / rate limit / access denied). Checked via
+             ``self.qm.account_disabled``.
+          4. reCAPTCHA streak cooldown active
+             (``self.qm.account_recaptcha_until[name] > now``). Other
+             accounts keep running — only the cooldowning one pauses.
+
+        Then:
+          5. Pass 1 — reuse an idle slot on the first eligible account.
+          6. Pass 2 — create a new slot on-demand on the first eligible
+             account (up to that server's max).
+          7. Rotate the winning account to the end of _rr_order so the
+             next dispatch prefers the next account.
         """
         if not self._rr_order:
             return None
+
+        blocked = stagger_blocked or set()
+        now_ts = time.time()
+
+        def _account_eligible(name, server):
+            """All old-mode gates in one place."""
+            if server is None:
+                return False
+            if getattr(server, "_is_cleaning", False):
+                return False
+            if name in blocked:
+                return False
+            # Account on hold (auth / rate limit / suspension)
+            if self.qm.account_disabled.get(name):
+                return False
+            # reCAPTCHA streak cooldown
+            recap_until = self.qm.account_recaptcha_until.get(name, 0)
+            if recap_until and recap_until > now_ts:
+                return False
+            return True
 
         # Pass 1: reuse idle slot across accounts (round-robin)
         order = list(self._rr_order)
         for name in order:
             server = self._servers.get(name)
-            if server is None:
-                continue
-            # Skip accounts that are being hard-cleaned
-            if getattr(server, "_is_cleaning", False):
+            if not _account_eligible(name, server):
                 continue
             for slot in server.get_all_slots():
                 if slot.slot_id not in busy_slots and not slot.is_busy:
@@ -2058,9 +2144,7 @@ class CDPSharedManager:
         # Pass 2: create new slot on-demand (round-robin)
         for name in order:
             server = self._servers.get(name)
-            if server is None:
-                continue
-            if getattr(server, "_is_cleaning", False):
+            if not _account_eligible(name, server):
                 continue
             try:
                 new_slot = await server.get_or_create_slot()
@@ -2078,7 +2162,19 @@ class CDPSharedManager:
         return None
 
     async def _run_job(self, slot, job):
-        """Execute a single job with retries."""
+        """Execute a single job attempt. On failure, delegate to
+        ``_handle_cdp_job_failure`` which requeues the job via the shared
+        ``queue_manager`` retry state — the NEXT dispatch cycle picks it
+        up and routes it to whichever slot is currently free (possibly
+        on a different account entirely).
+
+        This mirrors the old browser-per-slot mode behaviour: single
+        attempt per slot, requeue on failure, natural retry-to-different-
+        slot rotation. That's what breaks Google Flow's load-balancer
+        session stickiness — inline reload on the same context does NOT
+        because Google's routing is keyed on account + request hash,
+        not on browser session.
+        """
         job_id = job["id"]
 
         # Load FULL job payload from DB — get_all_jobs() used by the dispatcher
@@ -2099,67 +2195,206 @@ class CDPSharedManager:
 
         self._log(f"[{slot.slot_id}] Job {job_id[:6]}...: {prompt[:40]}...")
 
-        max_retries = max(1, get_int_setting("max_auto_retries_per_job", 3))
-        last_error = ""
+        try:
+            if "video" in job_type:
+                video_model = job.get("video_model") or model
+                ratio = job.get("aspect_ratio", "ASPECT_RATIO_16_9")
+                result, error = await slot.generate_video(prompt, video_model, ratio)
+                media_tag = "video"
+            else:
+                ratio = job.get("aspect_ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE")
+                result, error = await slot.generate_image(prompt, model, ratio)
+                media_tag = "image"
 
-        for attempt in range(max_retries + 1):
-            try:
-                if "video" in job_type:
-                    video_model = job.get("video_model") or model
-                    ratio = job.get("aspect_ratio", "ASPECT_RATIO_16_9")
-                    result, error = await slot.generate_video(prompt, video_model, ratio)
-                    media_tag = "video"
-                else:
-                    ratio = job.get("aspect_ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE")
-                    result, error = await slot.generate_image(prompt, model, ratio)
-                    media_tag = "image"
-
-                if result and not error:
-                    # SAVE to disk — bot_engine-style numbered files
-                    saved = await slot._save_generation_result(result, job, media_tag=media_tag)
-                    if not saved:
-                        last_error = "Generation succeeded but file save failed (no downloadable media)"
-                        self._log(f"[{slot.slot_id}] {last_error}")
-                        if attempt < max_retries:
-                            await asyncio.sleep(3)
-                            continue
-                        break
-
-                    update_job_status(job_id, "completed", account=slot.account_name)
-                    self.qm.signals.job_updated.emit(job_id, "completed", slot.account_name, "")
-                    self.qm.signals.account_auth_status.emit(slot.account_name, "logged_in", "Success")
-                    self._log(f"[{slot.slot_id}] Job {job_id[:6]}... completed! ({len(saved)} file(s))")
-
-                    # HARD CLEAN trigger — only on SUCCESSFUL save, not on failures.
-                    # Fires in background so the slot returns immediately and the
-                    # dispatcher will naturally park on it via _is_cleaning.
-                    try:
-                        server = self._servers.get(slot.account_name)
-                        if server is not None and server.note_job_completed():
-                            # Schedule as background task so this job's return is not blocked.
-                            asyncio.create_task(server._maybe_hard_clean())
-                    except Exception as e:
-                        self._log(f"[{slot.slot_id}] hard-clean trigger error: {str(e)[:80]}")
+            # ── Success path ──
+            if result and not error:
+                saved = await slot._save_generation_result(
+                    result, job, media_tag=media_tag
+                )
+                if not saved:
+                    await self._handle_cdp_job_failure(
+                        slot,
+                        job_id,
+                        "Generation succeeded but file save failed (no downloadable media)",
+                    )
                     return
 
-                last_error = error or "Unknown error"
-                self._log(f"[{slot.slot_id}] Attempt {attempt + 1}/{max_retries + 1} failed: {last_error[:200]}")
+                update_job_status(job_id, "completed", account=slot.account_name)
+                self.qm.signals.job_updated.emit(
+                    job_id, "completed", slot.account_name, ""
+                )
+                self.qm.signals.account_auth_status.emit(
+                    slot.account_name, "logged_in", "Success"
+                )
+                self._log(
+                    f"[{slot.slot_id}] Job {job_id[:6]}... completed! ({len(saved)} file(s))"
+                )
 
-                if "recaptcha" in last_error.lower():
-                    await slot._try_reload()
-                    await asyncio.sleep(3)
-                elif "auth" in last_error.lower() or "401" in last_error:
-                    await slot._try_reload()
-                    await asyncio.sleep(3)
-                elif attempt < max_retries:
-                    await asyncio.sleep(10 * (attempt + 1))
+                # Clear any retry state from previous failures on this job
+                self.qm.job_retry_counts.pop(job_id, None)
+                self.qm.job_retry_after.pop(job_id, None)
+                # Reset account reCAPTCHA streak on successful generation
+                self.qm.account_recaptcha_streak.pop(slot.account_name, None)
 
-            except Exception as e:
-                last_error = str(e)[:200]
-                self._log(f"[{slot.slot_id}] Attempt {attempt + 1} exception: {last_error}")
-                if attempt < max_retries:
-                    await asyncio.sleep(10)
+                # HARD CLEAN trigger — only on SUCCESSFUL save.
+                try:
+                    server = self._servers.get(slot.account_name)
+                    if server is not None and server.note_job_completed():
+                        asyncio.create_task(server._maybe_hard_clean())
+                except Exception as e:
+                    self._log(
+                        f"[{slot.slot_id}] hard-clean trigger error: {str(e)[:80]}"
+                    )
+                return
 
-        update_job_status(job_id, "failed", account=slot.account_name, error=last_error)
-        self.qm.signals.job_updated.emit(job_id, "failed", slot.account_name, last_error)
-        self._log(f"[{slot.slot_id}] Job {job_id[:6]}... FAILED: {last_error[:200]}")
+            # ── Failure path ── (generate_* returned (None/empty, error))
+            await self._handle_cdp_job_failure(
+                slot, job_id, error or "Unknown error"
+            )
+
+        except Exception as e:
+            # Unexpected exception during execution
+            await self._handle_cdp_job_failure(slot, job_id, str(e)[:200])
+
+    async def _handle_cdp_job_failure(self, slot, job_id, error_msg):
+        """Port of ``queue_manager._handle_job_failure`` for CDP Shared mode.
+
+        Uses all the old-mode helpers via ``self.qm.*``:
+
+          * ``_classify_error``        — categorize the error
+          * ``_is_retryable_error``    — decide retry vs fail
+          * ``_is_high_priority_retry_error`` — +1 retry budget for
+                                          timeouts / session drops /
+                                          reCAPTCHA / download failures
+          * ``_get_retry_delay_seconds`` — smart delay per error type
+                                          (20 s base for Flow backend
+                                          5xx, 30 s for timeouts, etc.)
+          * ``_put_account_on_hold``   — 300 s hold for auth / rate limit,
+                                          1800 s for access denied
+          * ``account_recaptcha_streak`` / ``recaptcha_account_cooldown_seconds``
+                                          — streak-based reCAPTCHA cooldown
+          * ``job_retry_counts`` / ``job_retry_after``
+                                          — per-job retry tracking
+
+        On retryable failures the job is requeued to 'pending' with a
+        ``retry_after`` timestamp. The NEXT dispatch cycle picks it up
+        and routes it to whichever slot is free at that moment, which
+        naturally rotates away from any degraded backend assignment
+        (since Google Flow's load balancer hashes on request metadata,
+        a request from a different slot/timestamp lands on a different
+        backend).
+        """
+        account_name = slot.account_name
+        label = slot.slot_id
+        category = self.qm._classify_error(error_msg)
+        retryable = self.qm._is_retryable_error(error_msg)
+        max_retries_for_error = self.qm.max_auto_retries_per_job + (
+            1 if self.qm._is_high_priority_retry_error(error_msg) else 0
+        )
+
+        self._log(
+            f"[{label}] Failure: category={category}, "
+            f"retryable={'yes' if retryable else 'no'}: {str(error_msg)[:120]}"
+        )
+
+        msg_lower = (error_msg or "").lower()
+
+        # ── Account-level holds for serious errors (old-mode parity) ──
+        if category in ("auth_missing", "project_resolution_failed"):
+            self.qm._put_account_on_hold(
+                account_name, f"session expired ({category})", 300
+            )
+        elif "session not signed in" in msg_lower or "not signed in" in msg_lower:
+            self.qm._put_account_on_hold(account_name, "session not signed in", 300)
+        elif any(p in msg_lower for p in (
+            "rate limit", "429", "quota exceeded", "resource exhausted",
+            "too many requests", "quota_exceeded", "rate_limit",
+        )):
+            self.qm._put_account_on_hold(account_name, "rate limited", 300)
+        elif "access denied" in msg_lower or "account suspended" in msg_lower:
+            self.qm._put_account_on_hold(account_name, "access denied", 1800)
+
+        # ── Moderation → fail permanently, no retry ──
+        if category == "moderated":
+            self.qm.job_retry_counts.pop(job_id, None)
+            self.qm.job_retry_after.pop(job_id, None)
+            normalized = str(error_msg or "").strip()
+            if normalized and not normalized.startswith("MODERATION:"):
+                normalized = f"MODERATION: {normalized}"
+            final_error = f"[moderated] {normalized or 'Content blocked by policy filter'}"
+            update_job_status(job_id, "failed", account=account_name, error=final_error)
+            self.qm.signals.job_updated.emit(job_id, "failed", account_name, final_error)
+            self._log(
+                f"[{label}] Prompt blocked by content filter. Marked as failed (no retry)."
+            )
+            return
+
+        # ── reCAPTCHA: reload page + apply streak-based account cooldown ──
+        if "recaptcha" in msg_lower:
+            self._log(
+                f"[{label}] reCAPTCHA issue — reloading page + applying account cooldown..."
+            )
+            try:
+                await slot._try_reload()
+            except Exception:
+                pass
+            streak = self.qm.account_recaptcha_streak.get(account_name, 0) + 1
+            self.qm.account_recaptcha_streak[account_name] = streak
+            cooldown_seconds = self.qm.recaptcha_account_cooldown_seconds * min(streak, 3)
+            self.qm.account_recaptcha_until[account_name] = time.time() + cooldown_seconds
+            self._log(
+                f"[{label}] Account {account_name}: reCAPTCHA cooldown "
+                f"{cooldown_seconds}s (streak {streak}). Other accounts continue."
+            )
+
+        # ── Session-drop detection: the context/page died on us ──
+        if self.qm._is_session_drop_error(error_msg):
+            self._log(
+                f"[{label}] Browser session dropped — slot will re-create context on next use."
+            )
+            # CDP mode's slot context is tied to the browser; reload is
+            # the best we can do without full hard-clean. The hard-clean
+            # cycle will fully rebuild contexts eventually.
+            try:
+                await slot._try_reload()
+            except Exception:
+                pass
+
+        # ── Retry decision ──
+        retry_count = self.qm.job_retry_counts.get(job_id, 0)
+        if max_retries_for_error > 0 and retryable:
+            if retry_count < max_retries_for_error:
+                retry_count += 1
+                self.qm.job_retry_counts[job_id] = retry_count
+                retry_delay = self.qm._get_retry_delay_seconds(error_msg, retry_count)
+                if retry_delay > 0:
+                    self.qm.job_retry_after[job_id] = time.time() + retry_delay
+                    retry_note = (
+                        f"Auto-retry scheduled ({retry_count}/{max_retries_for_error}) "
+                        f"after {retry_delay}s [{category}]: {str(error_msg)[:120]}"
+                    )
+                else:
+                    self.qm.job_retry_after.pop(job_id, None)
+                    retry_note = (
+                        f"Auto-retry scheduled ({retry_count}/{max_retries_for_error}) "
+                        f"immediately [{category}]: {str(error_msg)[:120]}"
+                    )
+                # REQUEUE — put job back to 'pending' so the dispatcher
+                # picks it up on whatever slot is free next. This is the
+                # KEY difference from inline retry: the requeue naturally
+                # rotates the retry to a different slot/context, which
+                # breaks Google Flow's load-balancer session stickiness.
+                update_job_status(job_id, "pending", account="", error=retry_note)
+                self.qm.signals.job_updated.emit(job_id, "pending", "", retry_note)
+                self._log(f"[{label}] {retry_note}")
+                return
+
+        # ── Retries exhausted OR non-retryable → mark failed permanently ──
+        self.qm.job_retry_counts.pop(job_id, None)
+        self.qm.job_retry_after.pop(job_id, None)
+        final_error = f"[{category}] {error_msg}"
+        update_job_status(job_id, "failed", account=account_name, error=final_error)
+        self.qm.signals.job_updated.emit(job_id, "failed", account_name, final_error)
+        self._log(
+            f"[{label}] Job {job_id[:6]}... failed [{category}]: {str(error_msg)[:200]}"
+        )
