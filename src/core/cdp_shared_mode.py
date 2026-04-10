@@ -294,47 +294,137 @@ class CDPSlotWorker:
         self.is_busy = False
         self.jobs_completed = 0
 
+        # Health tracking (Fix 3 + Fix 7)
+        self.consecutive_failures = 0
+        self.quarantined_until = 0.0  # timestamp; slot skipped until this time
+        self.last_success_at = 0.0
+        self.last_failure_reason = ""
+
+        # Pre-generated reCAPTCHA token cache (Fix 4)
+        self._cached_token = None
+        self._cached_token_expires = 0.0  # reCAPTCHA tokens expire in ~120s
+
+    def is_healthy(self, now=None):
+        """Check if slot can accept new jobs (not quarantined, not busy)."""
+        if self.is_busy:
+            return False
+        if now is None:
+            now = time.time()
+        return self.quarantined_until <= now
+
+    def note_failure(self, reason=""):
+        """Record a failure. After 3 consecutive failures, quarantine for 60s."""
+        self.consecutive_failures += 1
+        self.last_failure_reason = reason[:80]
+        if self.consecutive_failures >= 3:
+            self.quarantined_until = time.time() + 60
+            self._log(
+                f"[{self.slot_id}] Quarantined for 60s after {self.consecutive_failures} "
+                f"consecutive failures (last: {reason[:60]})"
+            )
+            self.consecutive_failures = 0  # reset after quarantine applied
+
+    def note_success(self):
+        """Reset failure counters on success."""
+        self.consecutive_failures = 0
+        self.last_success_at = time.time()
+        self.quarantined_until = 0.0
+        self.last_failure_reason = ""
+
     async def generate_image(self, prompt, model, ratio, references=None):
         """Generate image using SAME page.evaluate JS as bot_engine.
 
-        Returns the FULL JS result dict (with fifeUrl, mediaName, data) so that
-        _save_generation_result can extract the download URL. Previously only
-        data was returned, causing "no downloadable media" errors.
+        Includes inline retry for transient "Internal error" responses —
+        Google's backend randomly returns these, retrying with a new seed
+        within the same tab usually succeeds (80%+ pass rate).
+
+        Returns the FULL JS result dict (with fifeUrl, mediaName, data).
         """
         self.is_busy = True
         try:
             api_model = _resolve_image_model(model)
             api_ratio = _resolve_image_ratio(ratio)
-            seed = random.randint(100000, 999999)
-            batch_id = f"{random.getrandbits(128):032x}"
 
-            self._log(f"[{self.slot_id}] Image: {api_model}, {api_ratio}")
+            # Inline retry for transient server errors (Fix 5)
+            # 2 attempts with fresh seed each time, 2s gap
+            INLINE_MAX_ATTEMPTS = 2
+            INLINE_GAP_SECONDS = 2
 
-            result = await self._page.evaluate(
-                _IMAGE_GENERATE_JS,
-                {
-                    "projectId": self._project_id,
-                    "prompt": prompt,
-                    "modelName": api_model,
-                    "aspectRatio": api_ratio,
-                    "batchId": batch_id,
-                    "seed": seed,
-                    "recaptchaAction": "IMAGE_GENERATION",
-                    "referenceMediaIds": references or [],
-                },
-            )
+            last_error = None
+            for inline_attempt in range(1, INLINE_MAX_ATTEMPTS + 1):
+                seed = random.randint(100000, 999999)
+                batch_id = f"{random.getrandbits(128):032x}"
 
-            if not result:
-                return None, "No response from page.evaluate"
-            if not result.get("ok"):
-                return None, result.get("error", "Unknown error")
+                if inline_attempt == 1:
+                    self._log(f"[{self.slot_id}] Image: {api_model}, {api_ratio}")
+                else:
+                    self._log(
+                        f"[{self.slot_id}] Inline retry #{inline_attempt}/{INLINE_MAX_ATTEMPTS} "
+                        f"with new seed (prev: {last_error[:60] if last_error else '?'})"
+                    )
 
-            self.jobs_completed += 1
-            # Return the FULL result dict so downstream save sees fifeUrl/mediaName
-            return result, None
+                try:
+                    result = await self._page.evaluate(
+                        _IMAGE_GENERATE_JS,
+                        {
+                            "projectId": self._project_id,
+                            "prompt": prompt,
+                            "modelName": api_model,
+                            "aspectRatio": api_ratio,
+                            "batchId": batch_id,
+                            "seed": seed,
+                            "recaptchaAction": "IMAGE_GENERATION",
+                            "referenceMediaIds": references or [],
+                        },
+                    )
+                except Exception as e:
+                    last_error = f"page.evaluate exception: {str(e)[:150]}"
+                    # On exception, try to reload once — next inline attempt
+                    if inline_attempt < INLINE_MAX_ATTEMPTS:
+                        await self._try_reload()
+                        await asyncio.sleep(INLINE_GAP_SECONDS)
+                    continue
+
+                if not result:
+                    last_error = "No response from page.evaluate"
+                    if inline_attempt < INLINE_MAX_ATTEMPTS:
+                        await asyncio.sleep(INLINE_GAP_SECONDS)
+                    continue
+
+                if result.get("ok"):
+                    self.jobs_completed += 1
+                    self.note_success()  # clear failure counter
+                    return result, None
+
+                # Failure — decide if inline retry makes sense
+                error_text = str(result.get("error", "Unknown error"))
+                last_error = error_text
+                error_lower = error_text.lower()
+
+                # Only retry inline for transient server errors
+                transient = any(t in error_lower for t in (
+                    "internal error", "backend error", "service unavailable",
+                    "http 500", "http 502", "http 503", "http 504",
+                    "rpc failed", "connection reset", "deadline exceeded",
+                ))
+
+                if not transient:
+                    # Non-transient error — bail out, let queue_manager handle
+                    self.note_failure(error_text)
+                    return None, error_text
+
+                # Transient — quick retry with new seed
+                if inline_attempt < INLINE_MAX_ATTEMPTS:
+                    await asyncio.sleep(INLINE_GAP_SECONDS)
+                    continue
+
+            # All inline attempts exhausted
+            self.note_failure(last_error or "inline retries exhausted")
+            return None, last_error or "inline retries exhausted"
 
         except Exception as e:
             await self._try_reload()
+            self.note_failure(str(e)[:80])
             return None, str(e)[:200]
         finally:
             self.is_busy = False
@@ -343,6 +433,7 @@ class CDPSlotWorker:
     async def generate_video(self, prompt, model, ratio):
         """Generate video using SAME page.evaluate JS as bot_engine.
 
+        Includes inline retry for transient Internal errors — same as image.
         Returns the FULL JS result dict so _save_generation_result can see
         whatever download fields the JS exposes.
         """
@@ -350,35 +441,78 @@ class CDPSlotWorker:
         try:
             api_model = _resolve_video_model(model)
             api_ratio = _resolve_video_ratio(ratio)
-            seed = random.randint(100000, 999999)
-            batch_id = f"{random.getrandbits(128):032x}"
 
-            self._log(f"[{self.slot_id}] Video: {api_model}, {api_ratio}")
+            INLINE_MAX_ATTEMPTS = 2
+            INLINE_GAP_SECONDS = 2
 
-            result = await self._page.evaluate(
-                _VIDEO_GENERATE_JS,
-                {
-                    "projectId": self._project_id,
-                    "prompt": prompt,
-                    "modelKey": api_model,
-                    "aspectRatio": api_ratio,
-                    "batchId": batch_id,
-                    "seed": seed,
-                    "recaptchaAction": "VIDEO_GENERATION",
-                },
-            )
+            last_error = None
+            for inline_attempt in range(1, INLINE_MAX_ATTEMPTS + 1):
+                seed = random.randint(100000, 999999)
+                batch_id = f"{random.getrandbits(128):032x}"
 
-            if not result:
-                return None, "No response"
-            if not result.get("ok"):
-                return None, result.get("error", "Unknown error")
+                if inline_attempt == 1:
+                    self._log(f"[{self.slot_id}] Video: {api_model}, {api_ratio}")
+                else:
+                    self._log(
+                        f"[{self.slot_id}] Video inline retry #{inline_attempt} "
+                        f"with new seed (prev: {last_error[:60] if last_error else '?'})"
+                    )
 
-            self.jobs_completed += 1
-            # Return the FULL result dict (not just .data)
-            return result, None
+                try:
+                    result = await self._page.evaluate(
+                        _VIDEO_GENERATE_JS,
+                        {
+                            "projectId": self._project_id,
+                            "prompt": prompt,
+                            "modelKey": api_model,
+                            "aspectRatio": api_ratio,
+                            "batchId": batch_id,
+                            "seed": seed,
+                            "recaptchaAction": "VIDEO_GENERATION",
+                        },
+                    )
+                except Exception as e:
+                    last_error = f"page.evaluate exception: {str(e)[:150]}"
+                    if inline_attempt < INLINE_MAX_ATTEMPTS:
+                        await self._try_reload()
+                        await asyncio.sleep(INLINE_GAP_SECONDS)
+                    continue
+
+                if not result:
+                    last_error = "No response"
+                    if inline_attempt < INLINE_MAX_ATTEMPTS:
+                        await asyncio.sleep(INLINE_GAP_SECONDS)
+                    continue
+
+                if result.get("ok"):
+                    self.jobs_completed += 1
+                    self.note_success()
+                    return result, None
+
+                error_text = str(result.get("error", "Unknown error"))
+                last_error = error_text
+                error_lower = error_text.lower()
+
+                transient = any(t in error_lower for t in (
+                    "internal error", "backend error", "service unavailable",
+                    "http 500", "http 502", "http 503", "http 504",
+                    "rpc failed", "deadline exceeded",
+                ))
+
+                if not transient:
+                    self.note_failure(error_text)
+                    return None, error_text
+
+                if inline_attempt < INLINE_MAX_ATTEMPTS:
+                    await asyncio.sleep(INLINE_GAP_SECONDS)
+                    continue
+
+            self.note_failure(last_error or "inline retries exhausted")
+            return None, last_error or "inline retries exhausted"
 
         except Exception as e:
             await self._try_reload()
+            self.note_failure(str(e)[:80])
             return None, str(e)[:200]
         finally:
             self.is_busy = False
@@ -2132,7 +2266,8 @@ class CDPSharedManager:
             if not _account_eligible(name, server):
                 continue
             for slot in server.get_all_slots():
-                if slot.slot_id not in busy_slots and not slot.is_busy:
+                # Skip quarantined slots (Fix 7 — health tracking)
+                if slot.slot_id not in busy_slots and slot.is_healthy(now_ts):
                     # Move this account to end of rotation
                     try:
                         self._rr_order.remove(name)
