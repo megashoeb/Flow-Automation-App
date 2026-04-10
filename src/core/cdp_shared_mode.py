@@ -295,7 +295,12 @@ class CDPSlotWorker:
         self.jobs_completed = 0
 
     async def generate_image(self, prompt, model, ratio, references=None):
-        """Generate image using SAME page.evaluate JS as bot_engine."""
+        """Generate image using SAME page.evaluate JS as bot_engine.
+
+        Returns the FULL JS result dict (with fifeUrl, mediaName, data) so that
+        _save_generation_result can extract the download URL. Previously only
+        data was returned, causing "no downloadable media" errors.
+        """
         self.is_busy = True
         try:
             api_model = _resolve_image_model(model)
@@ -325,7 +330,8 @@ class CDPSlotWorker:
                 return None, result.get("error", "Unknown error")
 
             self.jobs_completed += 1
-            return result.get("data"), None
+            # Return the FULL result dict so downstream save sees fifeUrl/mediaName
+            return result, None
 
         except Exception as e:
             await self._try_reload()
@@ -335,7 +341,11 @@ class CDPSlotWorker:
             await self._maybe_refresh()
 
     async def generate_video(self, prompt, model, ratio):
-        """Generate video using SAME page.evaluate JS as bot_engine."""
+        """Generate video using SAME page.evaluate JS as bot_engine.
+
+        Returns the FULL JS result dict so _save_generation_result can see
+        whatever download fields the JS exposes.
+        """
         self.is_busy = True
         try:
             api_model = _resolve_video_model(model)
@@ -364,7 +374,8 @@ class CDPSlotWorker:
                 return None, result.get("error", "Unknown error")
 
             self.jobs_completed += 1
-            return result.get("data"), None
+            # Return the FULL result dict (not just .data)
+            return result, None
 
         except Exception as e:
             await self._try_reload()
@@ -376,8 +387,15 @@ class CDPSlotWorker:
     async def _save_generation_result(self, result, job, media_tag="image"):
         """
         Download + save generated media to disk.
-        Primary path: fifeUrl (bot_engine's proven method via playwright request ctx).
-        Fallbacks: encodedImage base64, URL via aiohttp.
+
+        Tries multiple response formats (in order):
+          1. Top-level fifeUrl / mediaName (extracted by our JS — same as bot_engine)
+          2. Walk result["data"]["media"][].image.generatedImage.fifeUrl (raw API shape)
+          3. Alternate formats: generatedMedias / responses[].generatedMedias /
+             mediaGenerations / results — with encodedImage (base64) or uri/url
+          4. Deep recursive walk as last resort: find ANY string that looks like a
+             downloadable image URL or looks like a media id we can redirect on.
+
         Returns list of saved file paths.
         """
         import base64 as _b64
@@ -389,108 +407,251 @@ class CDPSlotWorker:
             os.makedirs(output_dir, exist_ok=True)
 
             if not isinstance(result, dict):
+                self._log(f"[{self.slot_id}] Save: result is not dict ({type(result).__name__})")
                 return saved_files
 
-            # ── METHOD 1: fifeUrl (bot_engine's primary path) ──
+            # ── DEBUG: log response structure (first time per slot only) ──
+            try:
+                top_keys = list(result.keys())
+                self._log(f"[{self.slot_id}] DEBUG response keys: {top_keys}")
+                data_blob = result.get("data") or {}
+                if isinstance(data_blob, dict):
+                    self._log(f"[{self.slot_id}] DEBUG data keys: {list(data_blob.keys())}")
+                # Short preview (avoid flooding logs)
+                preview = json.dumps(result, default=str)[:400]
+                self._log(f"[{self.slot_id}] DEBUG preview: {preview}")
+            except Exception:
+                pass
+
+            request_ctx = self.context.request if self.context else None
+
+            # Helper: download a URL via playwright request context (carries cookies)
+            async def _download_and_save(url, media_tag_inner):
+                if not url or request_ctx is None:
+                    return None
+                try:
+                    resp = await request_ctx.get(url, timeout=90000)
+                    if not resp.ok:
+                        self._log(f"[{self.slot_id}] URL {url[:60]}... HTTP {resp.status}")
+                        return None
+                    content_type = str(resp.headers.get("content-type", "")).lower()
+                    ext = ".mp4" if media_tag_inner == "video" else ".jpg"
+                    if "png" in content_type:
+                        ext = ".png"
+                    elif "webp" in content_type:
+                        ext = ".webp"
+                    elif "jpeg" in content_type or "jpg" in content_type:
+                        ext = ".jpg"
+                    elif "mp4" in content_type:
+                        ext = ".mp4"
+                    elif "webm" in content_type:
+                        ext = ".webm"
+                    elif "quicktime" in content_type:
+                        ext = ".mov"
+                    save_path = self._build_save_path(output_dir, job, ext)
+                    body = await resp.body()
+                    if not body or len(body) < 100:
+                        return None
+                    tmp_path = save_path + ".tmp"
+                    with open(tmp_path, "wb") as f:
+                        f.write(body)
+                    os.replace(tmp_path, save_path)
+                    return save_path
+                except Exception as e:
+                    self._log(f"[{self.slot_id}] download error: {str(e)[:80]}")
+                    return None
+
+            # Helper: save base64 payload
+            def _save_base64(b64_str, media_tag_inner):
+                if not b64_str:
+                    return None
+                try:
+                    ext = ".mp4" if media_tag_inner == "video" else ".jpg"
+                    save_path = self._build_save_path(output_dir, job, ext)
+                    img_bytes = _b64.b64decode(b64_str)
+                    if not img_bytes or len(img_bytes) < 100:
+                        return None
+                    with open(save_path, "wb") as f:
+                        f.write(img_bytes)
+                    return save_path
+                except Exception as e:
+                    self._log(f"[{self.slot_id}] b64 decode failed: {str(e)[:60]}")
+                    return None
+
+            # Helper: build a media redirect URL from a media id
+            def _redirect_url(media_id):
+                if not media_id:
+                    return ""
+                return (
+                    "https://labs.google/fx/api/trpc/media.getMediaUrlRedirect"
+                    f"?name={media_id}"
+                )
+
+            # ── METHOD 1: Top-level fifeUrl / mediaName (extracted by our JS) ──
             fife_url = result.get("fifeUrl") or ""
             media_name = result.get("mediaName") or ""
-            download_url = fife_url
-            if not download_url and media_name:
-                # Build media redirect URL
-                download_url = (
-                    f"https://labs.google/fx/api/trpc/media.getMediaUrlRedirect"
-                    f"?name={media_name}"
-                )
-
-            if download_url:
-                try:
-                    request_ctx = self.context.request if self.context else None
-                    if request_ctx is not None:
-                        resp = await request_ctx.get(download_url, timeout=90000)
-                        if resp.ok:
-                            content_type = str(resp.headers.get("content-type", "")).lower()
-                            ext = ".jpg"
-                            if "png" in content_type:
-                                ext = ".png"
-                            elif "webp" in content_type:
-                                ext = ".webp"
-                            elif "mp4" in content_type:
-                                ext = ".mp4"
-                            elif "webm" in content_type:
-                                ext = ".webm"
-
-                            save_path = self._build_save_path(output_dir, job, ext)
-                            data = await resp.body()
-                            if data and len(data) > 100:
-                                tmp_path = save_path + ".tmp"
-                                with open(tmp_path, "wb") as f:
-                                    f.write(data)
-                                os.replace(tmp_path, save_path)
-                                saved_files.append(save_path)
-                                self._log(f"[{self.slot_id}] Saved: {save_path}")
-                                return saved_files
-                except Exception as e:
-                    self._log(f"[{self.slot_id}] fifeUrl download failed: {str(e)[:80]}")
-
-            # ── METHOD 2: Alternate response format (encodedImage base64) ──
-            data_blob = result.get("data") or {}
-            generated = []
-            if isinstance(data_blob, dict):
-                generated = (
-                    data_blob.get("generatedMedias")
-                    or data_blob.get("generated_medias")
-                    or []
-                )
-                if not generated:
-                    for resp_item in data_blob.get("responses") or []:
-                        if isinstance(resp_item, dict):
-                            medias = (
-                                resp_item.get("generatedMedias")
-                                or resp_item.get("generated_medias")
-                                or []
-                            )
-                            if medias:
-                                generated.extend(medias)
-
-            for media in generated:
-                if not isinstance(media, dict):
+            for attempt_url in (fife_url, _redirect_url(media_name)):
+                if not attempt_url:
                     continue
-                image_data = (
-                    media.get("encodedImage") or media.get("encoded_image") or ""
-                )
-                image_url = media.get("uri") or media.get("url") or ""
+                saved_path = await _download_and_save(attempt_url, media_tag)
+                if saved_path:
+                    saved_files.append(saved_path)
+                    self._log(f"[{self.slot_id}] Saved: {saved_path}")
+                    return saved_files
 
-                ext = ".mp4" if media_tag == "video" else ".jpg"
-                save_path = self._build_save_path(output_dir, job, ext)
-
-                if image_data:
-                    try:
-                        img_bytes = _b64.b64decode(image_data)
-                        with open(save_path, "wb") as f:
-                            f.write(img_bytes)
-                        saved_files.append(save_path)
-                        self._log(f"[{self.slot_id}] Saved (b64): {save_path}")
+            # ── METHOD 2: Walk data.media[].image.generatedImage.fifeUrl ──
+            # This is the raw Google API response shape (same as bot_engine reads)
+            data_blob = result.get("data") or {}
+            if isinstance(data_blob, dict):
+                media_arr = data_blob.get("media") if isinstance(data_blob.get("media"), list) else []
+                for media_item in media_arr:
+                    if not isinstance(media_item, dict):
                         continue
-                    except Exception as e:
-                        self._log(f"[{self.slot_id}] b64 decode failed: {str(e)[:60]}")
+                    img = media_item.get("image") or {}
+                    gen = img.get("generatedImage") if isinstance(img, dict) else None
+                    if not isinstance(gen, dict):
+                        continue
+                    candidate = gen.get("fifeUrl") or gen.get("url") or ""
+                    if candidate:
+                        saved_path = await _download_and_save(candidate, media_tag)
+                        if saved_path:
+                            saved_files.append(saved_path)
+                            self._log(f"[{self.slot_id}] Saved (data.media): {saved_path}")
+                            return saved_files
+                    # Also try by mediaId redirect
+                    mid = media_item.get("name") or media_item.get("mediaId") or ""
+                    if mid:
+                        saved_path = await _download_and_save(_redirect_url(mid), media_tag)
+                        if saved_path:
+                            saved_files.append(saved_path)
+                            self._log(f"[{self.slot_id}] Saved (data.media redirect): {saved_path}")
+                            return saved_files
 
-                if image_url:
-                    try:
-                        request_ctx = self.context.request if self.context else None
-                        if request_ctx is not None:
-                            r = await request_ctx.get(image_url, timeout=60000)
-                            if r.ok:
-                                body = await r.body()
-                                if body and len(body) > 100:
-                                    with open(save_path, "wb") as f:
-                                        f.write(body)
-                                    saved_files.append(save_path)
-                                    self._log(f"[{self.slot_id}] Downloaded: {save_path}")
-                    except Exception as e:
-                        self._log(f"[{self.slot_id}] URL download failed: {str(e)[:60]}")
+            # ── METHOD 3: Alternate response shapes (generatedMedias / results etc.) ──
+            candidate_lists = []
+            if isinstance(data_blob, dict):
+                for key in ("generatedMedias", "generated_medias", "mediaGenerations", "results"):
+                    v = data_blob.get(key)
+                    if isinstance(v, list) and v:
+                        candidate_lists.append(v)
+                # Nested under responses[]
+                for resp_item in data_blob.get("responses") or []:
+                    if isinstance(resp_item, dict):
+                        for key in ("generatedMedias", "generated_medias", "mediaGenerations", "results"):
+                            v = resp_item.get(key)
+                            if isinstance(v, list) and v:
+                                candidate_lists.append(v)
+            # Also top-level result may be the list directly in some shapes
+            for key in ("generatedMedias", "generated_medias", "mediaGenerations", "results"):
+                v = result.get(key)
+                if isinstance(v, list) and v:
+                    candidate_lists.append(v)
+
+            for media_list in candidate_lists:
+                for media in media_list:
+                    if not isinstance(media, dict):
+                        continue
+                    image_b64 = (
+                        media.get("encodedImage")
+                        or media.get("encoded_image")
+                        or media.get("imageData")
+                        or media.get("image_data")
+                        or media.get("bytes")
+                        or ""
+                    )
+                    image_url = (
+                        media.get("uri")
+                        or media.get("url")
+                        or media.get("imageUri")
+                        or media.get("image_uri")
+                        or media.get("downloadUri")
+                        or media.get("fifeUrl")
+                        or ""
+                    )
+                    # Also peek into nested image.generatedImage.fifeUrl
+                    if not image_url:
+                        img = media.get("image") or {}
+                        gen = img.get("generatedImage") if isinstance(img, dict) else None
+                        if isinstance(gen, dict):
+                            image_url = gen.get("fifeUrl") or gen.get("url") or ""
+
+                    if image_b64:
+                        saved_path = _save_base64(image_b64, media_tag)
+                        if saved_path:
+                            saved_files.append(saved_path)
+                            self._log(f"[{self.slot_id}] Saved (b64): {saved_path}")
+                            return saved_files
+
+                    if image_url:
+                        saved_path = await _download_and_save(image_url, media_tag)
+                        if saved_path:
+                            saved_files.append(saved_path)
+                            self._log(f"[{self.slot_id}] Saved (url): {saved_path}")
+                            return saved_files
+
+                    # Try media id → redirect
+                    media_id = (
+                        media.get("name")
+                        or media.get("mediaId")
+                        or media.get("media_id")
+                        or media.get("mediaGenerateId")
+                        or ""
+                    )
+                    if media_id:
+                        saved_path = await _download_and_save(_redirect_url(media_id), media_tag)
+                        if saved_path:
+                            saved_files.append(saved_path)
+                            self._log(f"[{self.slot_id}] Saved (id redirect): {saved_path}")
+                            return saved_files
+
+            # ── METHOD 4: Last-resort deep recursive walk ──
+            # Walk the entire result tree looking for any string that looks like
+            # a fife URL or http(s) URL pointing to google image hosts.
+            def _deep_find_url(node, depth=0):
+                if depth > 10:
+                    return None
+                if isinstance(node, str):
+                    s = node
+                    if s.startswith("http") and (
+                        "googleusercontent.com" in s
+                        or "ggpht.com" in s
+                        or "fife" in s.lower()
+                        or "labs.google" in s
+                    ):
+                        return s
+                    return None
+                if isinstance(node, dict):
+                    for v in node.values():
+                        found = _deep_find_url(v, depth + 1)
+                        if found:
+                            return found
+                elif isinstance(node, list):
+                    for v in node:
+                        found = _deep_find_url(v, depth + 1)
+                        if found:
+                            return found
+                return None
+
+            deep_url = _deep_find_url(result)
+            if deep_url:
+                self._log(f"[{self.slot_id}] DEBUG deep-found URL: {deep_url[:80]}...")
+                saved_path = await _download_and_save(deep_url, media_tag)
+                if saved_path:
+                    saved_files.append(saved_path)
+                    self._log(f"[{self.slot_id}] Saved (deep): {saved_path}")
+                    return saved_files
+
+            # Nothing worked — log full structure for debugging
+            try:
+                self._log(
+                    f"[{self.slot_id}] No downloadable media found. "
+                    f"Full response: {json.dumps(result, default=str)[:1500]}"
+                )
+            except Exception:
+                pass
 
         except Exception as e:
-            self._log(f"[{self.slot_id}] Save error: {str(e)[:80]}")
+            self._log(f"[{self.slot_id}] Save error: {str(e)[:120]}")
 
         return saved_files
 
@@ -766,19 +927,39 @@ class CDPBrowserServer:
             return None
 
     def _find_cloak_binary(self):
-        """Find CloakBrowser binary path — tries 3 methods (same as bot_engine)."""
+        """Find CloakBrowser binary path.
+
+        Order:
+          1. ensure_binary() — downloads if missing (important on first-run Mac)
+          2. binary_info() — fast path if already installed
+          3. get_binary_path() — config lookup
+
+        On Mac, if the returned path ends in .app (bundle), resolve to the actual
+        executable inside Contents/MacOS/.
+        """
         binary = None
 
-        # Method 1: cloakbrowser.binary_info()
+        # Method 1: ensure_binary() FIRST — this also downloads the binary if missing
+        # (critical on fresh Mac installs where binary_info() would return nothing)
         try:
-            from cloakbrowser import binary_info
-            info = binary_info() or {}
-            if info.get("installed"):
-                binary = info.get("binary_path")
-        except Exception:
-            pass
+            from cloakbrowser.download import ensure_binary
+            binary = ensure_binary()
+            if binary:
+                self._log(f"[CDPServer:{self.account_name}] Binary ensured: {binary}")
+        except Exception as e:
+            self._log(f"[CDPServer:{self.account_name}] ensure_binary unavailable: {str(e)[:60]}")
 
-        # Method 2: cloakbrowser.config.get_binary_path()
+        # Method 2: cloakbrowser.binary_info()
+        if not binary:
+            try:
+                from cloakbrowser import binary_info
+                info = binary_info() or {}
+                if info.get("installed"):
+                    binary = info.get("binary_path")
+            except Exception:
+                pass
+
+        # Method 3: cloakbrowser.config.get_binary_path()
         if not binary:
             try:
                 from cloakbrowser.config import get_binary_path
@@ -786,18 +967,44 @@ class CDPBrowserServer:
             except Exception:
                 pass
 
-        # Method 3: cloakbrowser.download.ensure_binary()
-        if not binary:
-            try:
-                from cloakbrowser.download import ensure_binary
-                binary = ensure_binary()
-            except Exception:
-                pass
-
         if not binary:
             return None
 
         binary_str = str(binary)
+
+        # Mac: .app bundle → find the real executable inside
+        if platform.system() == "Darwin" and binary_str.endswith(".app"):
+            # Try known Chromium-based exec names
+            candidates = [
+                os.path.join(binary_str, "Contents", "MacOS", "Chromium"),
+                os.path.join(binary_str, "Contents", "MacOS", "Google Chrome for Testing"),
+                os.path.join(binary_str, "Contents", "MacOS", "CloakBrowser"),
+                os.path.join(binary_str, "Contents", "MacOS", "Chrome"),
+            ]
+            resolved = None
+            for cand in candidates:
+                if os.path.exists(cand):
+                    resolved = cand
+                    break
+            # Fallback: walk MacOS dir and take first regular file
+            if not resolved:
+                macos_dir = os.path.join(binary_str, "Contents", "MacOS")
+                if os.path.isdir(macos_dir):
+                    try:
+                        for entry in sorted(os.listdir(macos_dir)):
+                            full = os.path.join(macos_dir, entry)
+                            if os.path.isfile(full):
+                                resolved = full
+                                break
+                    except Exception:
+                        pass
+            if resolved:
+                self._log(f"[CDPServer:{self.account_name}] Mac .app resolved: {resolved}")
+                binary_str = resolved
+            else:
+                self._log(f"[CDPServer:{self.account_name}] Mac .app bundle has no MacOS executable: {binary_str}")
+                return None
+
         if not os.path.exists(binary_str):
             self._log(f"[CDPServer:{self.account_name}] Binary path returned but file not found: {binary_str}")
             return None

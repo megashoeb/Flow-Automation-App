@@ -1461,7 +1461,7 @@ class MainWindow(QMainWindow):
         self.current_pipe_ref_paths = []
         self.bulk_panels = {}
 
-        saved_slots = max(1, min(5, get_int_setting("slots_per_account", 3)))
+        saved_slots = max(1, min(40, get_int_setting("slots_per_account", 3)))
         self._mode_tab_scrolls = {}
 
         self.mode_tabs = QTabWidget()
@@ -3354,8 +3354,8 @@ class MainWindow(QMainWindow):
         slots_layout = QHBoxLayout()
         slots_layout.addWidget(QLabel("Worker Slots Per Account:"))
         self.spin_slots_per_account = QSpinBox()
-        self.spin_slots_per_account.setRange(1, 6)
-        self.spin_slots_per_account.setValue(max(1, min(6, get_int_setting("slots_per_account", 3))))
+        self.spin_slots_per_account.setRange(1, 40)
+        self.spin_slots_per_account.setValue(max(1, min(40, get_int_setting("slots_per_account", 3))))
         slots_layout.addWidget(self.spin_slots_per_account)
         slots_layout.addStretch()
         perf_layout.addLayout(slots_layout)
@@ -5898,7 +5898,7 @@ class MainWindow(QMainWindow):
         stored_output_dir = "" if selected_output_dir == default_output_dir else selected_output_dir
         self.output_dir_input.setText(selected_output_dir)
         self._update_runtime_badges()
-        target_slots = max(1, min(5, slots))
+        target_slots = max(1, min(40, slots))
         for selector_name in ("img_cmb_parallel", "t2v_cmb_parallel", "ref_cmb_parallel", "frm_cmb_parallel", "pipe_cmb_parallel"):
             selector = getattr(self, selector_name, None)
             if selector is None:
@@ -7655,7 +7655,7 @@ class MainWindow(QMainWindow):
             f"upscale={current_settings['video_upscale']}."
         )
 
-        selected_slots = max(1, min(5, self._current_parallel_slots()))
+        selected_slots = max(1, min(40, self._current_parallel_slots()))
         set_setting("slots_per_account", str(selected_slots))
         self.spin_slots_per_account.setValue(selected_slots)
 
