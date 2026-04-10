@@ -34,7 +34,16 @@ class QueueTableModel(QAbstractTableModel):
 
         if role == Qt.DisplayRole:
             if col == 0:
-                return str(job.get("queue_no") or index.row() + 1)
+                # For retried jobs, show the ORIGINAL output_index (preserved
+                # across retry) instead of the new negative queue_no that was
+                # used to push the job to the top of the queue. This matches
+                # bot_engine's file-naming logic (which reads output_index
+                # first, falling back to queue_no).
+                if job.get("is_retry"):
+                    display_no = job.get("output_index") or job.get("queue_no")
+                else:
+                    display_no = job.get("queue_no")
+                return str(display_no or index.row() + 1)
             if col == 1:
                 prompt = str(job.get("prompt") or "")
                 return (prompt[:80] + "...") if len(prompt) > 80 else prompt

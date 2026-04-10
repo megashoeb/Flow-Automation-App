@@ -1583,7 +1583,7 @@ class MainWindow(QMainWindow):
         queue_header.setSectionResizeMode(4, QHeaderView.Stretch)
         queue_header.setSectionResizeMode(5, QHeaderView.Fixed)
         queue_header.setSectionResizeMode(6, QHeaderView.Fixed)
-        self.queue_table.setColumnWidth(0, 50)
+        self.queue_table.setColumnWidth(0, 75)  # No. — wide enough for 4-digit queue numbers
         self.queue_table.setColumnWidth(2, 60)
         self.queue_table.setColumnWidth(5, 80)
         self.queue_table.setColumnWidth(6, 60)

@@ -656,21 +656,40 @@ class CDPSlotWorker:
         return saved_files
 
     def _build_save_path(self, output_dir, job, ext):
-        """Build save path — uses job's queue_no if available, else numbered."""
-        queue_no = None
-        try:
-            qn = job.get("queue_no")
-            if qn is not None:
-                val = int(qn)
-                if val > 0:
-                    queue_no = val
-        except Exception:
-            queue_no = None
+        """Build save path — matches bot_engine's file naming logic.
 
-        if queue_no is not None:
-            filename = f"{queue_no}{ext}"
-        else:
-            # Fallback: next available number in output_dir
+        Retry handling: when a failed job is retried, db_manager.retry_failed_jobs_to_top
+        sets queue_no to a new negative value (to push the job to the top of the queue)
+        and sets output_index to the ORIGINAL queue_no (to preserve the filename).
+
+        So the file number must be read as:
+            output_index (if is_retry and valid) -> else queue_no -> else next-available
+
+        This ensures "Retry all failed" writes back to the same filename slots the
+        original jobs would have filled.
+        """
+        def _valid_positive_int(value):
+            try:
+                if value is None:
+                    return None
+                v = int(value)
+                return v if v > 0 else None
+            except Exception:
+                return None
+
+        file_num = None
+        is_retry = bool(job.get("is_retry"))
+
+        # Prefer output_index on retries (preserved original number)
+        if is_retry:
+            file_num = _valid_positive_int(job.get("output_index"))
+
+        # Fall back to queue_no (primary for normal jobs; secondary on retries)
+        if file_num is None:
+            file_num = _valid_positive_int(job.get("queue_no"))
+
+        # Last resort — never happens for DB-backed jobs but safe for manual calls
+        if file_num is None:
             existing_nums = []
             try:
                 for f in os.listdir(output_dir):
@@ -681,11 +700,13 @@ class CDPSlotWorker:
                         pass
             except Exception:
                 pass
-            next_num = (max(existing_nums) + 1) if existing_nums else 1
-            filename = f"{next_num}{ext}"
+            file_num = (max(existing_nums) + 1) if existing_nums else 1
 
+        filename = f"{file_num}{ext}"
         save_path = os.path.join(output_dir, filename)
-        # Avoid overwrite — append (1), (2), ... if exists
+
+        # Avoid overwrite on retry collisions — bot_engine will overwrite, but
+        # CDP mode appends _1, _2 so partial-failure retries can coexist.
         if os.path.exists(save_path):
             base, e = os.path.splitext(save_path)
             k = 1
@@ -1669,6 +1690,19 @@ class CDPSharedManager:
     async def _run_job(self, slot, job):
         """Execute a single job with retries."""
         job_id = job["id"]
+
+        # Load FULL job payload from DB — get_all_jobs() used by the dispatcher
+        # omits aspect_ratio, output_index, is_retry, ref_paths, video_ratio, etc.
+        # Without this, CDP mode silently defaults aspect_ratio and loses the
+        # preserved output_index on retries (causing wrong filenames).
+        try:
+            full_payload = self.qm._load_job_payload(job_id)
+            if isinstance(full_payload, dict) and full_payload:
+                # Merge — full payload takes precedence over the dispatch summary
+                job = {**job, **full_payload}
+        except Exception as e:
+            self._log(f"[{slot.slot_id}] Warning: _load_job_payload failed: {str(e)[:80]}")
+
         job_type = job.get("job_type", "image")
         prompt = job.get("prompt", "")
         model = job.get("model", "")
