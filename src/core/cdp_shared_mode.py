@@ -723,6 +723,10 @@ class CDPSlotWorker:
 class CDPBrowserServer:
     """Manages 1 CloakBrowser process. Creates N contexts via CDP."""
 
+    # Hard-clean cadence: every N completed jobs, do full browser restart to
+    # reset reCAPTCHA telemetry, GPU caches, etc.
+    HARD_CLEAN_EVERY_N_JOBS = 250
+
     def __init__(self, account_name, session_path, cookies_json_path, cdp_port, log_fn):
         self.account_name = account_name
         self._session_path = session_path
@@ -737,6 +741,16 @@ class CDPBrowserServer:
         self._max_slots = 0  # Hard ceiling — can create more on demand up to this
         self._cookies_cache = []  # Cached cookies for on-demand slot creation
         self._slot_lock = None  # Initialized in start() to avoid event loop binding
+        # Reusable launch config — populated by start(), reused by hard-clean restart.
+        # Keeping the SAME port/profile/fingerprint is critical for reCAPTCHA reset.
+        self._profile_path = None
+        self._fingerprint_seed = None
+        self._is_headless = True
+        self._binary_path = None
+        # Hard-clean tracking
+        self._jobs_completed = 0
+        self._is_cleaning = False
+        self._clean_count = 0  # how many hard cleans have happened (for stats)
 
     async def start(self, num_slots, total_jobs=0):
         """Start CloakBrowser process and create min(num_slots, total_jobs) contexts.
@@ -758,49 +772,30 @@ class CDPBrowserServer:
 
         cleanup_session_locks(self._session_path)
 
-        # Find CloakBrowser binary
+        # Find CloakBrowser binary (cached for reuse in hard-clean restart)
         binary = self._find_cloak_binary()
         if not binary:
             self._log(f"[CDPServer:{self.account_name}] CloakBrowser binary not found!")
             return False
+        self._binary_path = binary
 
-        seed = random.randint(10000, 99999)
+        # Generate seed + headless state ONCE and cache — restart must use SAME values
+        self._fingerprint_seed = random.randint(10000, 99999)
         cloak_display = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
-        is_headless = cloak_display != "visible"
+        self._is_headless = cloak_display != "visible"
 
         # Use _cloak profile to avoid lock conflicts with login Chrome
-        profile = self._session_path + "_cloak"
-        os.makedirs(profile, exist_ok=True)
-        cleanup_session_locks(profile)
+        self._profile_path = self._session_path + "_cloak"
+        os.makedirs(self._profile_path, exist_ok=True)
+        cleanup_session_locks(self._profile_path)
 
-        self._log(f"[CDPServer:{self.account_name}] Profile: {profile}")
-        self._log(f"[CDPServer:{self.account_name}] Display: {'headless' if is_headless else 'visible'}")
+        self._log(f"[CDPServer:{self.account_name}] Profile: {self._profile_path}")
+        self._log(f"[CDPServer:{self.account_name}] Display: {'headless' if self._is_headless else 'visible'}")
 
-        # Build launch args
-        chrome_args = [
-            binary,
-            f"--remote-debugging-port={self._cdp_port}",
-            f"--user-data-dir={profile}",
-            f"--fingerprint={seed}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-        ]
-        if is_headless:
-            chrome_args.append("--headless=new")
-
-        # Launch
-        popen_kwargs = {}
-        if platform.system() == "Windows":
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        else:
-            popen_kwargs["stdout"] = subprocess.DEVNULL
-            popen_kwargs["stderr"] = subprocess.DEVNULL
-
-        self._process = subprocess.Popen(chrome_args, **popen_kwargs)
-        process_tracker.register(self._process.pid)
-        self._log(f"[CDPServer:{self.account_name}] PID: {self._process.pid}")
+        # Launch browser process (extracted so hard-clean can reuse)
+        launched = self._launch_browser_process()
+        if not launched:
+            return False
 
         # Wait for CDP
         ready = await self._wait_for_cdp(timeout=15)
@@ -925,6 +920,327 @@ class CDPBrowserServer:
                     )
                     return new_slot
             return None
+
+    # ────────────────────────────────────────────────────────────────────
+    # Browser launch (extracted for reuse in hard-clean restart)
+    # ────────────────────────────────────────────────────────────────────
+    def _launch_browser_process(self):
+        """Launch the CloakBrowser subprocess using cached config.
+
+        Uses the SAME port, profile, fingerprint, and display mode as the
+        original start() call — critical for hard-clean restart to preserve
+        session continuity (same cookies, same device identity).
+        """
+        if not self._binary_path or not self._profile_path:
+            self._log(f"[CDPServer:{self.account_name}] _launch_browser_process: missing cached config")
+            return False
+
+        chrome_args = [
+            self._binary_path,
+            f"--remote-debugging-port={self._cdp_port}",
+            f"--user-data-dir={self._profile_path}",
+            f"--fingerprint={self._fingerprint_seed}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+        ]
+        if self._is_headless:
+            chrome_args.append("--headless=new")
+
+        popen_kwargs = {}
+        if platform.system() == "Windows":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            popen_kwargs["stdout"] = subprocess.DEVNULL
+            popen_kwargs["stderr"] = subprocess.DEVNULL
+
+        try:
+            self._process = subprocess.Popen(chrome_args, **popen_kwargs)
+            process_tracker.register(self._process.pid)
+            self._log(f"[CDPServer:{self.account_name}] PID: {self._process.pid} (port {self._cdp_port})")
+            return True
+        except Exception as e:
+            self._log(f"[CDPServer:{self.account_name}] subprocess.Popen failed: {str(e)[:80]}")
+            self._process = None
+            return False
+
+    # ────────────────────────────────────────────────────────────────────
+    # HARD CLEAN — full browser restart every N jobs (reCAPTCHA reset)
+    # ────────────────────────────────────────────────────────────────────
+    def note_job_completed(self):
+        """Increment completed-job counter.
+
+        Called by CDPSharedManager AFTER a successful file save.
+        Returns True if a hard clean should be triggered now.
+        """
+        self._jobs_completed += 1
+        return self._jobs_completed >= self.HARD_CLEAN_EVERY_N_JOBS and not self._is_cleaning
+
+    async def _maybe_hard_clean(self):
+        """Full browser restart after N completed jobs.
+
+        Steps:
+          1. Close all contexts (slots lose their page/context refs)
+          2. Disconnect Playwright CDP
+          3. Terminate browser process
+          4. Clean profile sub-dirs (Cache/Code Cache/Service Worker/etc.)
+             — NEVER deletes Cookies or Cookies-journal
+          5. Wait 3s for filesystem to settle
+          6. Relaunch browser process with SAME port/profile/fingerprint
+          7. Wait for CDP endpoint
+          8. Reconnect Playwright
+          9. Re-extract project ID on a fresh context
+         10. Recreate contexts for all existing slots
+         11. Reset job counter
+
+        Other accounts keep running — only this server pauses.
+        Failure does NOT crash — just logs and marks cleaning complete.
+        """
+        if self._is_cleaning:
+            return False
+        self._is_cleaning = True
+        clean_num = self._clean_count + 1
+        start_ts = time.time()
+
+        try:
+            self._log(
+                f"[CDPServer:{self.account_name}] HARD CLEAN #{clean_num} starting "
+                f"({self._jobs_completed} jobs done)..."
+            )
+
+            # ── Step 0: Wait for in-flight jobs on this account to finish ──
+            # _is_cleaning is already True so the dispatcher won't hand out NEW jobs
+            # to this account's slots. We just need to let currently-running ones
+            # drain. Cap the wait at 120s so a stuck slot doesn't block forever.
+            wait_start = time.time()
+            while time.time() - wait_start < 120:
+                busy_slots = [s for s in self._slots if s.is_busy]
+                if not busy_slots:
+                    break
+                self._log(
+                    f"[CDPServer:{self.account_name}] Waiting for {len(busy_slots)} "
+                    f"in-flight job(s) to finish before clean..."
+                )
+                await asyncio.sleep(2)
+
+            # ── Step 1: Close all slot contexts ──
+            self._log(f"[CDPServer:{self.account_name}] [1/11] Closing all contexts...")
+            for slot in self._slots:
+                try:
+                    if slot.context is not None:
+                        await slot.context.close()
+                except Exception:
+                    pass
+                slot.context = None
+                slot._page = None
+                slot.is_busy = False
+
+            # ── Step 2: Disconnect Playwright CDP ──
+            self._log(f"[CDPServer:{self.account_name}] [2/11] Disconnecting CDP...")
+            if self._browser is not None:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+
+            # ── Step 3: Terminate browser process ──
+            self._log(f"[CDPServer:{self.account_name}] [3/11] Killing browser process...")
+            if self._process is not None:
+                try:
+                    self._process.terminate()
+                    for _ in range(10):
+                        if self._process.poll() is not None:
+                            break
+                        await asyncio.sleep(0.2)
+                    if self._process.poll() is None:
+                        try:
+                            self._process.kill()
+                        except Exception:
+                            pass
+                    try:
+                        process_tracker.unregister(self._process.pid)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self._log(f"[CDPServer:{self.account_name}] process kill error: {str(e)[:60]}")
+                self._process = None
+
+            # ── Step 4: Clean profile sub-directories (NEVER touch Cookies) ──
+            self._log(f"[CDPServer:{self.account_name}] [4/11] Cleaning profile...")
+            import shutil
+            dirs_to_clean = [
+                "Cache",
+                "Code Cache",
+                "Service Worker",
+                "IndexedDB",
+                "GrShaderCache",
+                "BrowserMetrics",
+                "Crashpad",
+                "GPUCache",
+                "blob_storage",
+                "Session Storage",
+                "Local Storage",
+                "ShaderCache",
+                "DawnCache",
+                "GraphiteDawnCache",
+                "optimization_guide_model_store",
+                "component_crx_cache",
+            ]
+            # CRITICAL: never delete these (must be preserved for session continuity)
+            forbidden_names = {
+                "cookies",
+                "cookies-journal",
+                "login data",
+                "login data-journal",
+                "preferences",
+                "secure preferences",
+            }
+            total_freed = 0
+            bases = [self._profile_path, os.path.join(self._profile_path, "Default")]
+            for base in bases:
+                if not os.path.isdir(base):
+                    continue
+                for dirname in dirs_to_clean:
+                    # Safety: refuse to touch any forbidden name
+                    if dirname.lower() in forbidden_names:
+                        continue
+                    target = os.path.join(base, dirname)
+                    if not os.path.isdir(target):
+                        continue
+                    try:
+                        size = 0
+                        for dp, dn, fns in os.walk(target):
+                            for fn in fns:
+                                try:
+                                    size += os.path.getsize(os.path.join(dp, fn))
+                                except Exception:
+                                    pass
+                        shutil.rmtree(target, ignore_errors=True)
+                        total_freed += size
+                    except Exception:
+                        pass
+            freed_mb = total_freed / (1024 * 1024)
+            self._log(f"[CDPServer:{self.account_name}] [4/11] Cleaned {freed_mb:.1f}MB")
+
+            # ── Step 5: Wait for filesystem to settle ──
+            await asyncio.sleep(3)
+
+            # Extra safety: clean any stale session locks on the profile
+            try:
+                cleanup_session_locks(self._profile_path)
+            except Exception:
+                pass
+
+            # ── Step 6: Relaunch browser process (same port/profile/fingerprint) ──
+            self._log(
+                f"[CDPServer:{self.account_name}] [6/11] Restarting browser on port {self._cdp_port}..."
+            )
+            launched = self._launch_browser_process()
+            if not launched:
+                self._log(f"[CDPServer:{self.account_name}] HARD CLEAN: browser relaunch FAILED")
+                return False
+
+            # ── Step 7: Wait for CDP endpoint ──
+            self._log(f"[CDPServer:{self.account_name}] [7/11] Waiting for CDP...")
+            ready = await self._wait_for_cdp(timeout=20)
+            if not ready:
+                self._log(f"[CDPServer:{self.account_name}] HARD CLEAN: CDP not ready after 20s")
+                return False
+
+            # ── Step 8: Reconnect Playwright ──
+            self._log(f"[CDPServer:{self.account_name}] [8/11] Reconnecting Playwright...")
+            try:
+                if self._playwright is None:
+                    from playwright.async_api import async_playwright
+                    self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{self._cdp_port}"
+                )
+            except Exception as e:
+                self._log(f"[CDPServer:{self.account_name}] HARD CLEAN: Playwright reconnect failed: {str(e)[:80]}")
+                return False
+
+            # ── Step 9: Re-extract project ID on a fresh page ──
+            self._log(f"[CDPServer:{self.account_name}] [9/11] Re-verifying project ID...")
+            try:
+                probe_ctx = await self._browser.new_context()
+                if self._cookies_cache:
+                    try:
+                        await probe_ctx.add_cookies(self._cookies_cache)
+                    except Exception:
+                        pass
+                probe_page = await probe_ctx.new_page()
+                await probe_page.goto(
+                    "https://labs.google/fx/tools/flow",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await asyncio.sleep(3)
+                if "accounts.google.com" in probe_page.url:
+                    self._log(
+                        f"[CDPServer:{self.account_name}] HARD CLEAN: session invalid after restart "
+                        f"(redirected to login)"
+                    )
+                    try:
+                        await probe_ctx.close()
+                    except Exception:
+                        pass
+                    return False
+                new_pid = await self._extract_project_id(probe_page)
+                if new_pid:
+                    self._project_id = new_pid
+                try:
+                    await probe_ctx.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                self._log(f"[CDPServer:{self.account_name}] HARD CLEAN: project ID probe failed: {str(e)[:80]}")
+                # Keep existing project ID as fallback — don't fail the clean
+
+            # ── Step 10: Recreate contexts for all existing slots ──
+            self._log(f"[CDPServer:{self.account_name}] [10/11] Recreating {len(self._slots)} slot context(s)...")
+            recreated = 0
+            for slot in self._slots:
+                try:
+                    new_ctx = await self._browser.new_context()
+                    if self._cookies_cache:
+                        try:
+                            await new_ctx.add_cookies(self._cookies_cache)
+                        except Exception:
+                            pass
+                    new_page = await new_ctx.new_page()
+                    await new_page.goto(
+                        "https://labs.google/fx/tools/flow",
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                    await asyncio.sleep(1)
+                    slot.context = new_ctx
+                    slot._page = new_page
+                    slot._project_id = self._project_id
+                    slot.is_busy = False
+                    recreated += 1
+                except Exception as e:
+                    self._log(
+                        f"[CDPServer:{self.account_name}] slot {slot.slot_id} recreate failed: {str(e)[:60]}"
+                    )
+
+            # ── Step 11: Reset counter ──
+            self._jobs_completed = 0
+            self._clean_count += 1
+            elapsed = time.time() - start_ts
+            self._log(
+                f"[CDPServer:{self.account_name}] HARD CLEAN #{clean_num} DONE in {elapsed:.1f}s. "
+                f"{recreated}/{len(self._slots)} slots ready, reCAPTCHA reset, resuming..."
+            )
+            return True
+        except Exception as e:
+            self._log(f"[CDPServer:{self.account_name}] HARD CLEAN error: {str(e)[:120]}")
+            return False
+        finally:
+            self._is_cleaning = False
 
     def _find_cloak_binary(self):
         """Find CloakBrowser binary path.
@@ -1300,9 +1616,11 @@ class CDPSharedManager:
         """Round-robin across accounts with on-demand slot creation.
 
         1. Walk _rr_order of accounts.
-        2. First try reusing an idle slot on each account.
-        3. If none idle, ask the server to create a new slot on-demand (up to its max).
-        4. Rotate the winning account to the end of _rr_order for fairness.
+        2. Skip any account currently in hard-clean (its _is_cleaning flag is set).
+           Other accounts keep generating — only the cleaning one pauses.
+        3. First try reusing an idle slot on each account.
+        4. If none idle, ask the server to create a new slot on-demand (up to its max).
+        5. Rotate the winning account to the end of _rr_order for fairness.
         """
         if not self._rr_order:
             return None
@@ -1312,6 +1630,9 @@ class CDPSharedManager:
         for name in order:
             server = self._servers.get(name)
             if server is None:
+                continue
+            # Skip accounts that are being hard-cleaned
+            if getattr(server, "_is_cleaning", False):
                 continue
             for slot in server.get_all_slots():
                 if slot.slot_id not in busy_slots and not slot.is_busy:
@@ -1327,6 +1648,8 @@ class CDPSharedManager:
         for name in order:
             server = self._servers.get(name)
             if server is None:
+                continue
+            if getattr(server, "_is_cleaning", False):
                 continue
             try:
                 new_slot = await server.get_or_create_slot()
@@ -1382,6 +1705,17 @@ class CDPSharedManager:
                     self.qm.signals.job_updated.emit(job_id, "completed", slot.account_name, "")
                     self.qm.signals.account_auth_status.emit(slot.account_name, "logged_in", "Success")
                     self._log(f"[{slot.slot_id}] Job {job_id[:6]}... completed! ({len(saved)} file(s))")
+
+                    # HARD CLEAN trigger — only on SUCCESSFUL save, not on failures.
+                    # Fires in background so the slot returns immediately and the
+                    # dispatcher will naturally park on it via _is_cleaning.
+                    try:
+                        server = self._servers.get(slot.account_name)
+                        if server is not None and server.note_job_completed():
+                            # Schedule as background task so this job's return is not blocked.
+                            asyncio.create_task(server._maybe_hard_clean())
+                    except Exception as e:
+                        self._log(f"[{slot.slot_id}] hard-clean trigger error: {str(e)[:80]}")
                     return
 
                 last_error = error or "Unknown error"
