@@ -116,7 +116,7 @@ def _fix_cookies_for_import(cookies):
 # The SAME JavaScript that bot_engine uses for image generation.
 # Handles auth session, reCAPTCHA, and API call all in one evaluate().
 _IMAGE_GENERATE_JS = """
-async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, recaptchaAction, referenceMediaIds }) => {
+async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, recaptchaAction, referenceMediaIds, cachedToken }) => {
     const getAuthSession = async () => {
         try {
             const resp = await fetch("https://labs.google/fx/api/auth/session", {
@@ -129,11 +129,27 @@ async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, recaptchaActi
         } catch { return null; }
     };
 
-    const getRecaptchaContext = async () => {
+    // Fix 3: soft-reset reCAPTCHA state before executing — avoids
+    // stale widget state from previous failed calls. Much faster than
+    // reloading the page (~50ms vs ~5000ms).
+    const softResetRecaptcha = () => {
+        try {
+            const enterprise = window.grecaptcha?.enterprise;
+            if (enterprise && typeof enterprise.reset === "function") {
+                enterprise.reset();
+            }
+        } catch {}
+    };
+
+    const getRecaptchaContext = async (useReset) => {
         try {
             const enterprise = window.grecaptcha?.enterprise;
             if (!enterprise || typeof enterprise.execute !== "function") return null;
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            // Fix 3: on retry after error, reset reCAPTCHA first
+            if (useReset) softResetRecaptcha();
+
             let siteKey = null;
             const scripts = Array.from(document.querySelectorAll("script[src*='recaptcha'][src*='render=']"));
             for (const script of scripts) {
@@ -160,7 +176,14 @@ async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, recaptchaActi
         return { ok: false, status: 0, error: "missing auth session access token" };
     }
 
-    const recaptchaContext = await getRecaptchaContext();
+    // Fix 5: Use cached token if provided by Python (pre-generated
+    // in background) — saves ~200-500ms per job
+    let recaptchaContext = null;
+    if (cachedToken) {
+        recaptchaContext = { token: cachedToken, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
+    } else {
+        recaptchaContext = await getRecaptchaContext(false);
+    }
     const clientContext = { projectId, tool: "PINHOLE", sessionId: ";" + Date.now() };
     if (recaptchaContext) clientContext.recaptchaContext = recaptchaContext;
 
@@ -223,7 +246,7 @@ async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, recaptchaActi
 """
 
 _VIDEO_GENERATE_JS = """
-async ({ projectId, prompt, modelKey, aspectRatio, batchId, seed, recaptchaAction }) => {
+async ({ projectId, prompt, modelKey, aspectRatio, batchId, seed, recaptchaAction, cachedToken }) => {
     const getAuthSession = async () => {
         try {
             const resp = await fetch("https://labs.google/fx/api/auth/session", { method: "GET", credentials: "include" });
@@ -231,6 +254,13 @@ async ({ projectId, prompt, modelKey, aspectRatio, batchId, seed, recaptchaActio
             const data = await resp.json().catch(() => null);
             return (data && data.access_token) ? data : null;
         } catch { return null; }
+    };
+
+    const softResetRecaptcha = () => {
+        try {
+            const e = window.grecaptcha?.enterprise;
+            if (e && typeof e.reset === "function") e.reset();
+        } catch {}
     };
 
     const getRecaptchaContext = async () => {
@@ -255,7 +285,13 @@ async ({ projectId, prompt, modelKey, aspectRatio, batchId, seed, recaptchaActio
     const auth = await getAuthSession();
     if (!auth) return { ok: false, error: "missing auth session access token" };
 
-    const recap = await getRecaptchaContext();
+    // Fix 5: Use cached token if available
+    let recap = null;
+    if (cachedToken) {
+        recap = { token: cachedToken, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
+    } else {
+        recap = await getRecaptchaContext();
+    }
     const ctx = { projectId, tool: "PINHOLE", userPaygateTier: "PAYGATE_TIER_TWO", sessionId: ";" + Date.now() };
     if (recap) ctx.recaptchaContext = recap;
 
@@ -331,6 +367,74 @@ class CDPSlotWorker:
         self.quarantined_until = 0.0
         self.last_failure_reason = ""
 
+    async def pre_generate_token(self, action="IMAGE_GENERATION"):
+        """Fix 5: Pre-generate reCAPTCHA token in background.
+
+        reCAPTCHA Enterprise tokens expire in ~120s. We can generate them
+        in advance and use them when a job arrives, saving ~200-500ms
+        per job since execute() doesn't run synchronously during the
+        generation call.
+        """
+        if self.is_busy:
+            return
+        try:
+            token = await self._page.evaluate(
+                """
+                async (action) => {
+                    try {
+                        const enterprise = window.grecaptcha?.enterprise;
+                        if (!enterprise || typeof enterprise.execute !== "function") return null;
+                        let siteKey = null;
+                        for (const s of document.querySelectorAll("script[src*='recaptcha'][src*='render=']")) {
+                            try {
+                                const r = new URL(s.src).searchParams.get("render");
+                                if (r && r !== "explicit") { siteKey = r; break; }
+                            } catch {}
+                        }
+                        if (!siteKey) return null;
+                        if (typeof enterprise.ready === "function") {
+                            await new Promise((r) => enterprise.ready(r));
+                        }
+                        return await enterprise.execute(siteKey, { action });
+                    } catch { return null; }
+                }
+                """,
+                action,
+            )
+            if token:
+                self._cached_token = token
+                # reCAPTCHA Enterprise tokens expire after ~120s, cache
+                # for 90s to have a safety margin
+                self._cached_token_expires = time.time() + 90
+        except Exception:
+            pass
+
+    def _consume_cached_token(self):
+        """Return cached token if still valid, else None. Consumes on read."""
+        if self._cached_token and time.time() < self._cached_token_expires:
+            token = self._cached_token
+            self._cached_token = None
+            self._cached_token_expires = 0.0
+            return token
+        return None
+
+    async def soft_reset_recaptcha(self):
+        """Fix 3: Soft-reset reCAPTCHA without full page reload.
+        ~50ms vs ~5000ms for full reload. Use after reCAPTCHA failures."""
+        try:
+            await self._page.evaluate(
+                """
+                () => {
+                    try {
+                        const e = window.grecaptcha?.enterprise;
+                        if (e && typeof e.reset === "function") e.reset();
+                    } catch {}
+                }
+                """
+            )
+        except Exception:
+            pass
+
     async def generate_image(self, prompt, model, ratio, references=None):
         """Generate image using SAME page.evaluate JS as bot_engine.
 
@@ -363,6 +467,10 @@ class CDPSlotWorker:
                         f"with new seed (prev: {last_error[:60] if last_error else '?'})"
                     )
 
+                # Fix 5: Consume pre-generated token if fresh (saves ~200-500ms)
+                # Only use cache on attempt 1 — retries always regenerate
+                cached = self._consume_cached_token() if inline_attempt == 1 else None
+
                 try:
                     result = await self._page.evaluate(
                         _IMAGE_GENERATE_JS,
@@ -375,13 +483,14 @@ class CDPSlotWorker:
                             "seed": seed,
                             "recaptchaAction": "IMAGE_GENERATION",
                             "referenceMediaIds": references or [],
+                            "cachedToken": cached,
                         },
                     )
                 except Exception as e:
                     last_error = f"page.evaluate exception: {str(e)[:150]}"
-                    # On exception, try to reload once — next inline attempt
+                    # On exception, try soft reset + next attempt
                     if inline_attempt < INLINE_MAX_ATTEMPTS:
-                        await self._try_reload()
+                        await self.soft_reset_recaptcha()
                         await asyncio.sleep(INLINE_GAP_SECONDS)
                     continue
 
@@ -401,8 +510,14 @@ class CDPSlotWorker:
                 last_error = error_text
                 error_lower = error_text.lower()
 
-                # Only retry inline for transient server errors
-                transient = any(t in error_lower for t in (
+                # Fix 3: reCAPTCHA errors get soft-reset + inline retry
+                is_recaptcha = (
+                    "recaptcha" in error_lower
+                    or "evaluation failed" in error_lower
+                )
+
+                # Retry inline for transient server errors OR reCAPTCHA errors
+                transient = is_recaptcha or any(t in error_lower for t in (
                     "internal error", "backend error", "service unavailable",
                     "http 500", "http 502", "http 503", "http 504",
                     "rpc failed", "connection reset", "deadline exceeded",
@@ -415,6 +530,10 @@ class CDPSlotWorker:
 
                 # Transient — quick retry with new seed
                 if inline_attempt < INLINE_MAX_ATTEMPTS:
+                    if is_recaptcha:
+                        # Soft-reset reCAPTCHA (Fix 3) — 50ms vs 5s full reload
+                        self._log(f"[{self.slot_id}] reCAPTCHA error — soft reset + retry")
+                        await self.soft_reset_recaptcha()
                     await asyncio.sleep(INLINE_GAP_SECONDS)
                     continue
 
@@ -458,6 +577,8 @@ class CDPSlotWorker:
                         f"with new seed (prev: {last_error[:60] if last_error else '?'})"
                     )
 
+                cached = self._consume_cached_token() if inline_attempt == 1 else None
+
                 try:
                     result = await self._page.evaluate(
                         _VIDEO_GENERATE_JS,
@@ -469,12 +590,13 @@ class CDPSlotWorker:
                             "batchId": batch_id,
                             "seed": seed,
                             "recaptchaAction": "VIDEO_GENERATION",
+                            "cachedToken": cached,
                         },
                     )
                 except Exception as e:
                     last_error = f"page.evaluate exception: {str(e)[:150]}"
                     if inline_attempt < INLINE_MAX_ATTEMPTS:
-                        await self._try_reload()
+                        await self.soft_reset_recaptcha()
                         await asyncio.sleep(INLINE_GAP_SECONDS)
                     continue
 
@@ -493,7 +615,11 @@ class CDPSlotWorker:
                 last_error = error_text
                 error_lower = error_text.lower()
 
-                transient = any(t in error_lower for t in (
+                is_recaptcha = (
+                    "recaptcha" in error_lower
+                    or "evaluation failed" in error_lower
+                )
+                transient = is_recaptcha or any(t in error_lower for t in (
                     "internal error", "backend error", "service unavailable",
                     "http 500", "http 502", "http 503", "http 504",
                     "rpc failed", "deadline exceeded",
@@ -504,6 +630,9 @@ class CDPSlotWorker:
                     return None, error_text
 
                 if inline_attempt < INLINE_MAX_ATTEMPTS:
+                    if is_recaptcha:
+                        self._log(f"[{self.slot_id}] reCAPTCHA error — soft reset + retry")
+                        await self.soft_reset_recaptcha()
                     await asyncio.sleep(INLINE_GAP_SECONDS)
                     continue
 
@@ -995,6 +1124,9 @@ class CDPBrowserServer:
             except Exception:
                 pass
         page1 = await ctx1.new_page()
+        # Fix 1: Default timeout 120s — image gen takes 31-38s per HAR,
+        # video gen can take 60-90s, default 30s causes premature timeouts
+        page1.set_default_timeout(120000)
         await page1.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded", timeout=30000)
         # Smart warmup replaces the old blind sleep. Primes reCAPTCHA
         # Enterprise so the first real job's execute() scores high
@@ -1086,6 +1218,7 @@ class CDPBrowserServer:
                 except Exception:
                     pass
             page = await ctx.new_page()
+            page.set_default_timeout(120000)  # Fix 1: long image/video gen
             await page.goto(
                 "https://labs.google/fx/tools/flow",
                 wait_until="domcontentloaded",
@@ -1729,6 +1862,7 @@ class CDPBrowserServer:
                         except Exception:
                             pass
                     new_page = await new_ctx.new_page()
+                    new_page.set_default_timeout(120000)  # Fix 1
                     await new_page.goto(
                         "https://labs.google/fx/tools/flow",
                         wait_until="domcontentloaded",
@@ -2205,6 +2339,19 @@ class CDPSharedManager:
 
                 if dispatched == 0:
                     await asyncio.sleep(self.qm.scheduler_poll_seconds)
+
+                # Fix 5: Pre-generate reCAPTCHA tokens on idle slots
+                # Fire in background — no await, no blocking
+                try:
+                    for server in self._servers.values():
+                        for slot in server.get_all_slots():
+                            if (not slot.is_busy
+                                    and slot._cached_token is None
+                                    and slot.is_healthy(now_ts)):
+                                # Schedule background token generation
+                                asyncio.create_task(slot.pre_generate_token())
+                except Exception:
+                    pass
 
             if self._active_tasks:
                 self._log(f"[CDPShared] Waiting for {len(self._active_tasks)} active job(s)...")
