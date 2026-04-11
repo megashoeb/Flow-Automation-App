@@ -626,12 +626,15 @@ class AccountManager:
                                 _bridge_proxy = _raw
                         else:
                             _bridge_proxy = None
+                        # Login/warmup uses "careful" humanize preset —
+                        # slower but stronger reCAPTCHA score on fresh session.
+                        # API generation flow (bot_engine.py) stays on default preset for speed.
                         context = await cloak_persistent_async(
                             session_path,
                             headless=headless,
                             args=_cloak_args,
                             proxy=_bridge_proxy,
-                            humanize=True,
+                            humanize={"preset": "careful"},
                         )
                         AccountManager._register_context_process(context)
                         pages = list(getattr(context, "pages", []) or [])

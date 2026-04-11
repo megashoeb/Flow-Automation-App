@@ -844,14 +844,37 @@ class MultiTabManager:
                             busy_slots.add(n)
 
                     dispatched = 0
+
+                    # ── Same-account stagger: with multiple tabs on a
+                    # single CloakBrowser, firing 5 jobs within 2 s
+                    # triggers Google Flow's "Internal error encountered"
+                    # burst rate-limit. The setting already exists
+                    # (self.qm.same_account_stagger_seconds, default 1 s)
+                    # but this dispatcher wasn't consulting it. Now it
+                    # does — 5 jobs spread over ~5 s, zero burst errors.
+                    acct_stagger = max(0.0, float(self.qm.same_account_stagger_seconds))
+                    now_ts = time.time()
+                    stagger_blocked = set()
+                    if acct_stagger > 0:
+                        for acc_name, last_at in self.qm.last_account_dispatch_at.items():
+                            if now_ts - last_at < acct_stagger:
+                                stagger_blocked.add(acc_name)
+
                     for job in pending:
-                        tab = self._get_available_tab(busy_slots)
+                        tab = self._get_available_tab(busy_slots, stagger_blocked=stagger_blocked)
                         if not tab:
                             break
 
                         job_id = job["id"]
                         update_job_status(job_id, "running", account=tab.account_name)
                         self.qm.signals.job_updated.emit(job_id, "running", tab.account_name, "")
+
+                        # Record dispatch BEFORE task creation so further
+                        # iterations in this same poll cycle see the
+                        # account as freshly-dispatched.
+                        self.qm.last_account_dispatch_at[tab.account_name] = time.time()
+                        if acct_stagger > 0:
+                            stagger_blocked.add(tab.account_name)
 
                         task = asyncio.create_task(
                             self._run_job(tab, job), name=tab.slot_id,
@@ -881,8 +904,14 @@ class MultiTabManager:
                 self._browsers.clear()
                 self._log("[MultiTab] All browsers and tabs stopped.")
 
-    def _get_available_tab(self, busy_slots):
+    def _get_available_tab(self, busy_slots, stagger_blocked=None):
+        """Return the next idle tab, skipping accounts whose
+        same-account dispatch stagger hasn't elapsed yet.
+        """
+        blocked = stagger_blocked or set()
         for browser in self._browsers.values():
+            if browser.account_name in blocked:
+                continue
             for tab in browser.get_all_tabs():
                 if tab.slot_id not in busy_slots and not tab.is_busy:
                     return tab
@@ -923,11 +952,12 @@ class MultiTabManager:
                 )
 
                 # Handle specific errors
-                if "recaptcha" in last_error.lower():
+                err_lower = last_error.lower()
+                if "recaptcha" in err_lower:
                     self._log(f"[{tab.slot_id}] reCAPTCHA issue — reloading tab...")
                     await tab.reload()
                     await asyncio.sleep(3)
-                elif "401" in last_error or "auth" in last_error.lower():
+                elif "401" in last_error or "auth" in err_lower:
                     self._log(f"[{tab.slot_id}] Auth issue — refreshing Bearer + reloading tab...")
                     # Force Bearer refresh on the account browser
                     for browser in self._browsers.values():
@@ -939,6 +969,17 @@ class MultiTabManager:
                             break
                     await tab.reload()
                     await asyncio.sleep(3)
+                elif "internal error" in err_lower or "500" in last_error:
+                    # Google Flow backend flakiness — reload the tab to
+                    # rotate load-balancer session stickiness so the
+                    # retry lands on a fresh backend instead of the same
+                    # degraded one.
+                    if attempt < max_retries:
+                        self._log(
+                            f"[{tab.slot_id}] Internal error — reloading tab to rotate backend..."
+                        )
+                        await tab.reload()
+                        await asyncio.sleep(5 + attempt * 5)
                 elif attempt < max_retries:
                     await asyncio.sleep(10 * (attempt + 1))
 
