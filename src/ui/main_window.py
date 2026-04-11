@@ -3228,6 +3228,10 @@ class MainWindow(QMainWindow):
                 color: #F1F5F9;
                 font-size: 13px;
                 outline: none;
+                gridline-color: transparent;
+            }
+            QTableWidget::viewport {
+                background: #0F172A;
             }
             QHeaderView::section {
                 background: #0F172A;
@@ -3241,16 +3245,15 @@ class MainWindow(QMainWindow):
                 padding: 12px 14px;
             }
             QTableWidget::item {
-                padding: 10px 14px;
+                background: transparent;
+                border: none;
                 border-bottom: 1px solid #1E293B;
                 color: #F1F5F9;
+                padding: 0;
             }
             QTableWidget::item:selected {
-                background: #1E293B;
+                background: transparent;
                 color: #F1F5F9;
-            }
-            QTableWidget::item:hover {
-                background: #1E293B;
             }
             QScrollBar:vertical {
                 background: transparent;
@@ -3272,24 +3275,30 @@ class MainWindow(QMainWindow):
         )
         acc_header = self.acc_table.horizontalHeader()
         acc_header.setStretchLastSection(False)
-        acc_header.setSectionResizeMode(0, QHeaderView.Fixed)
-        acc_header.setSectionResizeMode(1, QHeaderView.Stretch)
-        acc_header.setSectionResizeMode(2, QHeaderView.Fixed)
-        acc_header.setSectionResizeMode(3, QHeaderView.Fixed)
-        acc_header.setSectionResizeMode(4, QHeaderView.Fixed)
-        acc_header.setSectionResizeMode(5, QHeaderView.Fixed)
-        acc_header.setSectionResizeMode(6, QHeaderView.Fixed)
-        acc_header.setSectionResizeMode(7, QHeaderView.Fixed)
-        acc_header.setSectionResizeMode(8, QHeaderView.Stretch)
-        acc_header.setSectionResizeMode(9, QHeaderView.Fixed)
-        self.acc_table.setColumnWidth(0, 48)   # ID
-        self.acc_table.setColumnWidth(2, 160)  # Proxy (wider — has button)
-        self.acc_table.setColumnWidth(3, 130)  # Status
-        self.acc_table.setColumnWidth(4, 100)  # Session (Saved)
-        self.acc_table.setColumnWidth(5, 100)  # Runtime
-        self.acc_table.setColumnWidth(6, 110)  # Cooldown
-        self.acc_table.setColumnWidth(7, 80)   # Slots
-        self.acc_table.setColumnWidth(9, 70)   # Actions (⋯ dropdown)
+        acc_header.setSectionResizeMode(0, QHeaderView.Fixed)     # ID
+        acc_header.setSectionResizeMode(1, QHeaderView.Stretch)   # Account — takes ALL remaining space
+        acc_header.setSectionResizeMode(2, QHeaderView.Fixed)     # Proxy
+        acc_header.setSectionResizeMode(3, QHeaderView.Fixed)     # Status
+        acc_header.setSectionResizeMode(4, QHeaderView.Fixed)     # Session
+        acc_header.setSectionResizeMode(5, QHeaderView.Fixed)     # Runtime
+        acc_header.setSectionResizeMode(6, QHeaderView.Fixed)     # Cooldown
+        acc_header.setSectionResizeMode(7, QHeaderView.Fixed)     # Slots
+        acc_header.setSectionResizeMode(8, QHeaderView.Fixed)     # Details (fixed not stretch)
+        acc_header.setSectionResizeMode(9, QHeaderView.Fixed)     # Actions
+        # Account column gets MINIMUM 280px — enough for long emails like megagaurienterprises@gmail.com (~260px at 13px font)
+        acc_header.setMinimumSectionSize(48)
+        self.acc_table.setColumnWidth(0, 48)    # ID
+        self.acc_table.setColumnWidth(1, 300)   # Account — initial 300 (stretch will expand)
+        self.acc_table.setColumnWidth(2, 150)   # Proxy
+        self.acc_table.setColumnWidth(3, 110)   # Status
+        self.acc_table.setColumnWidth(4, 90)    # Session
+        self.acc_table.setColumnWidth(5, 90)    # Runtime
+        self.acc_table.setColumnWidth(6, 100)   # Cooldown
+        self.acc_table.setColumnWidth(7, 70)    # Slots
+        self.acc_table.setColumnWidth(8, 160)   # Details
+        self.acc_table.setColumnWidth(9, 60)    # Actions
+        # Prevent text eliding in the table itself (separate from cell widgets)
+        self.acc_table.setTextElideMode(Qt.ElideNone)
         self._configure_table_scrolling(self.acc_table)
         layout.addWidget(self.acc_table)
         
@@ -4539,34 +4548,68 @@ class MainWindow(QMainWindow):
         self.warmup_widgets.pop(account_key, None)
 
     def _set_account_name_cell(self, row, account_id, display_name, real_name):
-        """Professional 2-line account cell: bold name + meta."""
+        """Professional 2-line account cell: bold name + meta.
+
+        Uses an avatar circle + stacked name/ID for clean Linear/Notion look.
+        No box effect — transparent background bleeds through to table.
+        """
         if not hasattr(self, "acc_table"):
             return
 
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(14, 6, 14, 6)
-        layout.setSpacing(2)
-
         full_name = real_name or display_name or "Unknown"
 
-        # Line 1: Account name (bold, full width — no truncation)
+        # Outer widget — transparent, no border, fills cell
+        widget = QWidget()
+        widget.setAttribute(Qt.WA_TranslucentBackground, False)
+        widget.setStyleSheet("background: transparent; border: none;")
+
+        outer = QHBoxLayout(widget)
+        outer.setContentsMargins(16, 8, 16, 8)
+        outer.setSpacing(12)
+
+        # Left: circular avatar with first letter
+        initial = full_name[0].upper() if full_name and full_name[0].isalnum() else "?"
+        avatar = QLabel(initial)
+        avatar.setFixedSize(36, 36)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setStyleSheet(
+            "background: #1E293B;"
+            "color: #60A5FA;"
+            "border: 1px solid #334155;"
+            "border-radius: 18px;"
+            "font-size: 14px;"
+            "font-weight: 700;"
+        )
+        outer.addWidget(avatar, 0, Qt.AlignVCenter)
+
+        # Right: vertical stack (name + meta)
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+
         name_label = QLabel(full_name)
         name_label.setStyleSheet(
-            "color: #F1F5F9; font-size: 13px; font-weight: 600; background: transparent;"
+            "color: #F1F5F9;"
+            "font-size: 13px;"
+            "font-weight: 600;"
+            "background: transparent;"
+            "border: none;"
         )
         name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        # Enable eliding if really too narrow, but prefer full text
-        name_label.setWordWrap(False)
-        layout.addWidget(name_label)
+        text_col.addWidget(name_label)
 
-        # Line 2: Metadata (small, muted) — shows account ID
-        meta_label = QLabel(f"ID: {account_id}")
+        meta_label = QLabel(f"Account ID: {account_id}")
         meta_label.setStyleSheet(
-            "color: #64748B; font-size: 11px; font-weight: 400; background: transparent;"
+            "color: #64748B;"
+            "font-size: 11px;"
+            "font-weight: 400;"
+            "background: transparent;"
+            "border: none;"
         )
-        layout.addWidget(meta_label)
+        text_col.addWidget(meta_label)
+
+        outer.addLayout(text_col, 1)
+        outer.addStretch()
 
         widget.setToolTip(full_name)
         self.acc_table.setCellWidget(row, 1, widget)
