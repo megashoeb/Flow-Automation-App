@@ -278,6 +278,9 @@ def get_or_create_bridge(proxy_url: str) -> str:
             local_port = _start_bridge(host, port, user, pwd)
             local_url = f"http://127.0.0.1:{local_port}"
             _BRIDGE_CACHE[url] = local_url
+            print(f"[PROXY-BRIDGE] Started local HTTP-to-SOCKS5 bridge: "
+                  f"{local_url} -> {host}:{port}")
             return local_url
-        except Exception:
+        except Exception as e:
+            print(f"[PROXY-BRIDGE] Failed to start bridge for {host}:{port}: {e}")
             return url

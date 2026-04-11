@@ -126,13 +126,16 @@ class GoogleLabsBot:
         self.headless = headless
         # Raw proxy URL (may be SOCKS5 with username/password).
         # Chromium/Playwright can't use SOCKS5 auth directly — route it
-        # through a local HTTP-to-SOCKS5 bridge. bridge returns a clean
-        # http://127.0.0.1:PORT that Playwright can use natively.
+        # through a local HTTP-to-SOCKS5 bridge.
         raw_proxy = str(proxy or "").strip()
+        self._raw_proxy = raw_proxy  # for logging
+        self._bridged_proxy_used = False
         if raw_proxy:
             try:
                 from src.core.proxy_bridge import get_or_create_bridge
                 self.proxy = get_or_create_bridge(raw_proxy)
+                if self.proxy != raw_proxy:
+                    self._bridged_proxy_used = True
             except Exception:
                 self.proxy = raw_proxy
         else:
@@ -895,6 +898,17 @@ class GoogleLabsBot:
                 f"[{self.account_name}] CloakBrowser mode: {mode_label} "
                 f"(seed={seed}, headless={headless}, profile={cloak_profile})"
             )
+            # Show proxy status so user can verify it's active
+            if self._raw_proxy:
+                if self._bridged_proxy_used:
+                    log_callback(
+                        f"[{self.account_name}] Proxy: {self._raw_proxy[:40]}... "
+                        f"-> SOCKS5 bridge -> {self.proxy}"
+                    )
+                else:
+                    log_callback(f"[{self.account_name}] Proxy: {self.proxy}")
+            else:
+                log_callback(f"[{self.account_name}] Proxy: none (direct)")
 
         last_error = None
         try:
