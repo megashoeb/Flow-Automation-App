@@ -3202,48 +3202,76 @@ class MainWindow(QMainWindow):
         self.acc_table = QTableWidget(0, 10)
         self.acc_table.setHorizontalHeaderLabels([
             "ID",
-            "Account Name",
+            "Account",
             "Proxy",
-            "Login Status",
-            "Saved Status",
+            "Status",
+            "Session",
             "Runtime",
-            "Cooldown Left",
-            "Active Slots",
-            "Detail",
-            "Actions",
+            "Cooldown",
+            "Slots",
+            "Details",
+            "",
         ])
         self.acc_table.verticalHeader().setVisible(False)
-        self.acc_table.verticalHeader().setDefaultSectionSize(40)
+        self.acc_table.verticalHeader().setDefaultSectionSize(56)  # Taller rows
         self.acc_table.setAlternatingRowColors(False)
         self.acc_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.acc_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.acc_table.setShowGrid(False)  # No grid lines — cleaner look
+        self.acc_table.setFocusPolicy(Qt.NoFocus)
         self.acc_table.setStyleSheet(
             """
             QTableWidget {
-                background: #1E293B;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                gridline-color: #334155;
-                color: white;
-                font-size: 12px;
+                background: #0F172A;
+                border: 1px solid #1E293B;
+                border-radius: 10px;
+                color: #F1F5F9;
+                font-size: 13px;
+                outline: none;
             }
             QHeaderView::section {
                 background: #0F172A;
-                color: #94A3B8;
+                color: #64748B;
                 font-size: 11px;
                 font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
                 border: none;
-                border-bottom: 2px solid #334155;
-                padding: 6px 8px;
+                border-bottom: 1px solid #1E293B;
+                padding: 12px 14px;
             }
             QTableWidget::item {
-                padding: 4px 8px;
+                padding: 10px 14px;
                 border-bottom: 1px solid #1E293B;
+                color: #F1F5F9;
+            }
+            QTableWidget::item:selected {
+                background: #1E293B;
+                color: #F1F5F9;
+            }
+            QTableWidget::item:hover {
+                background: #1E293B;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+                margin: 4px 2px 4px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #334155;
+                border-radius: 5px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #475569;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
             }
             """
         )
         acc_header = self.acc_table.horizontalHeader()
-        acc_header.setStretchLastSection(True)
+        acc_header.setStretchLastSection(False)
         acc_header.setSectionResizeMode(0, QHeaderView.Fixed)
         acc_header.setSectionResizeMode(1, QHeaderView.Stretch)
         acc_header.setSectionResizeMode(2, QHeaderView.Fixed)
@@ -3254,14 +3282,14 @@ class MainWindow(QMainWindow):
         acc_header.setSectionResizeMode(7, QHeaderView.Fixed)
         acc_header.setSectionResizeMode(8, QHeaderView.Stretch)
         acc_header.setSectionResizeMode(9, QHeaderView.Fixed)
-        self.acc_table.setColumnWidth(0, 40)
-        self.acc_table.setColumnWidth(2, 80)
-        self.acc_table.setColumnWidth(3, 120)
-        self.acc_table.setColumnWidth(4, 90)
-        self.acc_table.setColumnWidth(5, 90)
-        self.acc_table.setColumnWidth(6, 100)
-        self.acc_table.setColumnWidth(7, 80)
-        self.acc_table.setColumnWidth(9, 150)
+        self.acc_table.setColumnWidth(0, 48)   # ID
+        self.acc_table.setColumnWidth(2, 160)  # Proxy (wider — has button)
+        self.acc_table.setColumnWidth(3, 130)  # Status
+        self.acc_table.setColumnWidth(4, 100)  # Session (Saved)
+        self.acc_table.setColumnWidth(5, 100)  # Runtime
+        self.acc_table.setColumnWidth(6, 110)  # Cooldown
+        self.acc_table.setColumnWidth(7, 80)   # Slots
+        self.acc_table.setColumnWidth(9, 70)   # Actions (⋯ dropdown)
         self._configure_table_scrolling(self.acc_table)
         layout.addWidget(self.acc_table)
         
@@ -4510,112 +4538,101 @@ class MainWindow(QMainWindow):
         self.active_warmup_progress.pop(account_key, None)
         self.warmup_widgets.pop(account_key, None)
 
+    def _set_account_name_cell(self, row, account_id, display_name, real_name):
+        """Professional 2-line account cell: bold name + meta."""
+        if not hasattr(self, "acc_table"):
+            return
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(14, 6, 14, 6)
+        layout.setSpacing(2)
+
+        # Line 1: Account name (bold, bigger)
+        name_label = QLabel(display_name or real_name or "Unknown")
+        name_label.setStyleSheet(
+            "color: #F1F5F9; font-size: 13px; font-weight: 600;"
+        )
+        layout.addWidget(name_label)
+
+        # Line 2: Metadata (small, muted) — shows account ID
+        meta_label = QLabel(f"ID: {account_id}")
+        meta_label.setStyleSheet(
+            "color: #64748B; font-size: 11px; font-weight: 400;"
+        )
+        layout.addWidget(meta_label)
+
+        widget.setToolTip(real_name or display_name)
+        self.acc_table.setCellWidget(row, 1, widget)
+
     def _set_account_saved_status_cell(self, row, account):
         if not hasattr(self, "acc_table"):
             return
 
         session_dir = self._resolve_account_session_dir(account)
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
-        if session_dir.exists():
-            label.setText("Saved")
-            label.setStyleSheet("color: #3B82F6; font-weight: 600; padding: 4px 8px;")
-            label.setToolTip(str(session_dir))
-        else:
-            label.setText("-")
-            label.setStyleSheet("color: #64748B; padding: 4px 8px;")
-        self.acc_table.setCellWidget(row, 4, label)
-
-    def _set_account_login_status_cell(self, row, account_id, status_data=None):
-        if not hasattr(self, "acc_table"):
-            return
-
-        status = self._normalize_login_status(status_data)
-        state = status.get("state", "unknown")
-
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(6)
 
-        label = QLabel()
-        detail_tip = ""
-        if state == "logged_in":
-            label.setText("✅ Logged In")
-            label.setStyleSheet("color: #0f9d58; font-weight: 700;")
-            email = str(status.get("email") or "").strip()
-            expires = str(status.get("expires") or "").strip()
-            detail_bits = [bit for bit in (email, expires) if bit]
-            detail_tip = "\n".join(detail_bits)
-        elif state == "checking":
-            label.setText("⏳ Checking...")
-            label.setStyleSheet("color: #64748b; font-style: italic;")
-        elif state == "logging_in":
-            label.setText("🔄 Logging in...")
-            label.setStyleSheet("color: #1a73e8; font-style: italic;")
-        elif state == "logged_out":
-            label.setText("❌ Logged Out")
-            label.setStyleSheet("color: #d93025; font-weight: 700;")
-            detail_tip = str(status.get("error") or "").strip()
+        if session_dir.exists():
+            dot = QLabel("●")
+            dot.setStyleSheet("color: #3B82F6; font-size: 14px; font-weight: 900;")
+            label = QLabel("Saved")
+            label.setStyleSheet("color: #3B82F6; font-weight: 600; font-size: 12px;")
+            layout.addWidget(dot)
+            layout.addWidget(label)
+            widget.setToolTip(str(session_dir))
         else:
-            label.setText("— Not Checked")
-            label.setStyleSheet("color: #64748b;")
-
-        if detail_tip:
-            label.setToolTip(detail_tip)
-            widget.setToolTip(detail_tip)
-        layout.addWidget(label)
-
-        if state == "logged_out":
-            btn_relogin = QPushButton("Re-Login")
-            btn_relogin.setFixedWidth(78)
-            btn_relogin.setProperty("role", "warning")
-            btn_relogin.setToolTip(detail_tip or "Delete the expired session and sign in again.")
-            btn_relogin.clicked.connect(lambda _=False, account_id=account_id: self._relogin_account(account_id))
-            layout.addWidget(btn_relogin)
-
+            label = QLabel("—")
+            label.setStyleSheet("color: #64748B; font-weight: 600; font-size: 14px;")
+            layout.addWidget(label)
         layout.addStretch()
-        self.acc_table.setCellWidget(row, 3, widget)
+        self.acc_table.setCellWidget(row, 4, widget)
 
     def _set_account_login_status_cell(self, row, account_id, status_data=None):
+        """Render modern colored-dot status pill instead of emoji."""
         if not hasattr(self, "acc_table"):
             return
 
         status = self._normalize_login_status(status_data)
         state = status.get("state", "unknown")
         account = self._account_record_by_id(account_id) or {}
-        is_logged_in, status_text, detail_tip = self._get_login_status(account)
+        is_logged_in, _status_text, detail_tip = self._get_login_status(account)
 
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(4)
-
-        label = QLabel()
+        # Map state → (label, color)
         if state == "logging_in":
-            label.setText("🔄 Logging in...")
-            label.setStyleSheet("color: #3B82F6; font-weight: 600; padding: 4px 8px;")
+            label_text, color = "Logging in", "#3B82F6"
         elif state == "checking":
-            label.setText("⏳ Checking...")
-            label.setStyleSheet("color: #94A3B8; font-weight: 600; padding: 4px 8px;")
+            label_text, color = "Checking", "#94A3B8"
         elif is_logged_in:
-            label.setText(status_text)
-            label.setStyleSheet("color: #22C55E; font-weight: 600; padding: 4px 8px;")
+            label_text, color = "Active", "#10B981"
             email = str(status.get("email") or "").strip()
             expires = str(status.get("expires") or "").strip()
             detail_bits = [bit for bit in (detail_tip, email, expires) if bit]
             detail_tip = "\n".join(detail_bits)
         else:
-            label.setText(status_text)
-            label.setStyleSheet("color: #EF4444; font-weight: 600; padding: 4px 8px;")
+            label_text, color = "Offline", "#EF4444"
             error_text = str(status.get("error") or "").strip()
             detail_tip = "\n".join(bit for bit in (detail_tip, error_text) if bit)
 
-        if detail_tip:
-            label.setToolTip(detail_tip)
-            widget.setToolTip(detail_tip)
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(8)
+
+        # Colored dot (no emoji — clean Linear/Notion style)
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: 900;")
+        layout.addWidget(dot)
+
+        label = QLabel(label_text)
+        label.setStyleSheet(f"color: {color}; font-weight: 600; font-size: 12px;")
         layout.addWidget(label)
         layout.addStretch()
+
+        if detail_tip:
+            widget.setToolTip(detail_tip)
         self.acc_table.setCellWidget(row, 3, widget)
 
     def _refresh_login_statuses(self):
@@ -4674,26 +4691,87 @@ class MainWindow(QMainWindow):
         return btn
 
     def _add_account_action_buttons(self, row, account_id, account_name):
+        """Modern dropdown menu (⋯) replacing Reset/Delete buttons."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(4)
+        layout.addStretch()
 
-        btn_reset = self._make_account_action_button("Reset", "#F59E0B", "#92400E")
-        btn_reset.setToolTip("Delete saved session and open a fresh login browser.")
-        btn_reset.clicked.connect(
+        # 3-dot dropdown menu button — Linear/Notion style
+        menu_btn = QPushButton("⋯")
+        menu_btn.setFixedSize(32, 32)
+        menu_btn.setCursor(Qt.PointingHandCursor)
+        menu_btn.setToolTip(f"Actions for {account_name}")
+        menu_btn.setStyleSheet(
+            "QPushButton {"
+            " background: transparent;"
+            " color: #94A3B8;"
+            " border: 1px solid #334155;"
+            " border-radius: 6px;"
+            " font-size: 18px;"
+            " font-weight: 700;"
+            " padding: 0px;"
+            "}"
+            "QPushButton:hover {"
+            " background: #1E293B;"
+            " color: #F1F5F9;"
+            " border-color: #475569;"
+            "}"
+            "QPushButton:pressed {"
+            " background: #334155;"
+            "}"
+            "QPushButton::menu-indicator { image: none; width: 0px; }"
+        )
+
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(menu_btn)
+        menu.setStyleSheet(
+            "QMenu {"
+            " background: #1E293B;"
+            " color: #F1F5F9;"
+            " border: 1px solid #334155;"
+            " border-radius: 8px;"
+            " padding: 6px 0px;"
+            " font-size: 13px;"
+            "}"
+            "QMenu::item {"
+            " padding: 8px 20px 8px 16px;"
+            " border-radius: 4px;"
+            " margin: 2px 6px;"
+            "}"
+            "QMenu::item:selected {"
+            " background: #334155;"
+            "}"
+            "QMenu::separator {"
+            " height: 1px;"
+            " background: #334155;"
+            " margin: 4px 10px;"
+            "}"
+        )
+
+        act_reset = menu.addAction("🔄  Reset Session")
+        act_reset.setToolTip("Delete saved session and open a fresh login browser.")
+        act_reset.triggered.connect(
             lambda _=False, target_id=account_id: self._reset_account_session(target_id)
         )
-        layout.addWidget(btn_reset)
 
-        btn_delete = self._make_account_action_button("Delete", "#EF4444", "#991B1B")
-        btn_delete.setToolTip(f"Remove '{account_name}' from Account Manager.")
-        btn_delete.clicked.connect(
+        act_relogin = menu.addAction("🔐  Re-Login")
+        act_relogin.triggered.connect(
+            lambda _=False, target_id=account_id: self._relogin_account(target_id)
+        )
+
+        menu.addSeparator()
+
+        act_delete = menu.addAction("🗑  Delete Account")
+        act_delete.setToolTip(f"Remove '{account_name}' from Account Manager.")
+        act_delete.triggered.connect(
             lambda _=False, target_id=account_id: self._delete_account_by_id(target_id)
         )
-        layout.addWidget(btn_delete)
 
-        layout.addStretch()
+        menu_btn.setMenu(menu)
+        layout.addWidget(menu_btn)
+
         self.acc_table.setCellWidget(row, 9, widget)
 
     def _proxy_status_text(self, proxy_value):
@@ -4708,28 +4786,52 @@ class MainWindow(QMainWindow):
     def _set_account_proxy_cell(self, row, account_id, account_name, proxy_value):
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(8)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(6)
 
-        label = QLabel()
         proxy_text = str(proxy_value or "").strip()
-        if proxy_text:
-            label.setText(f"\u25cf {self._proxy_status_text(proxy_text)}")
-            label.setStyleSheet("color: #22C55E; font-weight: 600;")
-            label.setToolTip(proxy_text)
-        else:
-            label.setText("Direct")
-            label.setStyleSheet("color: #94A3B8; font-weight: 600;")
 
-        btn_proxy = QPushButton("\u2699 Proxy")
-        btn_proxy.setMinimumWidth(90)
-        btn_proxy.setProperty("role", "secondary")
+        if proxy_text:
+            # Colored dot + compact text
+            dot = QLabel("●")
+            dot.setStyleSheet("color: #10B981; font-size: 12px; font-weight: 900;")
+            layout.addWidget(dot)
+            label = QLabel(self._proxy_status_text(proxy_text))
+            label.setStyleSheet("color: #10B981; font-weight: 600; font-size: 12px;")
+            label.setToolTip(proxy_text)
+            layout.addWidget(label, 1)
+        else:
+            label = QLabel("Direct")
+            label.setStyleSheet("color: #64748B; font-weight: 500; font-size: 12px;")
+            layout.addWidget(label, 1)
+
+        # Icon-only settings button (cleaner)
+        btn_proxy = QPushButton("\u2699")
+        btn_proxy.setFixedSize(28, 28)
+        btn_proxy.setCursor(Qt.PointingHandCursor)
+        btn_proxy.setToolTip("Configure proxy")
+        btn_proxy.setStyleSheet(
+            "QPushButton {"
+            " background: transparent;"
+            " color: #94A3B8;"
+            " border: 1px solid #334155;"
+            " border-radius: 5px;"
+            " font-size: 14px;"
+            "}"
+            "QPushButton:hover {"
+            " background: #1E293B;"
+            " color: #F1F5F9;"
+            " border-color: #475569;"
+            "}"
+            "QPushButton:pressed {"
+            " background: #334155;"
+            "}"
+        )
         btn_proxy.clicked.connect(
             lambda _=False, target_id=account_id: self._open_proxy_dialog(target_id)
         )
-
-        layout.addWidget(label, 1)
         layout.addWidget(btn_proxy)
+
         self.acc_table.setCellWidget(row, 2, widget)
 
     def _open_proxy_dialog(self, account_id):
@@ -4929,26 +5031,87 @@ class MainWindow(QMainWindow):
         return safe or "account"
 
     def _add_account_action_buttons(self, row, account_id, account_name):
+        """Modern dropdown menu (⋯) replacing Reset/Delete buttons."""
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(4)
+        layout.addStretch()
 
-        btn_reset = self._make_account_action_button("Reset", "#F59E0B", "#92400E")
-        btn_reset.setToolTip("Delete saved session and open a fresh login browser.")
-        btn_reset.clicked.connect(
+        # 3-dot dropdown menu button — Linear/Notion style
+        menu_btn = QPushButton("⋯")
+        menu_btn.setFixedSize(32, 32)
+        menu_btn.setCursor(Qt.PointingHandCursor)
+        menu_btn.setToolTip(f"Actions for {account_name}")
+        menu_btn.setStyleSheet(
+            "QPushButton {"
+            " background: transparent;"
+            " color: #94A3B8;"
+            " border: 1px solid #334155;"
+            " border-radius: 6px;"
+            " font-size: 18px;"
+            " font-weight: 700;"
+            " padding: 0px;"
+            "}"
+            "QPushButton:hover {"
+            " background: #1E293B;"
+            " color: #F1F5F9;"
+            " border-color: #475569;"
+            "}"
+            "QPushButton:pressed {"
+            " background: #334155;"
+            "}"
+            "QPushButton::menu-indicator { image: none; width: 0px; }"
+        )
+
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(menu_btn)
+        menu.setStyleSheet(
+            "QMenu {"
+            " background: #1E293B;"
+            " color: #F1F5F9;"
+            " border: 1px solid #334155;"
+            " border-radius: 8px;"
+            " padding: 6px 0px;"
+            " font-size: 13px;"
+            "}"
+            "QMenu::item {"
+            " padding: 8px 20px 8px 16px;"
+            " border-radius: 4px;"
+            " margin: 2px 6px;"
+            "}"
+            "QMenu::item:selected {"
+            " background: #334155;"
+            "}"
+            "QMenu::separator {"
+            " height: 1px;"
+            " background: #334155;"
+            " margin: 4px 10px;"
+            "}"
+        )
+
+        act_reset = menu.addAction("🔄  Reset Session")
+        act_reset.setToolTip("Delete saved session and open a fresh login browser.")
+        act_reset.triggered.connect(
             lambda _=False, target_id=account_id: self._reset_account_session(target_id)
         )
-        layout.addWidget(btn_reset)
 
-        btn_delete = self._make_account_action_button("Delete", "#EF4444", "#991B1B")
-        btn_delete.setToolTip(f"Remove '{account_name}' from Account Manager.")
-        btn_delete.clicked.connect(
+        act_relogin = menu.addAction("🔐  Re-Login")
+        act_relogin.triggered.connect(
+            lambda _=False, target_id=account_id: self._relogin_account(target_id)
+        )
+
+        menu.addSeparator()
+
+        act_delete = menu.addAction("🗑  Delete Account")
+        act_delete.setToolTip(f"Remove '{account_name}' from Account Manager.")
+        act_delete.triggered.connect(
             lambda _=False, target_id=account_id: self._delete_account_by_id(target_id)
         )
-        layout.addWidget(btn_delete)
 
-        layout.addStretch()
+        menu_btn.setMenu(menu)
+        layout.addWidget(menu_btn)
+
         self.acc_table.setCellWidget(row, 9, widget)
 
     def _delete_account_session_artifacts(self, account):
@@ -6235,8 +6398,10 @@ class MainWindow(QMainWindow):
                 db_id = int(acc.get("id") or 0)
                 id_item = QTableWidgetItem(str(i + 1))
                 id_item.setData(Qt.UserRole, db_id)
+                id_item.setTextAlignment(Qt.AlignCenter)
                 real_name = str(acc.get('name') or "")
                 display_name = str(display_map.get(acc.get("id"), real_name) or "")
+                # Keep the item for data storage (runtime reads from Qt.UserRole)
                 name_item = QTableWidgetItem(display_name)
                 name_item.setData(Qt.UserRole, real_name)
                 name_item.setData(Qt.UserRole + 1, str(acc.get("session_path") or ""))
@@ -6248,6 +6413,10 @@ class MainWindow(QMainWindow):
                 self.acc_table.setItem(i, 0, id_item)
                 self.acc_table.setItem(i, 1, name_item)
                 self.acc_table.setItem(i, 4, saved_status_item)
+
+                # Professional 2-line account name widget (name + meta)
+                self._set_account_name_cell(i, db_id, display_name, real_name)
+
                 self._set_account_proxy_cell(i, db_id, real_name or display_name, acc.get("proxy"))
                 self._set_account_login_status_cell(i, db_id, self.account_login_state.get(db_id))
                 self._set_account_saved_status_cell(i, acc)
