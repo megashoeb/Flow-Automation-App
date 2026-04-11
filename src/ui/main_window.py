@@ -4548,45 +4548,20 @@ class MainWindow(QMainWindow):
         self.warmup_widgets.pop(account_key, None)
 
     def _set_account_name_cell(self, row, account_id, display_name, real_name):
-        """Professional 2-line account cell: bold name + meta.
-
-        Uses an avatar circle + stacked name/ID for clean Linear/Notion look.
-        No box effect — transparent background bleeds through to table.
-        """
+        """Clean 2-line account cell: bold name + muted meta. No avatar, no boxes."""
         if not hasattr(self, "acc_table"):
             return
 
         full_name = real_name or display_name or "Unknown"
 
-        # Outer widget — transparent, no border, fills cell
         widget = QWidget()
-        widget.setAttribute(Qt.WA_TranslucentBackground, False)
         widget.setStyleSheet("background: transparent; border: none;")
 
-        outer = QHBoxLayout(widget)
-        outer.setContentsMargins(16, 8, 16, 8)
-        outer.setSpacing(12)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setSpacing(3)
 
-        # Left: circular avatar with first letter
-        initial = full_name[0].upper() if full_name and full_name[0].isalnum() else "?"
-        avatar = QLabel(initial)
-        avatar.setFixedSize(36, 36)
-        avatar.setAlignment(Qt.AlignCenter)
-        avatar.setStyleSheet(
-            "background: #1E293B;"
-            "color: #60A5FA;"
-            "border: 1px solid #334155;"
-            "border-radius: 18px;"
-            "font-size: 14px;"
-            "font-weight: 700;"
-        )
-        outer.addWidget(avatar, 0, Qt.AlignVCenter)
-
-        # Right: vertical stack (name + meta)
-        text_col = QVBoxLayout()
-        text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(2)
-
+        # Line 1: Bold name, full width
         name_label = QLabel(full_name)
         name_label.setStyleSheet(
             "color: #F1F5F9;"
@@ -4596,8 +4571,9 @@ class MainWindow(QMainWindow):
             "border: none;"
         )
         name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        text_col.addWidget(name_label)
+        layout.addWidget(name_label)
 
+        # Line 2: muted ID
         meta_label = QLabel(f"Account ID: {account_id}")
         meta_label.setStyleSheet(
             "color: #64748B;"
@@ -4606,10 +4582,7 @@ class MainWindow(QMainWindow):
             "background: transparent;"
             "border: none;"
         )
-        text_col.addWidget(meta_label)
-
-        outer.addLayout(text_col, 1)
-        outer.addStretch()
+        layout.addWidget(meta_label)
 
         widget.setToolTip(full_name)
         self.acc_table.setCellWidget(row, 1, widget)
@@ -6484,8 +6457,10 @@ class MainWindow(QMainWindow):
                 id_item.setTextAlignment(Qt.AlignCenter)
                 real_name = str(acc.get('name') or "")
                 display_name = str(display_map.get(acc.get("id"), real_name) or "")
-                # Keep the item for data storage (runtime reads from Qt.UserRole)
-                name_item = QTableWidgetItem(display_name)
+                # Keep the item for data storage ONLY (runtime reads from Qt.UserRole).
+                # Text MUST be empty — actual display is done by setCellWidget below,
+                # otherwise the item's text renders UNDER the widget (double text bug).
+                name_item = QTableWidgetItem("")
                 name_item.setData(Qt.UserRole, real_name)
                 name_item.setData(Qt.UserRole + 1, str(acc.get("session_path") or ""))
                 saved_status_item = QTableWidgetItem("")
