@@ -4548,21 +4548,27 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 6, 14, 6)
         layout.setSpacing(2)
 
-        # Line 1: Account name (bold, bigger)
-        name_label = QLabel(display_name or real_name or "Unknown")
+        full_name = real_name or display_name or "Unknown"
+
+        # Line 1: Account name (bold, full width — no truncation)
+        name_label = QLabel(full_name)
         name_label.setStyleSheet(
-            "color: #F1F5F9; font-size: 13px; font-weight: 600;"
+            "color: #F1F5F9; font-size: 13px; font-weight: 600; background: transparent;"
         )
+        name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # Enable eliding if really too narrow, but prefer full text
+        name_label.setWordWrap(False)
         layout.addWidget(name_label)
 
         # Line 2: Metadata (small, muted) — shows account ID
         meta_label = QLabel(f"ID: {account_id}")
         meta_label.setStyleSheet(
-            "color: #64748B; font-size: 11px; font-weight: 400;"
+            "color: #64748B; font-size: 11px; font-weight: 400; background: transparent;"
         )
         layout.addWidget(meta_label)
 
-        widget.setToolTip(real_name or display_name)
+        widget.setToolTip(full_name)
         self.acc_table.setCellWidget(row, 1, widget)
 
     def _set_account_saved_status_cell(self, row, account):
@@ -4961,6 +4967,23 @@ class MainWindow(QMainWindow):
             return
 
         account_name = str(account.get("name") or "").strip()
+
+        # Confirmation dialog — prevent accidental deletion
+        reply = QMessageBox.question(
+            self,
+            "Delete Account",
+            f"Are you sure you want to delete '{account_name}'?\n\n"
+            f"This will permanently remove:\n"
+            f"  • Account from database\n"
+            f"  • Saved login session and cookies\n"
+            f"  • All pending/running jobs will be reassigned\n\n"
+            f"This action CANNOT be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
         self._start_background_task(
             self._delete_account_record,
             account_id,
@@ -5222,6 +5245,23 @@ class MainWindow(QMainWindow):
             return
 
         account_name = str(account.get("name") or "").strip()
+
+        # Confirmation dialog — prevent accidental deletion
+        reply = QMessageBox.question(
+            self,
+            "Delete Account",
+            f"Are you sure you want to delete '{account_name}'?\n\n"
+            f"This will permanently remove:\n"
+            f"  • Account from database\n"
+            f"  • Saved login session and cookies\n"
+            f"  • All pending/running jobs will be reassigned\n\n"
+            f"This action CANNOT be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
         self._start_background_task(
             self._delete_account_record,
             account_id,
