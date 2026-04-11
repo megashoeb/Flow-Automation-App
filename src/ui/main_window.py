@@ -19,6 +19,30 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QObject, QRunnable, QThreadPool, QRectF, QEvent
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# GLOBAL wheel-event block for dropdowns / spin boxes.
+# Prevents accidental value changes when scrolling the page with cursor
+# over a QComboBox/QSpinBox. Widget must be explicitly focused (clicked)
+# before wheel scroll can change its value — same as modern web UIs.
+# ══════════════════════════════════════════════════════════════════════════
+def _no_wheel_change(self, event):
+    """Ignore wheel events unless widget has focus. Forward to parent for page scroll."""
+    if self.hasFocus():
+        # Widget is focused — let it handle the wheel normally
+        return type(self).__mro__[1].wheelEvent(self, event)
+    # Not focused — ignore so event propagates to parent scroll area
+    event.ignore()
+
+
+def _apply_wheel_block():
+    """Monkey-patch wheelEvent on QComboBox / QSpinBox / QDoubleSpinBox."""
+    for cls in (QComboBox, QSpinBox, QDoubleSpinBox):
+        cls.wheelEvent = _no_wheel_change
+
+
+_apply_wheel_block()
 from PySide6.QtGui import QColor, QIcon, QPixmap, QFont, QPainter, QPen, QTextCursor
 
 from src.db.db_manager import (
@@ -1161,12 +1185,6 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None and str(app.style().objectName()).lower() != "fusion":
             app.setStyle("Fusion")
-        # Install app-wide event filter that blocks wheel events on
-        # unfocused QComboBox / QSpinBox widgets. Prevents accidental
-        # value changes when user scrolls the page and the cursor
-        # happens to be over a dropdown.
-        if app is not None:
-            app.installEventFilter(self)
         self.setObjectName("mainWindow")
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(True)
@@ -8047,28 +8065,6 @@ class MainWindow(QMainWindow):
             self._adjust_mode_tabs_height()
         if hasattr(self, "tabs") and self.tabs.currentWidget() is getattr(self, "tab_live_generation", None):
             self.ui_throttler.schedule("live_grid_resize", self._refresh_live_grid)
-
-    def eventFilter(self, obj, event):
-        """Block wheel events on unfocused QComboBox / QSpinBox / QDoubleSpinBox.
-
-        Prevents accidental value changes when user scrolls the page and the
-        cursor happens to be over a dropdown or spinner. Widget must have
-        focus before wheel scroll changes its value — just like web browsers.
-        """
-        if event.type() == QEvent.Wheel:
-            # Block wheel on combo boxes and spin boxes unless they have focus
-            if isinstance(obj, (QComboBox, QSpinBox, QDoubleSpinBox)):
-                if not obj.hasFocus():
-                    # Forward the wheel event to the parent (so the page scrolls)
-                    parent = obj.parent()
-                    while parent is not None:
-                        from PySide6.QtWidgets import QAbstractScrollArea
-                        if isinstance(parent, QAbstractScrollArea):
-                            QApplication.sendEvent(parent.viewport(), event)
-                            return True
-                        parent = parent.parent()
-                    return True  # consume the event anyway
-        return super().eventFilter(obj, event)
 
     def _on_account_auth_status(self, account_name, status, message):
         """Handle auth status changes from queue manager (logged_in / expired)."""
