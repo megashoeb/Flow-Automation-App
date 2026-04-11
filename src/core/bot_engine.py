@@ -124,7 +124,19 @@ class GoogleLabsBot:
         self.account_name = account_name
         self.session_path = session_path
         self.headless = headless
-        self.proxy = str(proxy or "").strip()
+        # Raw proxy URL (may be SOCKS5 with username/password).
+        # Chromium/Playwright can't use SOCKS5 auth directly — route it
+        # through a local HTTP-to-SOCKS5 bridge. bridge returns a clean
+        # http://127.0.0.1:PORT that Playwright can use natively.
+        raw_proxy = str(proxy or "").strip()
+        if raw_proxy:
+            try:
+                from src.core.proxy_bridge import get_or_create_bridge
+                self.proxy = get_or_create_bridge(raw_proxy)
+            except Exception:
+                self.proxy = raw_proxy
+        else:
+            self.proxy = ""
         self.browser_mode = str(browser_mode or "headless").strip().lower()
         self.chrome_display = str(chrome_display or "visible").strip().lower()
         self.cloak_display = str(cloak_display or "headless").strip().lower()
@@ -3111,12 +3123,12 @@ class GoogleLabsBot:
                         useV2ModelConfig: true,
                     };
 
+                    // HAR-validated: cookie-only auth matches real Chrome.
                     const resp = await fetch(endpoint, {
                         method: "POST",
                         credentials: "include",
                         headers: {
                             "content-type": "text/plain;charset=UTF-8",
-                            "authorization": "Bearer " + authData.access_token,
                         },
                         body: JSON.stringify(body),
                     });

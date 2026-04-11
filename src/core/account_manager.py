@@ -616,11 +616,21 @@ class AccountManager:
                         _seed = int(_hashlib.md5(_seed_base.encode("utf-8")).hexdigest()[:8], 16) % 99999
                         _cloak_args = AccountManager._build_cloak_launch_args(_seed)
                         logger(f"[{account_label}] CloakBrowser warmup (seed={_seed}, args={_cloak_args})")
+                        # SOCKS5+auth → local HTTP bridge
+                        _raw = str(proxy or "").strip()
+                        if _raw:
+                            try:
+                                from src.core.proxy_bridge import get_or_create_bridge
+                                _bridge_proxy = get_or_create_bridge(_raw)
+                            except Exception:
+                                _bridge_proxy = _raw
+                        else:
+                            _bridge_proxy = None
                         context = await cloak_persistent_async(
                             session_path,
                             headless=headless,
                             args=_cloak_args,
-                            proxy=(str(proxy or "").strip() or None),
+                            proxy=_bridge_proxy,
                             humanize=True,
                         )
                         AccountManager._register_context_process(context)
@@ -643,7 +653,12 @@ class AccountManager:
                         "--window-size=1920,1080",
                     ]
                     if proxy:
-                        chrome_args.append(f"--proxy-server={proxy}")
+                        try:
+                            from src.core.proxy_bridge import get_or_create_bridge
+                            _bridged = get_or_create_bridge(str(proxy))
+                        except Exception:
+                            _bridged = str(proxy)
+                        chrome_args.append(f"--proxy-server={_bridged}")
 
                     creationflags = 0
                     popen_kwargs = {}
@@ -1510,7 +1525,16 @@ class AccountManager:
             "https://accounts.google.com",
         ]
         if proxy:
-            chrome_args.append(f"--proxy-server={proxy}")
+            # Chromium can't use SOCKS5 with username/password — route
+            # through local HTTP-to-SOCKS5 bridge if needed.
+            try:
+                from src.core.proxy_bridge import get_or_create_bridge
+                proxy_for_chrome = get_or_create_bridge(proxy)
+            except Exception:
+                proxy_for_chrome = proxy
+            chrome_args.append(f"--proxy-server={proxy_for_chrome}")
+            if update_log_callback and proxy_for_chrome != proxy:
+                update_log_callback(f"[{label}] SOCKS5 bridge active: {proxy_for_chrome}")
 
         if update_log_callback:
             update_log_callback(f"[{label}] Launching pure Chrome with CDP port {cdp_port}...")
