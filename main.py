@@ -4,6 +4,11 @@ import signal
 import platform
 import subprocess
 import time
+import multiprocessing
+
+# ── PyInstaller freeze support (MUST be first) ──
+# Without this, .app/.exe builds spawn infinite child processes
+multiprocessing.freeze_support()
 
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
@@ -132,7 +137,25 @@ def _handle_exit_signal(signum, frame):
     os._exit(0)
 
 
+def _acquire_single_instance_lock():
+    """Prevent multiple app instances using a socket lock."""
+    import socket
+    _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Bind to a fixed local port — only one process can hold it
+        _lock_socket.bind(("127.0.0.1", 47291))
+        _lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return _lock_socket  # Keep reference alive to hold the lock
+    except OSError:
+        # Port already in use — another instance is running
+        print("[G-Labs] App is already running. Exiting duplicate instance.")
+        sys.exit(0)
+
+
 def main():
+    # ── Single instance guard — prevents multiple windows ──
+    _lock = _acquire_single_instance_lock()
+
     # Register signal handlers — catches Cmd+Q, Ctrl+C, kill.
     signal.signal(signal.SIGINT, _handle_exit_signal)
     signal.signal(signal.SIGTERM, _handle_exit_signal)
