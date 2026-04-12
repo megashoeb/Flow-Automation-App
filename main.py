@@ -2,11 +2,47 @@ import os
 import sys
 import signal
 import platform
+import subprocess
 
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
+
+
+# ── Auto-install missing dependencies on startup ──
+def _ensure_dependencies():
+    """Install any missing packages from requirements.txt silently."""
+    req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+    if not os.path.exists(req_file):
+        return
+    try:
+        import pkg_resources
+        with open(req_file, "r") as f:
+            reqs = [
+                line.strip() for line in f
+                if line.strip() and not line.startswith("#")
+            ]
+        missing = []
+        for req in reqs:
+            try:
+                pkg_resources.require(req)
+            except (pkg_resources.DistributionNotFound,
+                    pkg_resources.VersionConflict):
+                missing.append(req)
+        if missing:
+            print(f"[Auto-Install] Installing: {', '.join(missing)}")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--upgrade"] + missing,
+                stdout=subprocess.DEVNULL if not os.environ.get("DEBUG") else None,
+                stderr=subprocess.STDOUT,
+            )
+            print("[Auto-Install] Done.")
+    except Exception as e:
+        print(f"[Auto-Install] Warning: {e}")
+
+_ensure_dependencies()
+
 
 from src.core.runtime_stdio import ensure_std_streams
 ensure_std_streams()

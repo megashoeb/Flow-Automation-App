@@ -1,0 +1,19 @@
+#!/bin/bash
+# ── Post-merge hook: auto-install/upgrade all dependencies ──
+# Runs after every successful git pull / git merge
+
+echo ""
+echo "============================================"
+echo "  Auto-installing dependencies..."
+echo "============================================"
+
+python -m pip install --upgrade -r requirements.txt 2>&1 | tail -10
+
+if [ $? -eq 0 ]; then
+    echo "✓ All dependencies installed/upgraded."
+else
+    echo "⚠ Some dependencies failed — check output above."
+fi
+
+echo "============================================"
+echo ""
