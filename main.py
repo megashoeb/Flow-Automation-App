@@ -32,12 +32,24 @@ def _ensure_dependencies():
                 missing.append(req)
         if missing:
             print(f"[Auto-Install] Installing: {', '.join(missing)}")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--upgrade"] + missing,
-                stdout=subprocess.DEVNULL if not os.environ.get("DEBUG") else None,
-                stderr=subprocess.STDOUT,
-            )
-            print("[Auto-Install] Done.")
+            base_cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+            installed = False
+            # Try multiple strategies for cross-platform compatibility
+            for extra_flags in [[], ["--break-system-packages"], ["--user"]]:
+                try:
+                    subprocess.check_call(
+                        base_cmd + extra_flags + missing,
+                        stdout=subprocess.DEVNULL if not os.environ.get("DEBUG") else None,
+                        stderr=subprocess.STDOUT,
+                    )
+                    installed = True
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+            if installed:
+                print("[Auto-Install] Done.")
+            else:
+                print("[Auto-Install] Warning: pip install failed. Run manually: pip3 install -r requirements.txt")
     except Exception as e:
         print(f"[Auto-Install] Warning: {e}")
 
