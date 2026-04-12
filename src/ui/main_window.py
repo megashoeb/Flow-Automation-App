@@ -7028,81 +7028,73 @@ class MainWindow(QMainWindow):
     def _refresh_cloak_version_display(self, reset_button=True):
         if not hasattr(self, "lbl_cloak_version") or not hasattr(self, "btn_cloak_update"):
             return
+
+        # ── Get REAL installed version via pip show (subprocess) ──
+        # importlib reimport is unreliable on Mac due to .pyc caching
+        pkg_version = "unknown"
+        try:
+            _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "show", "cloakbrowser"],
+                capture_output=True, text=True, timeout=15, **_no_win,
+            )
+            if result.returncode == 0 and result.stdout:
+                for line in result.stdout.splitlines():
+                    if line.startswith("Version:"):
+                        pkg_version = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+
+        # Fallback to importlib if pip show failed
+        if pkg_version == "unknown":
+            try:
+                import importlib
+                for _mod in list(sys.modules.keys()):
+                    if _mod == "cloakbrowser" or _mod.startswith("cloakbrowser."):
+                        del sys.modules[_mod]
+                importlib.invalidate_caches()
+                cb = importlib.import_module("cloakbrowser")
+                pkg_version = str(getattr(cb, "__version__", "unknown"))
+            except ImportError:
+                self.lbl_cloak_version.setText("CloakBrowser: not installed")
+                self.lbl_cloak_version.setStyleSheet("color: #EF4444; font-size: 12px;")
+                if reset_button:
+                    self.btn_cloak_update.setText("Install CloakBrowser")
+                return
+            except Exception:
+                pass
+
+        # ── Get binary info ──
+        bin_version = "unknown"
+        installed = False
         try:
             import importlib
-
-            # Force clean reimport to pick up any pip-upgraded version
             for _mod in list(sys.modules.keys()):
                 if _mod == "cloakbrowser" or _mod.startswith("cloakbrowser."):
                     del sys.modules[_mod]
             importlib.invalidate_caches()
-            cloakbrowser = importlib.import_module("cloakbrowser")
-            binary_info = getattr(cloakbrowser, "binary_info", None)
-            pkg_version = str(getattr(cloakbrowser, "__version__", "unknown"))
+            cb = importlib.import_module("cloakbrowser")
+            binary_info = getattr(cb, "binary_info", None)
+            if callable(binary_info):
+                info = binary_info() or {}
+                bin_version = str(info.get("version") or "unknown")
+                installed = bool(info.get("installed"))
+        except Exception:
+            pass
 
-            try:
-                info = binary_info() if callable(binary_info) else {}
-                bin_version = str((info or {}).get("version") or "unknown")
-                installed = bool((info or {}).get("installed"))
-            except Exception:
-                bin_version = "unknown"
-                installed = False
-
-            if installed:
-                self.lbl_cloak_version.setText(f"CloakBrowser v{pkg_version} | Binary: {bin_version}")
-                self.lbl_cloak_version.setStyleSheet("color: #22C55E; font-size: 12px;")
-            else:
-                self.lbl_cloak_version.setText(f"CloakBrowser v{pkg_version} | Binary: not downloaded")
-                self.lbl_cloak_version.setStyleSheet("color: #F59E0B; font-size: 12px;")
-            if reset_button:
-                self.btn_cloak_update.setText("Check for Updates")
-            return
-        except ImportError:
+        if installed:
+            self.lbl_cloak_version.setText(f"CloakBrowser v{pkg_version} | Binary: {bin_version}")
+            self.lbl_cloak_version.setStyleSheet("color: #22C55E; font-size: 12px;")
+        elif pkg_version != "unknown":
+            self.lbl_cloak_version.setText(f"CloakBrowser v{pkg_version} | Binary: not downloaded")
+            self.lbl_cloak_version.setStyleSheet("color: #F59E0B; font-size: 12px;")
+        else:
             self.lbl_cloak_version.setText("CloakBrowser: not installed")
             self.lbl_cloak_version.setStyleSheet("color: #EF4444; font-size: 12px;")
-            if reset_button:
-                self.btn_cloak_update.setText("Install CloakBrowser")
-            return
-        except Exception as exc:
-            self.lbl_cloak_version.setText(f"CloakBrowser: error ({str(exc)[:40]})")
-            self.lbl_cloak_version.setStyleSheet("color: #EF4444; font-size: 12px;")
-            if reset_button:
-                self.btn_cloak_update.setText("Check for Updates")
-            return
-        try:
-            import importlib
 
-            importlib.invalidate_caches()
-            cloakbrowser = importlib.import_module("cloakbrowser")
-            binary_info = getattr(cloakbrowser, "binary_info", None)
-            pkg_version = str(getattr(cloakbrowser, "__version__", "unknown"))
-
-            try:
-                info = binary_info() if callable(binary_info) else {}
-                bin_version = str((info or {}).get("version") or "unknown")
-                installed = bool((info or {}).get("installed"))
-            except Exception:
-                bin_version = "unknown"
-                installed = False
-
-            if installed:
-                self.lbl_cloak_version.setText(f"🟢 CloakBrowser v{pkg_version} | Binary: {bin_version}")
-                self.lbl_cloak_version.setStyleSheet("color: #22C55E; font-size: 12px;")
-                self.lbl_cloak_version.setText(f"CloakBrowser v{pkg_version} | Binary: {bin_version}")
-            else:
-                self.lbl_cloak_version.setText(f"🟡 CloakBrowser v{pkg_version} | Binary: not downloaded")
-                self.lbl_cloak_version.setStyleSheet("color: #F59E0B; font-size: 12px;")
-                self.lbl_cloak_version.setText(f"CloakBrowser v{pkg_version} | Binary: not downloaded")
-            if not reset_button:
-                return
-            self.btn_cloak_update.setText("🔄 Check for Updates")
-        except ImportError:
-            self.lbl_cloak_version.setText("🔴 CloakBrowser: not installed")
-            self.lbl_cloak_version.setStyleSheet("color: #EF4444; font-size: 12px;")
-            self.btn_cloak_update.setText("📦 Install CloakBrowser")
-        except Exception as exc:
-            self.lbl_cloak_version.setText(f"CloakBrowser: error ({str(exc)[:40]})")
-            self.lbl_cloak_version.setStyleSheet("color: #EF4444; font-size: 12px;")
+        if reset_button:
+            self.btn_cloak_update.setText("Check for Updates")
 
     def _auto_check_cloak_on_startup(self):
         self._refresh_cloak_version_display()
