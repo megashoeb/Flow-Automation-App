@@ -490,34 +490,49 @@ class CloakUpdateWorker(QThread):
             python_exe = self._get_pip_python()
             _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
             pip_success = False
+            last_pip_error = ""
 
-            if True:  # Always try pip upgrade (works in both dev and .app builds now)
-                # Try multiple pip strategies for cross-platform compatibility
-                pip_strategies = [
-                    [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--quiet"],
-                    [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--quiet", "--break-system-packages"],
-                    [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--quiet", "--user"],
-                ]
-                for pip_cmd in pip_strategies:
-                    try:
-                        result = subprocess.run(
-                            pip_cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                            **_no_win,
-                        )
-                        if result.returncode == 0:
-                            pip_success = True
-                            self.status_changed.emit("✓ Package upgraded via pip.", "#22C55E")
-                            break
-                    except (subprocess.TimeoutExpired, FileNotFoundError):
-                        continue
-                    except Exception:
-                        continue
+            # Try multiple pip strategies for cross-platform compatibility
+            pip_strategies = [
+                [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade"],
+                [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--break-system-packages"],
+                [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--user"],
+            ]
+            for i, pip_cmd in enumerate(pip_strategies):
+                try:
+                    self.status_changed.emit(f"⏳ Trying pip strategy {i+1}/3...", "#60A5FA")
+                    result = subprocess.run(
+                        pip_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        **_no_win,
+                    )
+                    if result.returncode == 0:
+                        pip_success = True
+                        # Show what pip actually did
+                        pip_out = (result.stdout or "").strip()
+                        if "already satisfied" in pip_out.lower():
+                            self.status_changed.emit("✓ Already on latest pip version.", "#22C55E")
+                        elif "Successfully installed" in pip_out:
+                            self.status_changed.emit("✓ Package upgraded via pip!", "#22C55E")
+                        else:
+                            self.status_changed.emit("✓ pip command succeeded.", "#22C55E")
+                        break
+                    else:
+                        last_pip_error = (result.stderr or result.stdout or "").strip()[:150]
+                except subprocess.TimeoutExpired:
+                    last_pip_error = "pip timed out (120s)"
+                    continue
+                except FileNotFoundError:
+                    last_pip_error = f"Python not found: {python_exe}"
+                    continue
+                except Exception as e:
+                    last_pip_error = str(e)[:100]
+                    continue
 
-                if not pip_success:
-                    self.status_changed.emit("⚠ pip upgrade failed — checking binary anyway...", "#F59E0B")
+            if not pip_success:
+                self.status_changed.emit(f"⚠ pip upgrade failed: {last_pip_error[:80]}", "#F59E0B")
 
             self.status_changed.emit("⏳ Checking for binary updates...", "#60A5FA")
 
