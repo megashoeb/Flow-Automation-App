@@ -580,6 +580,12 @@ class CloakUpdateWorker(QThread):
                 if bin_updated:
                     changes.append(f"binary {bin_version_before} → {bin_version_after}")
                 self.finished.emit(True, f"Updated! {', '.join(changes)}")
+            elif not pip_success:
+                # pip upgrade failed — don't say "up to date", be honest
+                self.finished.emit(
+                    False,
+                    f"pip upgrade failed (v{pkg_version_after}). Run manually: pip install cloakbrowser --upgrade",
+                )
             else:
                 self.finished.emit(
                     True,
