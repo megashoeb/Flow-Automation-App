@@ -445,12 +445,26 @@ class CloakUpdateWorker(QThread):
         except Exception:
             pass
 
+    def _get_pip_python(self):
+        """Get the right Python for pip. In frozen builds, find system Python."""
+        if not getattr(sys, "frozen", False) and not getattr(sys, "_MEIPASS", None):
+            return sys.executable
+        for cmd in ["python3", "python"]:
+            try:
+                r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    return cmd
+            except Exception:
+                continue
+        return sys.executable
+
     def _pip_show_version(self):
         """Get real installed cloakbrowser version via pip show (no cache issues)."""
+        python_exe = self._get_pip_python()
         try:
             _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "show", "cloakbrowser"],
+                [python_exe, "-m", "pip", "show", "cloakbrowser"],
                 capture_output=True, text=True, timeout=15, **_no_win,
             )
             if result.returncode == 0 and result.stdout:
@@ -472,17 +486,12 @@ class CloakUpdateWorker(QThread):
             # ── Get version BEFORE upgrade (via pip show — no cache) ──
             pkg_version_before = self._pip_show_version()
 
-            if is_frozen:
-                self.status_changed.emit(
-                    "⏳ Checking binary updates (pip update not available in .exe)...",
-                    "#F59E0B",
-                )
-            else:
-                self.status_changed.emit("⏳ Updating CloakBrowser package...", "#60A5FA")
-                python_exe = sys.executable
-                _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
-                pip_success = False
+            self.status_changed.emit("⏳ Updating CloakBrowser package...", "#60A5FA")
+            python_exe = self._get_pip_python()
+            _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
+            pip_success = False
 
+            if True:  # Always try pip upgrade (works in both dev and .app builds now)
                 # Try multiple pip strategies for cross-platform compatibility
                 pip_strategies = [
                     [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--quiet"],
@@ -7034,28 +7043,49 @@ class MainWindow(QMainWindow):
                 self.chk_random_fingerprint.setEnabled(True)
                 self.chk_random_fingerprint.setToolTip("")
 
-    def _refresh_cloak_version_display(self, reset_button=True):
-        if not hasattr(self, "lbl_cloak_version") or not hasattr(self, "btn_cloak_update"):
-            return
+    def _get_pip_python(self):
+        """Get the right Python executable for pip commands.
+        In .app/.exe builds, sys.executable is the bundled binary — not Python.
+        Fall back to system python3/python on PATH."""
+        if not getattr(sys, "frozen", False) and not getattr(sys, "_MEIPASS", None):
+            return sys.executable  # Normal dev mode — use current Python
+        # Frozen build — find system Python
+        for cmd in ["python3", "python"]:
+            try:
+                result = subprocess.run(
+                    [cmd, "--version"], capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    return cmd
+            except Exception:
+                continue
+        return sys.executable  # Last resort
 
-        # ── Get REAL installed version via pip show (subprocess) ──
-        # importlib reimport is unreliable on Mac due to .pyc caching
-        pkg_version = "unknown"
+    def _pip_show_cloak_version(self):
+        """Get real installed cloakbrowser version via pip show."""
+        python_exe = self._get_pip_python()
         try:
             _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "show", "cloakbrowser"],
+                [python_exe, "-m", "pip", "show", "cloakbrowser"],
                 capture_output=True, text=True, timeout=15, **_no_win,
             )
             if result.returncode == 0 and result.stdout:
                 for line in result.stdout.splitlines():
                     if line.startswith("Version:"):
-                        pkg_version = line.split(":", 1)[1].strip()
-                        break
+                        return line.split(":", 1)[1].strip()
         except Exception:
             pass
+        return "unknown"
 
-        # Fallback to importlib if pip show failed
+    def _refresh_cloak_version_display(self, reset_button=True):
+        if not hasattr(self, "lbl_cloak_version") or not hasattr(self, "btn_cloak_update"):
+            return
+
+        # ── Get REAL installed version via pip show (subprocess) ──
+        pkg_version = self._pip_show_cloak_version()
+
+        # Fallback to importlib
         if pkg_version == "unknown":
             try:
                 import importlib
