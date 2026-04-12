@@ -37,3 +37,4 @@ desktop.ini
 
 # ─── Claude Code ───
 .claude/
+.deps_installing

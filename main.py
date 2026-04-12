@@ -3,6 +3,7 @@ import sys
 import signal
 import platform
 import subprocess
+import time
 
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
@@ -10,12 +11,34 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 
-# ── Auto-install missing dependencies on startup ──
+# ── Auto-install missing dependencies on startup (once only) ──
 def _ensure_dependencies():
-    """Install any missing packages from requirements.txt silently."""
+    """Install ONLY truly missing packages from requirements.txt. Runs once."""
+    # Guard: skip if already ran, or if frozen exe, or if flag file exists
+    if getattr(_ensure_dependencies, "_done", False):
+        return
+    _ensure_dependencies._done = True
+
+    if getattr(sys, "frozen", False):
+        return  # .exe build — pip not available
+
     req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
     if not os.path.exists(req_file):
         return
+
+    # Lock file to prevent install loop across multiple launches
+    lock_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deps_installing")
+    if os.path.exists(lock_file):
+        try:
+            # If lock is older than 5 minutes, stale — remove it
+            age = time.time() - os.path.getmtime(lock_file)
+            if age < 300:
+                print("[Auto-Install] Another install in progress, skipping.")
+                return
+            os.remove(lock_file)
+        except Exception:
+            return
+
     try:
         import pkg_resources
         with open(req_file, "r") as f:
@@ -23,35 +46,58 @@ def _ensure_dependencies():
                 line.strip() for line in f
                 if line.strip() and not line.startswith("#")
             ]
+        # Only install truly MISSING packages, not version mismatches
         missing = []
         for req in reqs:
             try:
                 pkg_resources.require(req)
-            except (pkg_resources.DistributionNotFound,
-                    pkg_resources.VersionConflict):
+            except pkg_resources.DistributionNotFound:
+                # Package not installed at all — need to install
                 missing.append(req)
-        if missing:
-            print(f"[Auto-Install] Installing: {', '.join(missing)}")
-            base_cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
-            installed = False
-            # Try multiple strategies for cross-platform compatibility
-            for extra_flags in [[], ["--break-system-packages"], ["--user"]]:
-                try:
-                    subprocess.check_call(
-                        base_cmd + extra_flags + missing,
-                        stdout=subprocess.DEVNULL if not os.environ.get("DEBUG") else None,
-                        stderr=subprocess.STDOUT,
-                    )
-                    installed = True
-                    break
-                except subprocess.CalledProcessError:
-                    continue
-            if installed:
-                print("[Auto-Install] Done.")
-            else:
-                print("[Auto-Install] Warning: pip install failed. Run manually: pip3 install -r requirements.txt")
+            except pkg_resources.VersionConflict:
+                # Package exists but wrong version — skip (don't loop)
+                pass
+        if not missing:
+            return
+
+        # Create lock file
+        try:
+            with open(lock_file, "w") as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+
+        print(f"[Auto-Install] Installing missing: {', '.join(missing)}")
+        base_cmd = [sys.executable, "-m", "pip", "install"]
+        installed = False
+        for extra_flags in [[], ["--break-system-packages"], ["--user"]]:
+            try:
+                subprocess.check_call(
+                    base_cmd + extra_flags + missing,
+                    stdout=subprocess.DEVNULL if not os.environ.get("DEBUG") else None,
+                    stderr=subprocess.STDOUT,
+                    timeout=120,
+                )
+                installed = True
+                break
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                continue
+        if installed:
+            print("[Auto-Install] Done.")
+        else:
+            print("[Auto-Install] Failed. Run manually: pip3 install -r requirements.txt")
+
+        # Remove lock file
+        try:
+            os.remove(lock_file)
+        except Exception:
+            pass
     except Exception as e:
         print(f"[Auto-Install] Warning: {e}")
+        try:
+            os.remove(lock_file)
+        except Exception:
+            pass
 
 _ensure_dependencies()
 
