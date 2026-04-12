@@ -13,12 +13,80 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QTextEdit, QPlainTextEdit, QPushButton, QComboBox, QLabel,
     QTableWidget, QTableWidgetItem, QTableView, QHeaderView, QAbstractItemView,
-    QSplitter, QGroupBox, QLineEdit, QTabWidget, QScrollArea,
+    QSplitter, QGroupBox, QLineEdit, QTabWidget, QScrollArea, QAbstractScrollArea,
     QMessageBox, QFileDialog, QSpinBox, QCheckBox, QFrame, QSizePolicy, QProgressBar,
-    QProgressDialog, QDialog,
+    QProgressDialog, QDialog, QAbstractSpinBox,
     QGraphicsDropShadowEffect, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QObject, QRunnable, QThreadPool, QRectF, QEvent
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# QFluentWidgets (Phase 2+ migration). Graceful fallback if unavailable —
+# allows main_window to keep importing even when library is missing.
+# ══════════════════════════════════════════════════════════════════════════
+try:
+    from qfluentwidgets import (
+        NavigationInterface,
+        NavigationItemPosition,
+        FluentIcon,
+        PrimaryPushButton,
+        PushButton,
+        TransparentPushButton,
+        MessageBox as FluentMessageBox,
+        InfoBar,
+        InfoBarPosition,
+        SpinBox as _FluentSpinBox,
+        DoubleSpinBox as _FluentDoubleSpinBox,
+        ComboBox as _FluentComboBox,
+    )
+    _FLUENT_UI_AVAILABLE = True
+except Exception:
+    NavigationInterface = None
+    NavigationItemPosition = None
+    FluentIcon = None
+    PrimaryPushButton = None
+    PushButton = None
+    TransparentPushButton = None
+    FluentMessageBox = None
+    InfoBar = None
+    InfoBarPosition = None
+    _FluentSpinBox = None
+    _FluentDoubleSpinBox = None
+    _FluentComboBox = None
+    _FLUENT_UI_AVAILABLE = False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Module-level class rebinding: replace QSpinBox / QDoubleSpinBox with
+# their Fluent variants so every `QSpinBox()` call in this file
+# automatically uses the Fluent-styled widget. Fluent SpinBox and
+# DoubleSpinBox ARE proper QSpinBox subclasses, so all existing code
+# (isinstance checks, API calls, signal connections, wheel monkey-patch via
+# inheritance) continues to work unchanged.
+#
+# NOTE: We do NOT rebind QComboBox. Fluent ComboBox is not a QComboBox
+# subclass (it extends QPushButton) — while duck-type compatible at the
+# method level, Qt's internal popup and isinstance-based logic breaks
+# when we substitute it. Stock QComboBox is kept with a chevron QSS.
+# ══════════════════════════════════════════════════════════════════════════
+if _FLUENT_UI_AVAILABLE:
+    if _FluentSpinBox is not None:
+        QSpinBox = _FluentSpinBox
+    if _FluentDoubleSpinBox is not None:
+        QDoubleSpinBox = _FluentDoubleSpinBox
+
+    # Re-apply wheel-block on Fluent variants. The earlier
+    # _apply_wheel_block() call patched the stock QSpinBox class, but
+    # Fluent SpinBox/DoubleSpinBox define their OWN wheelEvent which
+    # shadows the inherited patched method. We need to patch Fluent
+    # classes directly so page scrolling doesn't change values.
+    for _cls in (_FluentSpinBox, _FluentDoubleSpinBox, _FluentComboBox):
+        if _cls is not None:
+            try:
+                _cls.wheelEvent = _no_wheel_change
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -28,21 +96,108 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QObject, QRunnabl
 # before wheel scroll can change its value — same as modern web UIs.
 # ══════════════════════════════════════════════════════════════════════════
 def _no_wheel_change(self, event):
-    """Ignore wheel events unless widget has focus. Forward to parent for page scroll."""
+    """Legacy monkey-patch (still used as fallback). Ignore wheel events
+    unless widget has focus."""
     if self.hasFocus():
-        # Widget is focused — let it handle the wheel normally
         return type(self).__mro__[1].wheelEvent(self, event)
-    # Not focused — ignore so event propagates to parent scroll area
     event.ignore()
 
 
 def _apply_wheel_block():
-    """Monkey-patch wheelEvent on QComboBox / QSpinBox / QDoubleSpinBox."""
+    """Monkey-patch wheelEvent on QComboBox / QSpinBox / QDoubleSpinBox.
+    This is the first line of defense but PySide6's C++ event dispatch
+    sometimes bypasses post-hoc Python overrides, so we ALSO install a
+    global application-level event filter (_WheelEventFilter) as the
+    authoritative solution."""
     for cls in (QComboBox, QSpinBox, QDoubleSpinBox):
         cls.wheelEvent = _no_wheel_change
 
 
 _apply_wheel_block()
+
+
+class _WheelEventFilter(QObject):
+    """Per-widget event filter: block wheel events on any
+    QAbstractSpinBox / QComboBox and manually forward them to the
+    nearest QAbstractScrollArea ancestor so the page still scrolls.
+
+    Why forwarding: simply returning True from the filter consumes
+    the event entirely — the parent scroll area never sees it.
+    We have to manually sendEvent() to the scroll area's viewport
+    after consuming the original.
+    """
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.Wheel:
+                # Walk up the parent chain to find a scroll area.
+                ancestor = obj.parent() if hasattr(obj, "parent") else None
+                while ancestor is not None:
+                    if isinstance(ancestor, QAbstractScrollArea):
+                        # Forward the wheel event to the scroll area
+                        # viewport so the page scrolls normally.
+                        try:
+                            QApplication.sendEvent(ancestor.viewport(), event)
+                        except Exception:
+                            pass
+                        return True  # consume on the widget
+                    parent_fn = getattr(ancestor, "parent", None)
+                    ancestor = parent_fn() if callable(parent_fn) else None
+                # No scroll area found — still consume so the widget
+                # doesn't change its value.
+                return True
+        except Exception:
+            pass
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Runtime-generated chevron SVG for QComboBox drop-down arrow. QSS can
+# only reference arrows via `image: url(...)` with a real file path, and
+# CSS border-triangle tricks don't render reliably in PySide6 subcontrols.
+# This writes a tiny SVG to a known cache dir on first import so the QSS
+# can point at it. The file is idempotent — written once per run.
+# ══════════════════════════════════════════════════════════════════════════
+_CHEVRON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 10">'
+    '<path d="M2 2 L8 8 L14 2" stroke="#CBD5E1" stroke-width="2.2" '
+    'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
+    '</svg>'
+)
+
+
+def _ensure_chevron_asset():
+    """Write the chevron SVG to disk so QSS can reference it."""
+    try:
+        import tempfile
+        asset_dir = Path(tempfile.gettempdir()) / "glabs_assets"
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        path = asset_dir / "chevron_down.svg"
+        if not path.exists():
+            path.write_text(_CHEVRON_SVG, encoding="utf-8")
+        # Qt QSS wants forward slashes even on Windows
+        return str(path).replace("\\", "/")
+    except Exception:
+        return ""
+
+
+_CHEVRON_PATH = _ensure_chevron_asset()
+
+
+def _force_plusminus_symbols(root_widget):
+    """Walk a widget tree and set PlusMinus button symbols on every
+    QSpinBox / QDoubleSpinBox. QSS-styled arrows are unreliable in
+    PySide6 (CSS triangle subcontrols don't render cleanly). Plus/minus
+    glyphs are text, so they are always visible against any theme and
+    any background color."""
+    try:
+        for sb in root_widget.findChildren(QAbstractSpinBox):
+            try:
+                sb.setButtonSymbols(QAbstractSpinBox.PlusMinus)
+            except Exception:
+                pass
+    except Exception:
+        pass
 from PySide6.QtGui import QColor, QIcon, QPixmap, QFont, QPainter, QPen, QTextCursor
 
 from src.db.db_manager import (
@@ -196,8 +351,54 @@ class CleanupThread(QThread):
             pass
 
 
+class _CloakDownloadLogHandler:
+    """Captures cloakbrowser.download log records and emits parsed
+    progress to a Qt signal. CloakBrowser logs progress internally via
+    Python's logging module (lines like "Download progress: 30% (60/200
+    MB)") but doesn't expose a callback API — this handler bridges
+    that gap.
+    """
+    _DOWNLOAD_PCT_RE = re.compile(
+        r"Download progress:\s*(\d+)%\s*\((\d+)/(\d+)\s*MB\)",
+        re.IGNORECASE,
+    )
+    _DOWNLOAD_DONE_RE = re.compile(
+        r"Download complete:\s*(\d+)\s*MB",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, progress_signal):
+        self._progress_signal = progress_signal
+        self.level = 0  # accept all levels
+
+    def handle(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        m = self._DOWNLOAD_PCT_RE.search(msg)
+        if m:
+            try:
+                pct = int(m.group(1))
+                done = int(m.group(2))
+                total = int(m.group(3))
+                self._progress_signal.emit(pct, done, total)
+            except Exception:
+                pass
+            return
+        done = self._DOWNLOAD_DONE_RE.search(msg)
+        if done:
+            try:
+                size = int(done.group(1))
+                self._progress_signal.emit(100, size, size)
+            except Exception:
+                pass
+
+
 class CloakUpdateWorker(QThread):
     status_changed = Signal(str, str)
+    # percent (0-100), downloaded MB, total MB
+    progress_changed = Signal(int, int, int)
     finished = Signal(bool, str)
 
     def __init__(self, install_mode=False, parent=None):
@@ -212,6 +413,37 @@ class CloakUpdateWorker(QThread):
             cache_dir = Path.home() / ".cloakbrowser"
         cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ["CLOAKBROWSER_CACHE_DIR"] = str(cache_dir.resolve())
+
+    def _install_download_log_handler(self):
+        """Hook into cloakbrowser.download logger to capture progress."""
+        import logging
+        try:
+            dl_logger = logging.getLogger("cloakbrowser.download")
+            dl_logger.setLevel(logging.INFO)
+            handler = _CloakDownloadLogHandler(self.progress_changed)
+            # logging wants a real Handler subclass — wrap ours
+            class _BridgeHandler(logging.Handler):
+                def __init__(self, bridge):
+                    super().__init__(level=logging.INFO)
+                    self._bridge = bridge
+
+                def emit(self, record):
+                    self._bridge.handle(record)
+
+            bridge = _BridgeHandler(handler)
+            dl_logger.addHandler(bridge)
+            return bridge
+        except Exception:
+            return None
+
+    def _remove_download_log_handler(self, handler):
+        import logging
+        if handler is None:
+            return
+        try:
+            logging.getLogger("cloakbrowser.download").removeHandler(handler)
+        except Exception:
+            pass
 
     def run(self):
         import importlib
@@ -285,7 +517,14 @@ class CloakUpdateWorker(QThread):
             version_before = str(info_before.get("version") or "none")
 
             self.status_changed.emit("⏳ Downloading latest binary if available...", "#60A5FA")
-            ensure_binary()
+            # Install log handler to capture download progress %, then
+            # ensure_binary() — the handler emits progress_changed as
+            # CloakBrowser logs "Download progress: N% (done/total MB)".
+            _log_handler = self._install_download_log_handler()
+            try:
+                ensure_binary()
+            finally:
+                self._remove_download_log_handler(_log_handler)
 
             info_after = binary_info() or {}
             version_after = str(info_after.get("version") or "none")
@@ -686,7 +925,7 @@ class VirtualLiveGridWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(event.rect(), QColor("#0F172A"))
+        painter.fillRect(event.rect(), QColor("#111827"))
 
         card_w, card_h = self.CARD_SIZES.get(self._card_size, self.CARD_SIZES["medium"])
         row_height = card_h + self._spacing
@@ -700,15 +939,35 @@ class VirtualLiveGridWidget(QWidget):
             "failed": QColor("#EF4444"),
             "moderated": QColor("#F59E0B"),
         }
+        status_bg = {
+            "pending": QColor("#1E293B"),
+            "running": QColor("#0C2D5E"),
+            "completed": QColor("#052E16"),
+            "failed": QColor("#2A0F12"),
+            "moderated": QColor("#2A1F08"),
+        }
+        status_labels = {
+            "pending": "QUEUED",
+            "running": "● LIVE",
+            "completed": "✓ DONE",
+            "failed": "✗ FAIL",
+            "moderated": "⚠ FLAG",
+        }
 
         prompt_font = QFont()
         prompt_font.setPointSize(10)
         prompt_font.setBold(True)
         meta_font = QFont()
-        meta_font.setPointSize(9)
+        meta_font.setPointSize(8)
         header_font = QFont()
         header_font.setPointSize(9)
         header_font.setBold(True)
+        badge_font = QFont()
+        badge_font.setPointSize(8)
+        badge_font.setBold(True)
+        big_status_font = QFont()
+        big_status_font.setPointSize(14)
+        big_status_font.setBold(True)
 
         for row in range(first_row, last_row + 1):
             for col in range(self._columns):
@@ -722,7 +981,8 @@ class VirtualLiveGridWidget(QWidget):
                 rect = QRectF(x, y, card_w, card_h)
 
                 status = str(job.get("status") or "pending").strip().lower()
-                status_color = status_colors.get(status, QColor("#94A3B8"))
+                s_color = status_colors.get(status, QColor("#94A3B8"))
+                s_bg = status_bg.get(status, QColor("#1E293B"))
                 queue_no = job.get("output_index") if job.get("is_retry") else job.get("queue_no")
                 if queue_no is None:
                     queue_no = idx + 1
@@ -730,40 +990,75 @@ class VirtualLiveGridWidget(QWidget):
                 meta = str(job.get("account") or "Waiting in queue")
                 progress = str(job.get("progress") or "")
 
-                painter.setPen(QPen(QColor("#334155"), 1))
-                painter.setBrush(QColor("#1A2744") if job.get("is_retry") else QColor("#1E293B"))
-                painter.drawRoundedRect(rect, 10, 10)
+                # ── Card background ──
+                is_retry = job.get("is_retry")
+                card_bg = QColor("#162033") if is_retry else QColor("#1E293B")
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(card_bg)
+                painter.drawRoundedRect(rect, 12, 12)
 
+                # Top accent line (3px colored bar)
+                accent_rect = QRectF(x + 1, y + 1, card_w - 2, 3)
+                painter.setBrush(s_color)
+                painter.drawRoundedRect(accent_rect, 2, 2)
+
+                # ── Header row: #N + status badge ──
                 painter.setFont(header_font)
-                painter.setPen(QColor("#F8FAFC"))
-                painter.drawText(QRectF(x + 12, y + 12, card_w - 24, 20), Qt.AlignLeft | Qt.AlignVCenter, f"#{queue_no}")
-                painter.setPen(status_color)
-                painter.drawText(QRectF(x + 12, y + 12, card_w - 24, 20), Qt.AlignRight | Qt.AlignVCenter, status.upper())
+                painter.setPen(QColor("#CBD5E1"))
+                painter.drawText(QRectF(x + 14, y + 14, card_w * 0.4, 20), Qt.AlignLeft | Qt.AlignVCenter, f"#{queue_no}")
 
+                # Status badge (pill)
+                badge_text = status_labels.get(status, status.upper())
+                painter.setFont(badge_font)
+                fm = painter.fontMetrics()
+                badge_w = fm.horizontalAdvance(badge_text) + 16
+                badge_h = 22
+                badge_x = x + card_w - 14 - badge_w
+                badge_y = y + 12
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(s_bg)
+                painter.drawRoundedRect(QRectF(badge_x, badge_y, badge_w, badge_h), 6, 6)
+                painter.setPen(s_color)
+                painter.drawText(QRectF(badge_x, badge_y, badge_w, badge_h), Qt.AlignCenter, badge_text)
+
+                # ── Preview area ──
+                preview_y = y + 42
+                preview_h = max(72, int(card_h * 0.36))
+                preview_rect = QRectF(x + 12, preview_y, card_w - 24, preview_h)
+                painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor("#0F172A"))
-                painter.setPen(QPen(QColor("#334155"), 1))
-                painter.drawRoundedRect(QRectF(x + 12, y + 40, card_w - 24, max(72, int(card_h * 0.36))), 8, 8)
-                painter.setPen(status_color if status == "completed" else QColor("#64748B"))
-                painter.drawText(
-                    QRectF(x + 12, y + 40, card_w - 24, max(72, int(card_h * 0.36))),
-                    Qt.AlignCenter,
-                    "DONE" if status == "completed" else ("FAIL" if status in ("failed", "moderated") else "LIVE"),
-                )
+                painter.drawRoundedRect(preview_rect, 10, 10)
 
+                # Status icon in preview
+                painter.setFont(big_status_font)
+                painter.setPen(s_color)
+                painter.drawText(preview_rect, Qt.AlignCenter, status_labels.get(status, status.upper()))
+
+                # ── Prompt text ──
+                prompt_y = preview_y + preview_h + 10
                 painter.setFont(prompt_font)
-                painter.setPen(QColor("#F8FAFC"))
-                prompt_rect = QRectF(x + 12, y + 126, card_w - 24, 42)
-                prompt_text = painter.fontMetrics().elidedText(prompt.replace("\n", " "), Qt.ElideRight, max(40, int(prompt_rect.width() * 2)))
+                painter.setPen(QColor("#E2E8F0"))
+                prompt_rect = QRectF(x + 14, prompt_y, card_w - 28, 40)
+                prompt_text = fm.elidedText(prompt.replace("\n", " "), Qt.ElideRight, max(40, int(prompt_rect.width() * 2)))
                 painter.drawText(prompt_rect, Qt.TextWordWrap, prompt_text)
 
+                # ── Meta info (bottom) ──
                 painter.setFont(meta_font)
-                painter.setPen(QColor("#94A3B8"))
-                painter.drawText(QRectF(x + 12, y + card_h - 52, card_w - 24, 18), Qt.AlignLeft | Qt.AlignVCenter, meta[:48])
-                painter.drawText(
-                    QRectF(x + 12, y + card_h - 30, card_w - 24, 18),
-                    Qt.AlignLeft | Qt.AlignVCenter,
-                    progress[:48] if progress else str(job.get("job_type") or "image").title(),
-                )
+                # Separator line
+                sep_y = y + card_h - 48
+                painter.setPen(QPen(QColor("#1E293B"), 1))
+                painter.drawLine(int(x + 14), int(sep_y), int(x + card_w - 14), int(sep_y))
+
+                painter.setPen(QColor("#64748B"))
+                painter.drawText(QRectF(x + 14, y + card_h - 42, card_w - 28, 16), Qt.AlignLeft | Qt.AlignVCenter, meta[:42])
+                type_text = progress[:42] if progress else str(job.get("job_type") or "image").title()
+                painter.setPen(QColor("#475569"))
+                painter.drawText(QRectF(x + 14, y + card_h - 24, card_w - 28, 16), Qt.AlignLeft | Qt.AlignVCenter, type_text)
+
+                # Card border (draw last so it's on top)
+                painter.setPen(QPen(QColor("#334155"), 1))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rect, 12, 12)
 
         painter.end()
 
@@ -1084,71 +1379,202 @@ class LiveJobCard(QFrame):
 
 
 class SidebarNav(QFrame):
+    """
+    Fluent-powered sidebar navigation.
+
+    Public API (preserved from the old QFrame version — DO NOT change
+    signatures, several call sites in MainWindow depend on these):
+        - Signal: page_selected(str)
+        - set_active(key)
+        - update_stats(pending, running, done, failed, session_total)
+        - setFixedWidth(width)
+
+    Internal implementation uses qfluentwidgets.NavigationInterface for
+    the nav buttons (with icons, hover states, smooth selection
+    animations). The footer stats panel is a lightweight QWidget under
+    the nav — still contains the clickable "Failed" button.
+    """
     page_selected = Signal(str)
+
+    NAV_ITEMS = [
+        ("dashboard", "Image Generation"),
+        ("video", "Video Generation"),
+        ("accounts", "Account Manager"),
+        ("live", "Live Generation"),
+        ("failed", "Failed Jobs"),
+        ("settings", "Settings"),
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sidebarNav")
-        self.setFixedWidth(180)
+        self.setFixedWidth(220)  # slightly wider for Fluent nav labels
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 14, 10, 14)
-        layout.setSpacing(6)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
+        # ── Title header ──────────────────────────────────────────
+        title_wrap = QWidget()
+        title_wrap.setObjectName("sidebarTitleWrap")
+        title_layout = QVBoxLayout(title_wrap)
+        title_layout.setContentsMargins(18, 18, 18, 10)
+        title_layout.setSpacing(0)
         self.lbl_title = QLabel("G-Labs\nAutomation")
         self.lbl_title.setObjectName("sidebarTitle")
-        layout.addWidget(self.lbl_title)
+        title_layout.addWidget(self.lbl_title)
+        root.addWidget(title_wrap)
 
-        top_divider = QFrame()
-        top_divider.setFrameShape(QFrame.HLine)
-        top_divider.setObjectName("sidebarDivider")
-        layout.addWidget(top_divider)
+        # ── Fluent NavigationInterface ────────────────────────────
+        if _FLUENT_UI_AVAILABLE and NavigationInterface is not None:
+            self.nav = NavigationInterface(
+                self, showMenuButton=False, showReturnButton=False
+            )
+            self.nav.setExpandWidth(220)
+            # Map route keys to their icons
+            nav_icons = {
+                "dashboard": FluentIcon.PHOTO,
+                "video": FluentIcon.VIDEO,
+                "accounts": FluentIcon.PEOPLE,
+                "live": FluentIcon.PLAY,
+                "failed": FluentIcon.CANCEL,
+                "settings": FluentIcon.SETTING,
+            }
+            for key, label in self.NAV_ITEMS:
+                icon = nav_icons.get(key, FluentIcon.HOME)
+                # NavigationWidget.clicked is Signal(bool) — the lambda's
+                # first positional arg MUST accept the bool payload or it
+                # overrides the captured route key default. Use an
+                # explicit swallow arg to preserve the captured `k`.
+                self.nav.addItem(
+                    routeKey=key,
+                    icon=icon,
+                    text=label,
+                    onClick=(lambda _checked=False, k=key: self._emit_nav(k)),
+                    selectable=True,
+                    position=NavigationItemPosition.TOP,
+                )
+            root.addWidget(self.nav, 1)
+            self.nav_buttons = None  # not used in Fluent mode
+        else:
+            # Fallback: original QPushButton-based sidebar when Fluent
+            # library is unavailable (shouldn't happen in normal runs).
+            self.nav = None
+            self.nav_buttons = {}
+            fallback_layout = QVBoxLayout()
+            fallback_layout.setContentsMargins(10, 6, 10, 6)
+            fallback_layout.setSpacing(6)
+            for key, label in self.NAV_ITEMS:
+                btn = QPushButton(label)
+                btn.setObjectName("sidebarNavButton")
+                btn.setCheckable(True)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.clicked.connect(
+                    lambda checked=False, nav_key=key: self._emit_nav(nav_key)
+                )
+                fallback_layout.addWidget(btn)
+                self.nav_buttons[key] = btn
+            fallback_layout.addStretch(1)
+            fallback_wrap = QWidget()
+            fallback_wrap.setLayout(fallback_layout)
+            root.addWidget(fallback_wrap, 1)
 
-        self.nav_buttons = {}
-        nav_items = [
-            ("dashboard", "Image Generation"),
-            ("video", "Video Generation"),
-            ("accounts", "Account Manager"),
-            ("live", "Live Generation"),
-            ("failed", "Failed Jobs"),
-            ("settings", "Settings"),
-        ]
-        for key, label in nav_items:
-            btn = QPushButton(label)
-            btn.setObjectName("sidebarNavButton")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda checked=False, nav_key=key: self._emit_nav(nav_key))
-            layout.addWidget(btn)
-            self.nav_buttons[key] = btn
-
-        layout.addStretch(1)
-
+        # ── Divider above stats ───────────────────────────────────
         bottom_divider = QFrame()
         bottom_divider.setFrameShape(QFrame.HLine)
         bottom_divider.setObjectName("sidebarDivider")
-        layout.addWidget(bottom_divider)
+        root.addWidget(bottom_divider)
 
-        self.lbl_pending = QLabel("Pending: 0")
-        self.lbl_pending.setObjectName("sidebarStat")
-        self.lbl_running = QLabel("Running: 0")
-        self.lbl_running.setObjectName("sidebarStatRunning")
-        self.lbl_done = QLabel("Done: 0")
-        self.lbl_done.setObjectName("sidebarStatDone")
-        self.btn_failed = QPushButton("Failed: 0")
-        self.btn_failed.setObjectName("sidebarFailedButton")
-        self.btn_failed.setCursor(Qt.PointingHandCursor)
-        self.btn_failed.clicked.connect(lambda: self._emit_nav("failed"))
+        # ── Stats footer panel — professional mini stat cards ────
+        stats_wrap = QWidget()
+        stats_wrap.setObjectName("sidebarStatsWrap")
+        stats_layout = QVBoxLayout(stats_wrap)
+        stats_layout.setContentsMargins(14, 14, 14, 14)
+        stats_layout.setSpacing(6)
+
+        # Section header
+        stats_header = QLabel("QUEUE STATS")
+        stats_header.setObjectName("sidebarStatsHeader")
+        stats_layout.addWidget(stats_header)
+        stats_layout.addSpacing(2)
+
+        def _build_stat_row(key, label_text, color):
+            """Build a mini stat row: colored dot + label + count.
+            Returns (row_widget, count_label)."""
+            row = QFrame()
+            row.setObjectName("sidebarStatRow")
+            row.setProperty("variant", key)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(10, 6, 10, 6)
+            rl.setSpacing(8)
+            dot = QLabel("●")
+            dot.setObjectName("sidebarStatDot")
+            dot.setStyleSheet(f"color: {color}; font-size: 14px; background: transparent;")
+            dot.setFixedWidth(10)
+            lbl = QLabel(label_text)
+            lbl.setObjectName("sidebarStatLabel")
+            count = QLabel("0")
+            count.setObjectName("sidebarStatCount")
+            count.setProperty("variant", key)
+            count.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            rl.addWidget(dot)
+            rl.addWidget(lbl, 1)
+            rl.addWidget(count)
+            return row, count
+
+        pending_row, self.lbl_pending = _build_stat_row("pending", "Pending", "#94A3B8")
+        running_row, self.lbl_running = _build_stat_row("running", "Running", "#60A5FA")
+        done_row, self.lbl_done = _build_stat_row("done", "Done", "#22C55E")
+        stats_layout.addWidget(pending_row)
+        stats_layout.addWidget(running_row)
+        stats_layout.addWidget(done_row)
+
+        # Failed: clickable row (navigates to failed jobs page)
+        failed_row = QFrame()
+        failed_row.setObjectName("sidebarStatRow")
+        failed_row.setProperty("variant", "failed")
+        failed_row.setCursor(Qt.PointingHandCursor)
+        failed_layout_inner = QHBoxLayout(failed_row)
+        failed_layout_inner.setContentsMargins(10, 6, 10, 6)
+        failed_layout_inner.setSpacing(8)
+        failed_dot = QLabel("●")
+        failed_dot.setStyleSheet("color: #EF4444; font-size: 14px; background: transparent;")
+        failed_dot.setFixedWidth(10)
+        failed_lbl = QLabel("Failed")
+        failed_lbl.setObjectName("sidebarStatLabel")
+        # Store count label as btn_failed for backwards compat with update_stats
+        # naming (even though it's now a QLabel, not a QPushButton). We
+        # wire click via a mousePressEvent on the row frame.
+        self.btn_failed = QLabel("0")
+        self.btn_failed.setObjectName("sidebarStatCount")
+        self.btn_failed.setProperty("variant", "failed")
+        self.btn_failed.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        failed_layout_inner.addWidget(failed_dot)
+        failed_layout_inner.addWidget(failed_lbl, 1)
+        failed_layout_inner.addWidget(self.btn_failed)
+
+        def _failed_row_mouse_press(event, self_ref=self):
+            self_ref._emit_nav("failed")
+        failed_row.mousePressEvent = _failed_row_mouse_press
+        self._failed_row = failed_row
+        stats_layout.addWidget(failed_row)
+
+        # Session footer — subtle, below a divider
+        session_divider = QFrame()
+        session_divider.setObjectName("sidebarStatsInnerDivider")
+        session_divider.setFrameShape(QFrame.HLine)
+        session_divider.setFixedHeight(1)
+        stats_layout.addSpacing(4)
+        stats_layout.addWidget(session_divider)
+        stats_layout.addSpacing(4)
         self.lbl_session = QLabel("Session: 0 images")
         self.lbl_session.setObjectName("sidebarSession")
+        self.lbl_session.setAlignment(Qt.AlignCenter)
+        stats_layout.addWidget(self.lbl_session)
 
-        layout.addWidget(self.lbl_pending)
-        layout.addWidget(self.lbl_running)
-        layout.addWidget(self.lbl_done)
-        layout.addWidget(self.btn_failed)
-        layout.addSpacing(4)
-        layout.addWidget(self.lbl_session)
+        root.addWidget(stats_wrap)
 
+        self._active_key = ""
         self.set_active("dashboard")
 
     def _emit_nav(self, key):
@@ -1156,22 +1582,39 @@ class SidebarNav(QFrame):
         self.page_selected.emit(str(key))
 
     def set_active(self, key):
-        current_key = str(key or "")
-        for btn_key, button in self.nav_buttons.items():
-            button.setChecked(btn_key == current_key)
+        """Mark a nav item as selected. Called by MainWindow._sync_sidebar_selection."""
+        key_str = str(key or "")
+        if not key_str:
+            return
+        self._active_key = key_str
+        if self.nav is not None:
+            try:
+                self.nav.setCurrentItem(key_str)
+            except Exception:
+                pass
+        elif self.nav_buttons:
+            for btn_key, button in self.nav_buttons.items():
+                button.setChecked(btn_key == key_str)
 
     def update_stats(self, pending, running, done, failed, session_total):
-        self.lbl_pending.setText(f"Pending: {int(pending or 0)}")
-        self.lbl_running.setText(f"Running: {int(running or 0)}")
-        self.lbl_done.setText(f"Done: {int(done or 0)}")
-        self.btn_failed.setText(f"Failed: {int(failed or 0)}")
+        """Refresh the footer stats panel. In the new stat-card layout,
+        labels are just the count (e.g. "5") not "Pending: 5" — the
+        metric name is shown separately in each row."""
+        self.lbl_pending.setText(str(int(pending or 0)))
+        self.lbl_running.setText(str(int(running or 0)))
+        self.lbl_done.setText(str(int(done or 0)))
+        self.btn_failed.setText(str(int(failed or 0)))
         self.lbl_session.setText(f"Session: {int(session_total or 0)} images")
-        if int(failed or 0) > 0:
-            self.btn_failed.setProperty("hasFailures", True)
-        else:
-            self.btn_failed.setProperty("hasFailures", False)
+        has_failures = int(failed or 0) > 0
+        self.btn_failed.setProperty("hasFailures", has_failures)
         self.btn_failed.style().unpolish(self.btn_failed)
         self.btn_failed.style().polish(self.btn_failed)
+        # Also update the parent row style so it lights up red when
+        # failures exist (CSS [hasFailures="true"] selector).
+        if hasattr(self, "_failed_row"):
+            self._failed_row.setProperty("hasFailures", has_failures)
+            self._failed_row.style().unpolish(self._failed_row)
+            self._failed_row.style().polish(self._failed_row)
 
 
 class MainWindow(QMainWindow):
@@ -1185,12 +1628,18 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None and str(app.style().objectName()).lower() != "fusion":
             app.setStyle("Fusion")
+        # Per-widget wheel filter: installed directly on each spin/combo
+        # after setup_* methods complete. See _install_wheel_filters().
+        self._wheel_filter = _WheelEventFilter(self)
         self.setObjectName("mainWindow")
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(True)
         self.setWindowTitle("G-Labs Multi-Account Automation App")
         self.resize(1280, 860)
-        self.setMinimumSize(1024, 600)
+        # Lower minimum so the window can fit on smaller laptops
+        # (13"/14" screens at 1366x768 or scaled displays). Scroll
+        # area handles overflow gracefully.
+        self.setMinimumSize(900, 560)
         self.setWindowState(Qt.WindowMaximized)
         
         self.central_widget = QWidget()
@@ -1304,6 +1753,11 @@ class MainWindow(QMainWindow):
         self.failed_jobs_refresh_timer.setInterval(400)
         self.failed_jobs_refresh_timer.timeout.connect(lambda: self._request_failed_jobs_refresh(force=False))
         self._apply_modern_theme()
+        # Install per-widget wheel filter on every spin/combo box in
+        # the app. Must happen after setup_* methods have created the
+        # widgets. The filter consumes wheel events and forwards them
+        # to the parent scroll area.
+        self._install_wheel_filters()
         self._update_runtime_badges()
         self._pending_settings_sync_ready = True
         self.account_runtime_timer.start()
@@ -1485,7 +1939,7 @@ class MainWindow(QMainWindow):
         self.current_pipe_ref_paths = []
         self.bulk_panels = {}
 
-        saved_slots = max(1, min(40, get_int_setting("slots_per_account", 3)))
+        saved_slots = max(1, min(40, get_int_setting("slots_per_account", 5)))
         self._mode_tab_scrolls = {}
 
         self.mode_tabs = QTabWidget()
@@ -1539,6 +1993,10 @@ class MainWindow(QMainWindow):
         prompts_header.addWidget(self.btn_import_txt)
         prompts_layout.addLayout(prompts_header)
         self.prompts_input = QTextEdit()
+        # Disable rich-text acceptance so pasted content from websites
+        # or docs doesn't carry black text color / fonts / styling.
+        # Qt strips formatting and inserts plain text only.
+        self.prompts_input.setAcceptRichText(False)
         self.prompts_input.setPlaceholderText(
             "Paste your prompts here, one per line...\n\n"
             "Example:\n"
@@ -1565,9 +2023,18 @@ class MainWindow(QMainWindow):
             "- No limit on number of prompts\n"
             "- Detailed prompts = better results"
         )
-        self.btn_add_to_queue = QPushButton("＋  Add to Queue")
-        self.btn_add_to_queue.setProperty("role", "primaryGradient")
-        self.btn_add_to_queue.setText("+  Add to Queue")
+        # Phase 3: Add to Queue → Fluent PrimaryPushButton with + icon
+        _AddBtnCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_add_to_queue = _AddBtnCls()
+        self.btn_add_to_queue.setText("Add to Queue")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_add_to_queue.setIcon(FluentIcon.ADD)
+            except Exception:
+                pass
+        else:
+            self.btn_add_to_queue.setProperty("role", "primaryGradient")
+            self.btn_add_to_queue.setText("+  Add to Queue")
         self.btn_add_to_queue.setFixedHeight(34)
         self.btn_add_to_queue.clicked.connect(self.add_prompts_to_queue)
         prompts_layout.addWidget(self.btn_add_to_queue)
@@ -1684,14 +2151,22 @@ class MainWindow(QMainWindow):
         self.lbl_logs_title.setStyleSheet("color: white; font-size: 14px; font-weight: 700;")
         logs_header.addWidget(self.lbl_logs_title)
         logs_header.addStretch()
-        self.btn_clear_logs = QPushButton("Clear")
-        self.btn_clear_logs.setFixedHeight(26)
-        self.btn_clear_logs.setFixedWidth(60)
-        self.btn_clear_logs.setStyleSheet(
-            "QPushButton { background-color: #334155; color: #94A3B8; font-size: 11px; "
-            "border: 1px solid #475569; border-radius: 3px; } "
-            "QPushButton:hover { background-color: #475569; }"
-        )
+        _ClearLogsCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_clear_logs = _ClearLogsCls()
+        self.btn_clear_logs.setText("Clear")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_clear_logs.setIcon(FluentIcon.BROOM)
+            except Exception:
+                pass
+        self.btn_clear_logs.setFixedHeight(30)
+        self.btn_clear_logs.setFixedWidth(90)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_clear_logs.setStyleSheet(
+                "QPushButton { background-color: #334155; color: #94A3B8; font-size: 11px; "
+                "border: 1px solid #475569; border-radius: 3px; } "
+                "QPushButton:hover { background-color: #475569; }"
+            )
         self.btn_clear_logs.clicked.connect(self._clear_logs)
         logs_header.addWidget(self.btn_clear_logs)
         logs_layout.addLayout(logs_header)
@@ -1706,20 +2181,32 @@ class MainWindow(QMainWindow):
         self.log_buffer = LogBuffer(self.logs_output, self, interval_ms=180)
         self._apply_card_shadow(self.logs_widget, blur=24, y_offset=8)
 
-        self.btn_start = QPushButton("▶  Start Automation")
+        # Phase 3: Main toolbar action buttons — Fluent PrimaryPushButton
+        # for blue "go" actions, PushButton with color override for
+        # Pause (orange) and Stop (red) so semantic colors are preserved.
+        _StartBtnCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_start = _StartBtnCls()
         self.btn_start.setText("Start Automation")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_start.setIcon(FluentIcon.PLAY)
+            except Exception:
+                pass
         self.btn_start.setFixedHeight(34)
-        self.btn_start.setMinimumWidth(110)
-        self.btn_start.setStyleSheet(
-            "QPushButton { background-color: #2563EB; color: white; font-size: 13px; font-weight: 700; "
-            "border: none; border-radius: 7px; padding: 0 18px; } "
-            "QPushButton:hover { background-color: #3B82F6; } "
-            "QPushButton:disabled { background-color: #1E3A5F; color: #64748B; }"
-        )
+        self.btn_start.setMinimumWidth(140)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_start.setStyleSheet(
+                "QPushButton { background-color: #2563EB; color: white; font-size: 13px; font-weight: 700; "
+                "border: none; border-radius: 7px; padding: 0 18px; } "
+                "QPushButton:hover { background-color: #3B82F6; } "
+                "QPushButton:disabled { background-color: #1E3A5F; color: #64748B; }"
+            )
         self.btn_start.clicked.connect(self.start_queue_manager)
 
-        self.btn_pause = QPushButton("⏸  Pause")
-        self.btn_pause.setText("Pause")
+        # Pause: keep stock QPushButton — Fluent PushButton's internal
+        # paint conflicts with our orange color override, causing icon/
+        # text overlap. Colored action buttons work best with plain QSS.
+        self.btn_pause = QPushButton("Pause")
         self.btn_pause.setFixedHeight(30)
         self.btn_pause.setFixedWidth(84)
         self.btn_pause.setStyleSheet(
@@ -1730,20 +2217,26 @@ class MainWindow(QMainWindow):
         )
         self.btn_pause.clicked.connect(self.pause_queue_manager)
 
-        self.btn_resume = QPushButton("▶  Resume")
+        self.btn_resume = _StartBtnCls()
         self.btn_resume.setText("Resume")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_resume.setIcon(FluentIcon.PLAY)
+            except Exception:
+                pass
         self.btn_resume.setFixedHeight(30)
-        self.btn_resume.setFixedWidth(84)
-        self.btn_resume.setStyleSheet(
-            "QPushButton { background-color: #1D4ED8; color: white; font-size: 12px; font-weight: 600; "
-            "border: none; border-radius: 6px; } "
-            "QPushButton:hover { background-color: #3B82F6; } "
-            "QPushButton:disabled { background-color: #1E3A5F; color: #64748B; }"
-        )
+        self.btn_resume.setFixedWidth(94)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_resume.setStyleSheet(
+                "QPushButton { background-color: #1D4ED8; color: white; font-size: 12px; font-weight: 600; "
+                "border: none; border-radius: 6px; } "
+                "QPushButton:hover { background-color: #3B82F6; } "
+                "QPushButton:disabled { background-color: #1E3A5F; color: #64748B; }"
+            )
         self.btn_resume.clicked.connect(self.resume_queue_manager)
 
-        self.btn_stop = QPushButton("⏹  Stop")
-        self.btn_stop.setText("Stop")
+        # Stop: same story as Pause — stock QPushButton + red QSS.
+        self.btn_stop = QPushButton("Stop")
         self.btn_stop.setFixedHeight(30)
         self.btn_stop.setFixedWidth(84)
         self.btn_stop.setStyleSheet(
@@ -1754,18 +2247,39 @@ class MainWindow(QMainWindow):
         )
         self.btn_stop.clicked.connect(self.stop_queue_manager)
 
-        self.btn_clear_queue = QPushButton("Clear Queue")
-        self.btn_clear_queue.setFixedHeight(26)
-        self.btn_clear_queue.setStyleSheet(
-            "QPushButton { background-color: #334155; color: #94A3B8; font-size: 11px; "
-            "border: 1px solid #475569; border-radius: 4px; padding: 0 10px; } "
-            "QPushButton:hover { background-color: #475569; color: white; }"
-        )
+        # Phase 3 + Fix: Queue clear buttons → Fluent PushButton with
+        # BROOM icon. TransparentPushButton was too subtle (text floating
+        # with no border). PushButton gives visible Fluent border +
+        # hover state so users can actually see the button.
+        _ClearBtnCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_clear_queue = _ClearBtnCls()
+        self.btn_clear_queue.setText("Clear Queue")
+        self.btn_clear_queue.setFixedHeight(30)
+        self.btn_clear_queue.setMinimumWidth(110)
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_clear_queue.setIcon(FluentIcon.DELETE)
+            except Exception:
+                pass
+        else:
+            self.btn_clear_queue.setStyleSheet(
+                "QPushButton { background-color: #334155; color: #94A3B8; font-size: 11px; "
+                "border: 1px solid #475569; border-radius: 4px; padding: 0 10px; } "
+                "QPushButton:hover { background-color: #475569; color: white; }"
+            )
         self.btn_clear_queue.clicked.connect(self.clear_queue)
 
-        self.btn_clear_done = QPushButton("Clear Done")
-        self.btn_clear_done.setFixedHeight(26)
-        self.btn_clear_done.setStyleSheet(self.btn_clear_queue.styleSheet())
+        self.btn_clear_done = _ClearBtnCls()
+        self.btn_clear_done.setText("Clear Done")
+        self.btn_clear_done.setFixedHeight(30)
+        self.btn_clear_done.setMinimumWidth(110)
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_clear_done.setIcon(FluentIcon.ACCEPT)
+            except Exception:
+                pass
+        else:
+            self.btn_clear_done.setStyleSheet(self.btn_clear_queue.styleSheet())
         self.btn_clear_done.clicked.connect(self.clear_completed_jobs_from_queue)
 
         self.toolbar_actions_layout.addWidget(self.btn_start)
@@ -1775,10 +2289,29 @@ class MainWindow(QMainWindow):
         queue_header_wrap.addWidget(self.btn_clear_queue)
         queue_header_wrap.addWidget(self.btn_clear_done)
 
+        # ── Responsive scroll wrapper ─────────────────────────────
+        # Wrap dashboard_content in a QScrollArea so small screens
+        # scroll gracefully instead of cramping everything, and large
+        # screens still show everything without waste. The scroll area
+        # sits inside the top half of the vertical splitter with
+        # logs_widget beneath it.
+        self.dashboard_scroll = QScrollArea()
+        self.dashboard_scroll.setObjectName("dashboardScroll")
+        self.dashboard_scroll.setWidgetResizable(True)
+        self.dashboard_scroll.setFrameShape(QFrame.NoFrame)
+        self.dashboard_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.dashboard_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.dashboard_scroll.setWidget(self.dashboard_content)
+
         self.main_splitter = QSplitter(Qt.Vertical)
-        self.main_splitter.addWidget(self.dashboard_content)
+        self.main_splitter.addWidget(self.dashboard_scroll)
         self.main_splitter.addWidget(self.logs_widget)
-        self.main_splitter.setSizes([720, 280])
+        # Use stretch factors instead of hard-coded pixel sizes so the
+        # split scales proportionally on any screen (75% content,
+        # 25% logs).
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([720, 240])
         self.main_splitter.setCollapsible(0, False)
         self.main_splitter.setCollapsible(1, True)
         self.main_splitter.setHandleWidth(6)
@@ -1797,9 +2330,37 @@ class MainWindow(QMainWindow):
 
     def setup_live_generation(self):
         layout = QVBoxLayout(self.tab_live_generation)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 12)
+        layout.setSpacing(14)
 
+        # ── Header card: stats + progress bar in one panel ──
+        header_card = QFrame()
+        header_card.setObjectName("liveHeaderCard")
+        header_card.setStyleSheet(
+            "#liveHeaderCard {"
+            "  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #1E293B, stop:1 #172033);"
+            "  border: 1px solid #334155; border-radius: 14px;"
+            "}"
+        )
+        header_vbox = QVBoxLayout(header_card)
+        header_vbox.setContentsMargins(18, 16, 18, 16)
+        header_vbox.setSpacing(14)
+
+        # Title row
+        title_row = QHBoxLayout()
+        live_icon = QLabel("⚡")
+        live_icon.setStyleSheet("font-size: 18px; background: transparent; border: none;")
+        live_title = QLabel("Live Generation")
+        live_title.setStyleSheet(
+            "color: #F8FAFC; font-size: 17px; font-weight: 800; letter-spacing: 0.5px;"
+            " background: transparent; border: none;"
+        )
+        title_row.addWidget(live_icon)
+        title_row.addWidget(live_title)
+        title_row.addStretch()
+        header_vbox.addLayout(title_row)
+
+        # Stats row
         stats_bar = QHBoxLayout()
         stats_bar.setSpacing(10)
         self.live_stat_total = self._create_live_stat("0", "Total", "#94A3B8")
@@ -1815,36 +2376,73 @@ class MainWindow(QMainWindow):
             self.live_stat_pending,
         ):
             stats_bar.addWidget(card, 1)
-        layout.addLayout(stats_bar)
+        header_vbox.addLayout(stats_bar)
 
-        progress_wrap = QFrame()
-        progress_wrap.setObjectName("dashboardPanel")
-        progress_layout = QVBoxLayout(progress_wrap)
-        progress_layout.setContentsMargins(14, 14, 14, 14)
-        progress_layout.setSpacing(8)
-        progress_title = QLabel("Overall Progress")
-        progress_title.setObjectName("tabSectionTitle")
-        progress_layout.addWidget(progress_title)
+        # Progress bar
+        progress_label = QLabel("Overall Progress")
+        progress_label.setStyleSheet(
+            "color: #94A3B8; font-size: 11px; font-weight: 700; letter-spacing: 1px;"
+            " text-transform: uppercase; background: transparent; border: none;"
+        )
+        header_vbox.addWidget(progress_label)
         self.live_progress_bar = QProgressBar()
         self.live_progress_bar.setRange(0, 100)
         self.live_progress_bar.setValue(0)
         self.live_progress_bar.setTextVisible(True)
         self.live_progress_bar.setFormat("No jobs")
-        self.live_progress_bar.setFixedHeight(28)
+        self.live_progress_bar.setFixedHeight(30)
         self.live_progress_bar.setObjectName("liveOverallProgress")
-        progress_layout.addWidget(self.live_progress_bar)
-        layout.addWidget(progress_wrap)
-        self._apply_card_shadow(progress_wrap, blur=24, y_offset=8)
+        header_vbox.addWidget(self.live_progress_bar)
 
+        layout.addWidget(header_card)
+        self._apply_card_shadow(header_card, blur=28, y_offset=8)
+
+        # ── Grid Section ──
         grid_wrap = QFrame()
-        grid_wrap.setObjectName("dashboardPanel")
+        grid_wrap.setObjectName("liveGridPanel")
+        grid_wrap.setStyleSheet(
+            "#liveGridPanel {"
+            "  background: #111827; border: 1px solid #1E293B;"
+            "  border-top: 1px solid #334155; border-radius: 14px;"
+            "}"
+        )
         grid_layout = QVBoxLayout(grid_wrap)
-        grid_layout.setContentsMargins(14, 14, 14, 14)
+        grid_layout.setContentsMargins(16, 14, 16, 14)
         grid_layout.setSpacing(10)
 
+        # Grid header row
+        grid_header = QHBoxLayout()
+        grid_title_icon = QLabel("🎨")
+        grid_title_icon.setStyleSheet("font-size: 15px; background: transparent; border: none;")
         grid_title = QLabel("Active Grid")
-        grid_title.setObjectName("tabSectionTitle")
-        grid_layout.addWidget(grid_title)
+        grid_title.setStyleSheet(
+            "color: #F8FAFC; font-size: 14px; font-weight: 700; background: transparent; border: none;"
+        )
+        grid_header.addWidget(grid_title_icon)
+        grid_header.addWidget(grid_title)
+        grid_header.addStretch()
+
+        # Grid size selector inline in header
+        sz_label = QLabel("Grid Size")
+        sz_label.setStyleSheet(
+            "color: #64748B; font-size: 11px; font-weight: 600; background: transparent; border: none;"
+        )
+        grid_header.addWidget(sz_label)
+        self.cmb_grid_size = self._create_setting_combo(
+            [("Small", "small"), ("Medium", "medium"), ("Large", "large")],
+            current_data="medium",
+            trigger_sync=False,
+        )
+        self.cmb_grid_size.setFixedWidth(100)
+        self.cmb_grid_size.currentIndexChanged.connect(self._refresh_live_grid)
+        grid_header.addWidget(self.cmb_grid_size)
+        grid_layout.addLayout(grid_header)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("background: #1E293B; border: none; max-height: 1px;")
+        grid_layout.addWidget(sep)
 
         self.grid_scroll = QScrollArea()
         self.grid_scroll.setWidgetResizable(True)
@@ -1858,20 +2456,21 @@ class MainWindow(QMainWindow):
         self.grid_scroll.setWidget(self.live_grid_widget)
         grid_layout.addWidget(self.grid_scroll, 1)
 
+        # Bottom bar
         bottom_bar = QHBoxLayout()
         bottom_bar.setSpacing(10)
-        bottom_bar.addWidget(QLabel("Grid Size:"))
-        self.cmb_grid_size = self._create_setting_combo(
-            [("Small", "small"), ("Medium", "medium"), ("Large", "large")],
-            current_data="medium",
-            trigger_sync=False,
-        )
-        self.cmb_grid_size.currentIndexChanged.connect(self._refresh_live_grid)
-        bottom_bar.addWidget(self.cmb_grid_size)
         bottom_bar.addStretch()
 
-        self.btn_open_outputs = QPushButton("📂 Open Outputs Folder")
-        self.btn_open_outputs.setProperty("role", "browse")
+        _BtnCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_open_outputs = _BtnCls("📂  Open Outputs Folder")
+        self.btn_open_outputs.setObjectName("liveOpenOutputsBtn")
+        self.btn_open_outputs.setStyleSheet(
+            "#liveOpenOutputsBtn {"
+            "  background: #1E293B; color: #E2E8F0; border: 1px solid #334155;"
+            "  border-radius: 8px; padding: 7px 18px; font-weight: 600; font-size: 12px;"
+            "}"
+            "#liveOpenOutputsBtn:hover { background: #263449; border-color: #3B82F6; }"
+        )
         self.btn_open_outputs.clicked.connect(self._open_outputs_folder)
         bottom_bar.addWidget(self.btn_open_outputs)
         grid_layout.addLayout(bottom_bar)
@@ -1884,23 +2483,31 @@ class MainWindow(QMainWindow):
 
     def _create_live_stat(self, count_text, label_text, color):
         card = QFrame()
-        card.setObjectName("statCard")
+        card.setObjectName("liveStatCard")
+        card.setStyleSheet(
+            f"QFrame#liveStatCard {{"
+            f"  background: #0F172A; border: 1px solid #1E293B; border-radius: 12px;"
+            f"  border-top: 3px solid {color};"
+            f"}}"
+            f"QFrame#liveStatCard:hover {{ background: #162033; border-color: #334155; border-top: 3px solid {color}; }}"
+        )
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(14, 12, 14, 12)
-        card_layout.setSpacing(4)
+        card_layout.setContentsMargins(14, 14, 14, 10)
+        card_layout.setSpacing(2)
 
         count_label = QLabel(str(count_text))
         count_label.setStyleSheet(
-            f"color: {color}; font-size: 26px; font-weight: 800; background: transparent; border: none;"
+            f"color: {color}; font-size: 28px; font-weight: 900; background: transparent; border: none;"
         )
-        label = QLabel(label_text)
+        count_label.setAlignment(Qt.AlignCenter)
+        label = QLabel(label_text.upper())
         label.setStyleSheet(
-            "color: #64748B; font-size: 11px; font-weight: 700; letter-spacing: 1px; background: transparent; border: none;"
+            "color: #64748B; font-size: 10px; font-weight: 700; letter-spacing: 1.5px; background: transparent; border: none;"
         )
+        label.setAlignment(Qt.AlignCenter)
         card_layout.addWidget(count_label)
         card_layout.addWidget(label)
         card._count_label = count_label
-        self._apply_card_shadow(card, blur=18, y_offset=6)
         return card
 
     def _default_outputs_dir(self):
@@ -2553,10 +3160,10 @@ class MainWindow(QMainWindow):
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self.img_cmb_model = self._create_setting_combo([
-            ("Imagen 4", "Imagen 4"),
-            ("Nano Banana Pro", "Nano Banana Pro"),
             ("Nano Banana 2", "Nano Banana 2"),
-        ], current_data="Imagen 4")
+            ("Nano Banana Pro", "Nano Banana Pro"),
+            ("Imagen 4", "Imagen 4"),
+        ], current_data="Nano Banana 2")
         self.img_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
             ("Standard (4:3)", "Standard (4:3)"),
@@ -2940,8 +3547,18 @@ class MainWindow(QMainWindow):
 
         pipe_actions = QHBoxLayout()
         pipe_actions.addStretch()
-        self.pipe_btn_add_bulk = QPushButton("Add All to Queue")
-        self.pipe_btn_add_bulk.setProperty("role", "primaryGradient")
+        _PipeAddCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.pipe_btn_add_bulk = _PipeAddCls()
+        self.pipe_btn_add_bulk.setText("Add All to Queue")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.pipe_btn_add_bulk.setIcon(FluentIcon.ADD)
+            except Exception:
+                pass
+        else:
+            self.pipe_btn_add_bulk.setProperty("role", "primaryGradient")
+        self.pipe_btn_add_bulk.setFixedHeight(36)
+        self.pipe_btn_add_bulk.setMinimumWidth(180)
         self.pipe_btn_add_bulk.clicked.connect(self._add_pipeline_to_queue)
         pipe_actions.addWidget(self.pipe_btn_add_bulk)
         layout.addLayout(pipe_actions)
@@ -3076,6 +3693,7 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(tbl_images)
 
         prompts_input = QTextEdit()
+        prompts_input.setAcceptRichText(False)
         prompts_input.setPlaceholderText("Prompts, one per line. Line 1 pairs with image 1.")
         prompts_input.setMinimumHeight(84)
         prompts_input.verticalScrollBar().setSingleStep(6)
@@ -3100,10 +3718,19 @@ class MainWindow(QMainWindow):
         lbl_hint.setWordWrap(True)
         panel_layout.addWidget(lbl_hint)
 
-        btn_add = QPushButton()
+        _BulkAddCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        btn_add = _BulkAddCls()
         btn_add.setText("Add All to Queue")
-        btn_add.setProperty("role", "primaryGradient")
-        btn_add.setStyleSheet(add_style)
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                btn_add.setIcon(FluentIcon.ADD)
+            except Exception:
+                pass
+        else:
+            btn_add.setProperty("role", "primaryGradient")
+            btn_add.setStyleSheet(add_style)
+        btn_add.setFixedHeight(36)
+        btn_add.setMinimumWidth(180)
         btn_add.clicked.connect(lambda _=False, key=mode_key: self.add_bulk_i2v_to_queue(key))
         panel_layout.addWidget(btn_add, alignment=Qt.AlignLeft)
         panel_layout.addStretch()
@@ -3134,28 +3761,31 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
+        # ── Account Health Monitor overview card ──────────────────
         overview = QFrame()
         overview.setObjectName("accountOverviewCard")
         overview_layout = QHBoxLayout(overview)
-        overview_layout.setContentsMargins(14, 10, 14, 10)
-        overview_layout.setSpacing(8)
+        overview_layout.setContentsMargins(20, 14, 20, 14)
+        overview_layout.setSpacing(10)
         overview_title = QLabel("Account Health Monitor")
         overview_title.setObjectName("accountOverviewTitle")
         overview_layout.addWidget(overview_title)
         overview_layout.addStretch()
 
-        self.lbl_acc_total = QLabel("Total: 0")
-        self.lbl_acc_total.setObjectName("accountMetricChip")
-        self.lbl_acc_logged_in = QLabel("Logged In: 0")
-        self.lbl_acc_logged_in.setObjectName("accountMetricChip")
-        self.lbl_acc_logged_out = QLabel("Logged Out: 0")
-        self.lbl_acc_logged_out.setObjectName("accountMetricChip")
-        self.lbl_acc_running = QLabel("Running: 0")
-        self.lbl_acc_running.setObjectName("accountMetricChip")
-        self.lbl_acc_cooldown = QLabel("Cooldown: 0")
-        self.lbl_acc_cooldown.setObjectName("accountMetricChip")
-        self.lbl_acc_ready = QLabel("Ready: 0")
-        self.lbl_acc_ready.setObjectName("accountMetricChip")
+        # Colored metric chips — each has its own variant via property
+        # so the QSS can tint them individually (green/blue/orange/gray).
+        def _mk_chip(text, variant):
+            lbl = QLabel(text)
+            lbl.setObjectName("accountMetricChip")
+            lbl.setProperty("variant", variant)
+            return lbl
+
+        self.lbl_acc_total = _mk_chip("Total: 0", "neutral")
+        self.lbl_acc_logged_in = _mk_chip("Logged In: 0", "success")
+        self.lbl_acc_logged_out = _mk_chip("Logged Out: 0", "muted")
+        self.lbl_acc_running = _mk_chip("Running: 0", "info")
+        self.lbl_acc_cooldown = _mk_chip("Cooldown: 0", "warning")
+        self.lbl_acc_ready = _mk_chip("Ready: 0", "success")
 
         overview_layout.addWidget(self.lbl_acc_total)
         overview_layout.addWidget(self.lbl_acc_logged_in)
@@ -3164,25 +3794,43 @@ class MainWindow(QMainWindow):
         overview_layout.addWidget(self.lbl_acc_cooldown)
         overview_layout.addWidget(self.lbl_acc_ready)
         layout.addWidget(overview)
-        
+
+        # ── Add New Google Account card ───────────────────────────
         add_group = QGroupBox("Add New Google Account Session")
         add_layout = QGridLayout()
-        add_layout.setHorizontalSpacing(10)
-        add_layout.setVerticalSpacing(8)
+        add_layout.setHorizontalSpacing(12)
+        add_layout.setVerticalSpacing(10)
+        add_layout.setContentsMargins(4, 4, 4, 4)
+
+        lbl_acc_name_head = QLabel("Account Name")
+        lbl_acc_name_head.setObjectName("settingLabel")
+        lbl_acc_proxy_head = QLabel("Proxy")
+        lbl_acc_proxy_head.setObjectName("settingLabel")
+
         self.acc_name_input = QLineEdit()
         self.acc_name_input.setPlaceholderText("Optional alias (leave blank for auto Gmail)")
-        self.acc_name_input.setMinimumHeight(36)
+        self.acc_name_input.setMinimumHeight(38)
         self.acc_proxy_input = QLineEdit()
         self.acc_proxy_input.setPlaceholderText("Optional proxy: socks5://user:pass@host:port")
-        self.acc_proxy_input.setMinimumHeight(36)
-        self.btn_login = QPushButton("Login to Google (New Browser)")
-        self.btn_login.setProperty("role", "primary")
-        self.btn_login.setMinimumHeight(38)
+        self.acc_proxy_input.setMinimumHeight(38)
+
+        _LoginBtnCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_login = _LoginBtnCls()
+        self.btn_login.setText("Login to Google (New Browser)")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_login.setIcon(FluentIcon.PEOPLE)
+            except Exception:
+                pass
+        else:
+            self.btn_login.setProperty("role", "primary")
+        self.btn_login.setMinimumHeight(86)
+        self.btn_login.setMinimumWidth(240)
         self.btn_login.clicked.connect(self.start_login)
-        
-        add_layout.addWidget(QLabel("Account Name"), 0, 0)
+
+        add_layout.addWidget(lbl_acc_name_head, 0, 0)
         add_layout.addWidget(self.acc_name_input, 0, 1)
-        add_layout.addWidget(QLabel("Proxy"), 1, 0)
+        add_layout.addWidget(lbl_acc_proxy_head, 1, 0)
         add_layout.addWidget(self.acc_proxy_input, 1, 1)
         add_layout.addWidget(self.btn_login, 0, 2, 2, 1)
         add_layout.setColumnStretch(1, 1)
@@ -3343,25 +3991,58 @@ class MainWindow(QMainWindow):
         self.load_accounts()
         
     def setup_failed_jobs(self):
-        layout = QVBoxLayout(self.tab_failed_jobs)
-        layout.setContentsMargins(10, 10, 10, 10)
+        root = QVBoxLayout(self.tab_failed_jobs)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(14)
 
-        top_controls = QHBoxLayout()
+        # ── Page header card (matches Settings page style) ─────────
+        header_wrap = QFrame()
+        header_wrap.setObjectName("settingsHeader")
+        header_layout = QHBoxLayout(header_wrap)
+        header_layout.setContentsMargins(22, 18, 22, 18)
+        header_layout.setSpacing(14)
+
+        header_text_col = QVBoxLayout()
+        header_text_col.setSpacing(4)
+        header_title = QLabel("Failed Jobs")
+        header_title.setObjectName("settingsPageTitle")
+        header_subtitle = QLabel(
+            "Review, edit, and retry jobs that failed during generation. "
+            "Edit prompts directly in the table before retrying."
+        )
+        header_subtitle.setObjectName("settingsPageSubtitle")
+        header_subtitle.setWordWrap(True)
+        header_text_col.addWidget(header_title)
+        header_text_col.addWidget(header_subtitle)
+        header_layout.addLayout(header_text_col, 1)
+
         self.chk_select_all_failed = QCheckBox("Select All")
         self.chk_select_all_failed.clicked.connect(self._toggle_select_all_failed)
-        top_controls.addWidget(self.chk_select_all_failed)
-        top_controls.addStretch()
-        layout.addLayout(top_controls)
+        header_layout.addWidget(self.chk_select_all_failed, 0, Qt.AlignRight)
+        root.addWidget(header_wrap)
+
+        # ── Table card ─────────────────────────────────────────────
+        table_card = QFrame()
+        table_card.setObjectName("failedJobsCard")
+        table_card_layout = QVBoxLayout(table_card)
+        table_card_layout.setContentsMargins(2, 2, 2, 2)
+        table_card_layout.setSpacing(0)
 
         self.failed_table = QTableWidget(0, 7)
+        self.failed_table.setObjectName("failedJobsTable")
         self.failed_table.setHorizontalHeaderLabels(
             ["✓", "#", "Prompt", "Type", "Error Reason", "Original Prompt", "Status"]
         )
         self.failed_table.verticalHeader().setVisible(False)
-        self.failed_table.setAlternatingRowColors(True)
+        self.failed_table.verticalHeader().setDefaultSectionSize(48)
+        # Disable alternating row colors so per-item setBackground
+        # (status badges, moderation tints) paints cleanly without
+        # the QSS alternate-background fighting it.
+        self.failed_table.setAlternatingRowColors(False)
         self.failed_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.failed_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.failed_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.failed_table.setShowGrid(False)
         self.failed_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.failed_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.failed_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
@@ -3369,60 +4050,263 @@ class MainWindow(QMainWindow):
         self.failed_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.failed_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.failed_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.failed_table.horizontalHeader().setHighlightSections(False)
         self.failed_table.itemSelectionChanged.connect(self._update_failed_jobs_actions)
         self.failed_table.itemChanged.connect(self._on_failed_table_item_changed)
         self._configure_table_scrolling(self.failed_table)
-        layout.addWidget(self.failed_table)
-        
-        bottom_layout = QHBoxLayout()
-        self.btn_refresh_failed = QPushButton("Refresh List")
-        self.btn_refresh_failed.setProperty("role", "secondary")
-        self.btn_refresh_failed.clicked.connect(self.load_failed_jobs)
 
-        self.btn_requeue_selected = QPushButton("🔄 Retry Selected")
-        self.btn_requeue_selected.setProperty("role", "warning")
+        # Empty-state overlay — shown when table has 0 rows
+        self.failed_empty_overlay = QLabel(
+            "No failed jobs\n\nWhen a job fails, it'll show up here so you can edit and retry."
+        )
+        self.failed_empty_overlay.setObjectName("failedJobsEmpty")
+        self.failed_empty_overlay.setAlignment(Qt.AlignCenter)
+        self.failed_empty_overlay.setWordWrap(True)
+
+        stack_wrap = QWidget()
+        stack_layout = QVBoxLayout(stack_wrap)
+        stack_layout.setContentsMargins(0, 0, 0, 0)
+        stack_layout.setSpacing(0)
+        stack_layout.addWidget(self.failed_table)
+        stack_layout.addWidget(self.failed_empty_overlay)
+        table_card_layout.addWidget(stack_wrap)
+        root.addWidget(table_card, 1)
+
+        # ── Bottom action bar ──────────────────────────────────────
+        actions_wrap = QFrame()
+        actions_wrap.setObjectName("failedJobsActionsBar")
+        actions_layout = QHBoxLayout(actions_wrap)
+        actions_layout.setContentsMargins(22, 14, 22, 14)
+        actions_layout.setSpacing(10)
+
+        _RefreshCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_refresh_failed = _RefreshCls()
+        self.btn_refresh_failed.setText("Refresh List")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_refresh_failed.setIcon(FluentIcon.SYNC)
+            except Exception:
+                pass
+        else:
+            self.btn_refresh_failed.setProperty("role", "secondary")
+        self.btn_refresh_failed.setFixedHeight(36)
+        # Wrap in lambda — otherwise clicked(bool) payload is passed
+        # to load_failed_jobs as `jobs=False`, which wipes the table.
+        self.btn_refresh_failed.clicked.connect(lambda: self.load_failed_jobs())
+
+        _RetrySelCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_requeue_selected = _RetrySelCls()
+        self.btn_requeue_selected.setText("Retry Selected")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_requeue_selected.setIcon(FluentIcon.PLAY)
+            except Exception:
+                pass
+        else:
+            self.btn_requeue_selected.setProperty("role", "warning")
+        self.btn_requeue_selected.setFixedHeight(36)
+        self.btn_requeue_selected.setMinimumWidth(150)
         self.btn_requeue_selected.clicked.connect(self._retry_selected_failed)
 
-        self.btn_retry_all_failed = QPushButton("🔄 Retry All Failed")
-        self.btn_retry_all_failed.setProperty("role", "warning")
+        _RetryAllCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_retry_all_failed = _RetryAllCls()
+        self.btn_retry_all_failed.setText("Retry All Failed")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_retry_all_failed.setIcon(FluentIcon.UPDATE)
+            except Exception:
+                pass
+        else:
+            self.btn_retry_all_failed.setProperty("role", "warning")
+        self.btn_retry_all_failed.setFixedHeight(36)
+        self.btn_retry_all_failed.setMinimumWidth(150)
         self.btn_retry_all_failed.clicked.connect(self._retry_all_failed)
 
-        self.btn_copy_failed = QPushButton("📋 Copy Failed Prompts")
-        self.btn_copy_failed.setProperty("role", "secondary")
+        _CopyCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_copy_failed = _CopyCls()
+        self.btn_copy_failed.setText("Copy All Prompts")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_copy_failed.setIcon(FluentIcon.COPY)
+            except Exception:
+                pass
+        else:
+            self.btn_copy_failed.setProperty("role", "secondary")
+        self.btn_copy_failed.setFixedHeight(36)
+        self.btn_copy_failed.setToolTip(
+            "Copy every failed prompt to clipboard (one per line).\n"
+            "Paste into your AI tool, rewrite them, then use Paste Rewritten\n"
+            "to apply the rewrites back in order."
+        )
         self.btn_copy_failed.clicked.connect(self.copy_failed_prompts)
 
+        _PasteCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_paste_failed = _PasteCls()
+        self.btn_paste_failed.setText("Paste Rewritten")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_paste_failed.setIcon(FluentIcon.PASTE)
+            except Exception:
+                pass
+        else:
+            self.btn_paste_failed.setProperty("role", "secondary")
+        self.btn_paste_failed.setFixedHeight(36)
+        self.btn_paste_failed.setToolTip(
+            "Read rewritten prompts from clipboard (one per line) and\n"
+            "apply them to failed jobs in order. The first line replaces\n"
+            "the first failed job's prompt, the second line the second, etc.\n"
+            "Count must match the number of failed jobs."
+        )
+        self.btn_paste_failed.clicked.connect(self.paste_rewritten_failed_prompts)
+
+        # Clear Failed: stock QPushButton with red override (same
+        # pattern as Pause/Stop/Clean Profiles — Fluent PushButton
+        # conflicts with color overrides).
         self.btn_clear_failed = QPushButton("Clear Failed")
-        self.btn_clear_failed.setProperty("role", "subtleDanger")
+        self.btn_clear_failed.setStyleSheet(
+            "QPushButton { background-color: #DC2626; color: white; padding: 8px 18px; "
+            "border-radius: 7px; font-weight: 700; border: none; min-height: 36px; "
+            "font-size: 12px; } "
+            "QPushButton:hover { background-color: #EF4444; } "
+            "QPushButton:pressed { background-color: #B91C1C; } "
+            "QPushButton:disabled { background-color: #334155; color: #64748B; }"
+        )
+        self.btn_clear_failed.setCursor(Qt.PointingHandCursor)
         self.btn_clear_failed.clicked.connect(self.clear_failed_jobs_list)
-        
-        bottom_layout.addWidget(self.btn_refresh_failed)
-        bottom_layout.addStretch()
-        bottom_layout.addWidget(self.btn_requeue_selected)
-        bottom_layout.addWidget(self.btn_retry_all_failed)
-        bottom_layout.addWidget(self.btn_copy_failed)
-        bottom_layout.addWidget(self.btn_clear_failed)
-        layout.addLayout(bottom_layout)
-        
+
+        actions_layout.addWidget(self.btn_refresh_failed)
+        actions_layout.addStretch()
+        actions_layout.addWidget(self.btn_copy_failed)
+        actions_layout.addWidget(self.btn_paste_failed)
+        actions_layout.addWidget(self.btn_requeue_selected)
+        actions_layout.addWidget(self.btn_retry_all_failed)
+        actions_layout.addWidget(self.btn_clear_failed)
+        root.addWidget(actions_wrap)
+
         self.load_failed_jobs()
+        self._update_failed_empty_state()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Settings page helpers — professional card/form layout building
+    # ──────────────────────────────────────────────────────────────────
+    def _settings_card(self, title, subtitle=""):
+        """Create a titled card container for a group of related settings.
+        Returns (card, form) where `form` is the QFormLayout to add rows to.
+        """
+        card = QGroupBox()
+        card.setObjectName("settingsCard")
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(22, 18, 22, 18)
+        outer.setSpacing(6)
+
+        title_lbl = QLabel(str(title))
+        title_lbl.setObjectName("settingsCardTitle")
+        outer.addWidget(title_lbl)
+        if subtitle:
+            sub_lbl = QLabel(str(subtitle))
+            sub_lbl.setObjectName("settingsCardSubtitle")
+            sub_lbl.setWordWrap(True)
+            outer.addWidget(sub_lbl)
+
+        divider = QFrame()
+        divider.setObjectName("settingsCardDivider")
+        divider.setFrameShape(QFrame.HLine)
+        divider.setFixedHeight(1)
+        outer.addWidget(divider)
+        outer.addSpacing(8)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(20)
+        form.setVerticalSpacing(12)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignTop | Qt.AlignLeft)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        outer.addLayout(form)
+        return card, form
+
+    def _settings_label(self, text, hint=None):
+        """Build a QLabel with settings-style formatting + optional tooltip."""
+        lbl = QLabel(str(text))
+        lbl.setObjectName("settingsRowLabel")
+        if hint:
+            lbl.setToolTip(str(hint))
+        return lbl
+
+    def _settings_range_row(self, spin_min, spin_max, suffix=""):
+        """Wrap two spinboxes (min + 'to' + max) into a single row widget."""
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+        row_layout.addWidget(spin_min)
+        sep = QLabel("to")
+        sep.setObjectName("settingsRowSeparator")
+        row_layout.addWidget(sep)
+        row_layout.addWidget(spin_max)
+        if suffix:
+            suffix_lbl = QLabel(str(suffix))
+            suffix_lbl.setObjectName("settingsRowSeparator")
+            row_layout.addWidget(suffix_lbl)
+        row_layout.addStretch()
+        return row
 
     def setup_settings(self):
-        layout = QVBoxLayout(self.tab_settings)
-        layout.setContentsMargins(10, 10, 10, 10)
+        # Outer scroll wrapper so long settings lists scroll cleanly on
+        # any screen size.
+        root = QVBoxLayout(self.tab_settings)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        perf_group = QGroupBox("Automation Engine")
-        perf_layout = QVBoxLayout()
+        settings_scroll = QScrollArea()
+        settings_scroll.setObjectName("settingsScrollArea")
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        slots_layout = QHBoxLayout()
-        slots_layout.addWidget(QLabel("Worker Slots Per Account:"))
+        scroll_content = QWidget()
+        scroll_content.setObjectName("settingsScrollContent")
+        layout = QVBoxLayout(scroll_content)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+
+        # ── Page header ───────────────────────────────────────────
+        header_wrap = QFrame()
+        header_wrap.setObjectName("settingsHeader")
+        header_layout = QVBoxLayout(header_wrap)
+        header_layout.setContentsMargins(22, 18, 22, 18)
+        header_layout.setSpacing(4)
+        header_title = QLabel("Settings")
+        header_title.setObjectName("settingsPageTitle")
+        header_subtitle = QLabel(
+            "Tune automation behavior, browser mode, stealth, and output location. "
+            "Changes are saved when you click Save Settings below."
+        )
+        header_subtitle.setObjectName("settingsPageSubtitle")
+        header_subtitle.setWordWrap(True)
+        header_layout.addWidget(header_title)
+        header_layout.addWidget(header_subtitle)
+        layout.addWidget(header_wrap)
+
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 1 — Performance & Parallelism
+        # ═══════════════════════════════════════════════════════════
+        perf_card, perf_form = self._settings_card(
+            "Performance & Parallelism",
+            "Control how many concurrent jobs run per account and how they're paced.",
+        )
+
         self.spin_slots_per_account = QSpinBox()
         self.spin_slots_per_account.setRange(1, 40)
-        self.spin_slots_per_account.setValue(max(1, min(40, get_int_setting("slots_per_account", 3))))
-        slots_layout.addWidget(self.spin_slots_per_account)
-        slots_layout.addStretch()
-        perf_layout.addLayout(slots_layout)
+        self.spin_slots_per_account.setValue(max(1, min(40, get_int_setting("slots_per_account", 5))))
+        self.spin_slots_per_account.setToolTip(
+            "How many generation jobs run in parallel per account. More slots = more RAM and CPU usage."
+        )
+        perf_form.addRow(
+            self._settings_label("Worker Slots Per Account"),
+            self.spin_slots_per_account,
+        )
 
-        stagger_layout = QHBoxLayout()
-        stagger_layout.addWidget(QLabel("Same-Account Stagger (sec):"))
         self.spin_same_account_stagger = QDoubleSpinBox()
         self.spin_same_account_stagger.setRange(0.0, 60.0)
         self.spin_same_account_stagger.setDecimals(1)
@@ -3430,12 +4314,15 @@ class MainWindow(QMainWindow):
         self.spin_same_account_stagger.setValue(
             max(0.0, min(60.0, get_float_setting("same_account_stagger_seconds", 1.0)))
         )
-        stagger_layout.addWidget(self.spin_same_account_stagger)
-        stagger_layout.addStretch()
-        perf_layout.addLayout(stagger_layout)
+        self.spin_same_account_stagger.setToolTip(
+            "Minimum delay between consecutive dispatches on the same account. "
+            "Prevents burst rate-limits when parallel slots are enabled."
+        )
+        perf_form.addRow(
+            self._settings_label("Same-Account Stagger (sec)"),
+            self.spin_same_account_stagger,
+        )
 
-        global_stagger_layout = QHBoxLayout()
-        global_stagger_layout.addWidget(QLabel("Global Stagger (sec):"))
         self.spin_global_stagger_min = QDoubleSpinBox()
         self.spin_global_stagger_min.setRange(0.0, 60.0)
         self.spin_global_stagger_min.setDecimals(1)
@@ -3443,8 +4330,6 @@ class MainWindow(QMainWindow):
         self.spin_global_stagger_min.setValue(
             max(0.0, min(60.0, get_float_setting("global_stagger_min_seconds", 0.3)))
         )
-        global_stagger_layout.addWidget(self.spin_global_stagger_min)
-        global_stagger_layout.addWidget(QLabel("to"))
         self.spin_global_stagger_max = QDoubleSpinBox()
         self.spin_global_stagger_max.setRange(0.0, 120.0)
         self.spin_global_stagger_max.setDecimals(1)
@@ -3453,86 +4338,81 @@ class MainWindow(QMainWindow):
         self.spin_global_stagger_max.setValue(
             max(self.spin_global_stagger_min.value(), min(120.0, saved_gmax))
         )
-        global_stagger_layout.addWidget(self.spin_global_stagger_max)
-        global_stagger_layout.addStretch()
-        perf_layout.addLayout(global_stagger_layout)
+        perf_form.addRow(
+            self._settings_label("Global Stagger (sec)"),
+            self._settings_range_row(self.spin_global_stagger_min, self.spin_global_stagger_max),
+        )
 
-        speed_profile_layout = QHBoxLayout()
-        speed_profile_layout.addWidget(QLabel("Speed Profile:"))
         self.cmb_speed_profile = QComboBox()
         self.cmb_speed_profile.addItem("Slow Stable", "stable")
         self.cmb_speed_profile.addItem("Fast", "fast")
         saved_speed_profile = str(get_setting("speed_profile", "fast") or "fast").strip().lower()
-        speed_index = self.cmb_speed_profile.findData(saved_speed_profile if saved_speed_profile in ("stable", "fast") else "fast")
+        speed_index = self.cmb_speed_profile.findData(
+            saved_speed_profile if saved_speed_profile in ("stable", "fast") else "fast"
+        )
         if speed_index < 0:
             speed_index = 0
         self.cmb_speed_profile.setCurrentIndex(speed_index)
-        speed_profile_layout.addWidget(self.cmb_speed_profile)
-        speed_profile_layout.addStretch()
-        perf_layout.addLayout(speed_profile_layout)
+        perf_form.addRow(self._settings_label("Speed Profile"), self.cmb_speed_profile)
 
-        warmup_layout = QHBoxLayout()
-        warmup_layout.addWidget(QLabel("Warmup Delay (sec):"))
-        self.spin_warmup_min = QDoubleSpinBox()
-        self.spin_warmup_min.setRange(0.0, 10.0)
-        self.spin_warmup_min.setDecimals(1)
-        self.spin_warmup_min.setSingleStep(0.1)
-        self.spin_warmup_min.setValue(
-            max(0.0, min(10.0, get_float_setting("api_humanized_warmup_min_seconds", 0.2)))
+        self.chk_profile_clone = QCheckBox(
+            "Enable profile cloning for extra slots (required for same-account parallel)"
         )
-        warmup_layout.addWidget(self.spin_warmup_min)
-        warmup_layout.addWidget(QLabel("to"))
-        self.spin_warmup_max = QDoubleSpinBox()
-        self.spin_warmup_max.setRange(0.0, 10.0)
-        self.spin_warmup_max.setDecimals(1)
-        self.spin_warmup_max.setSingleStep(0.1)
-        saved_warmup_max = get_float_setting("api_humanized_warmup_max_seconds", 0.4)
-        self.spin_warmup_max.setValue(
-            max(self.spin_warmup_min.value(), min(10.0, saved_warmup_max))
-        )
-        warmup_layout.addWidget(self.spin_warmup_max)
-        warmup_layout.addStretch()
-        perf_layout.addLayout(warmup_layout)
-
-        self.chk_profile_clone = QCheckBox("Enable profile cloning for extra slots (required for same-account parallel)")
         self.chk_profile_clone.setChecked(get_bool_setting("enable_profile_clones", True))
-        perf_layout.addWidget(self.chk_profile_clone)
+        perf_form.addRow("", self.chk_profile_clone)
 
-        recaptcha_layout = QHBoxLayout()
-        recaptcha_layout.addWidget(QLabel("ReCAPTCHA Slot Cooldown (sec):"))
+        perf_note = QLabel(
+            "Tip: More slots = more RAM / CPU. If your system gets slow, reduce slots to 1–2."
+        )
+        perf_note.setObjectName("settingsHint")
+        perf_note.setWordWrap(True)
+        perf_form.addRow("", perf_note)
+        layout.addWidget(perf_card)
+
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 2 — Retry & Auto-Recovery
+        # ═══════════════════════════════════════════════════════════
+        retry_card, retry_form = self._settings_card(
+            "Retry & Auto-Recovery",
+            "Configure how the queue retries failed jobs and when it auto-refreshes stuck accounts.",
+        )
+
         self.spin_recaptcha_cooldown = QSpinBox()
         self.spin_recaptcha_cooldown.setRange(5, 600)
         self.spin_recaptcha_cooldown.setValue(
             max(5, min(600, get_int_setting("recaptcha_account_cooldown_seconds", 15)))
         )
-        recaptcha_layout.addWidget(self.spin_recaptcha_cooldown)
-        recaptcha_layout.addStretch()
-        perf_layout.addLayout(recaptcha_layout)
+        self.spin_recaptcha_cooldown.setToolTip(
+            "How long a slot waits after a reCAPTCHA block before retrying."
+        )
+        retry_form.addRow(
+            self._settings_label("ReCAPTCHA Slot Cooldown (sec)"),
+            self.spin_recaptcha_cooldown,
+        )
 
-        retry_layout = QHBoxLayout()
-        retry_layout.addWidget(QLabel("Max Retries Per Job:"))
         self.spin_max_retries = QSpinBox()
         self.spin_max_retries.setRange(0, 5)
         self.spin_max_retries.setValue(
             max(0, min(5, get_int_setting("max_retries", get_int_setting("max_auto_retries_per_job", 3))))
         )
-        retry_layout.addWidget(self.spin_max_retries)
-        retry_layout.addStretch()
-        perf_layout.addLayout(retry_layout)
+        self.spin_max_retries.setToolTip(
+            "How many times the queue retries a failed job before marking it as failed."
+        )
+        retry_form.addRow(self._settings_label("Max Retries Per Job"), self.spin_max_retries)
 
-        retry_delay_layout = QHBoxLayout()
-        retry_delay_layout.addWidget(QLabel("Retry Base Delay (sec):"))
         self.spin_retry_base_delay = QSpinBox()
         self.spin_retry_base_delay.setRange(5, 300)
         self.spin_retry_base_delay.setValue(
             max(5, min(300, get_int_setting("retry_base_delay_seconds", get_int_setting("auto_retry_base_delay_seconds", 10))))
         )
-        retry_delay_layout.addWidget(self.spin_retry_base_delay)
-        retry_delay_layout.addStretch()
-        perf_layout.addLayout(retry_delay_layout)
+        self.spin_retry_base_delay.setToolTip(
+            "Base delay between retries (smart backoff multiplies this)."
+        )
+        retry_form.addRow(
+            self._settings_label("Retry Base Delay (sec)"),
+            self.spin_retry_base_delay,
+        )
 
-        auto_refresh_layout = QHBoxLayout()
-        auto_refresh_layout.addWidget(QLabel("Auto-refresh After N Jobs:"))
         self.spin_auto_refresh_after_jobs = QSpinBox()
         self.spin_auto_refresh_after_jobs.setRange(0, 10000)
         self.spin_auto_refresh_after_jobs.setValue(
@@ -3541,39 +4421,48 @@ class MainWindow(QMainWindow):
         self.spin_auto_refresh_after_jobs.setToolTip(
             "0 disables auto-refresh. Otherwise, refresh account slots after every N successful jobs."
         )
-        auto_refresh_layout.addWidget(self.spin_auto_refresh_after_jobs)
-        auto_refresh_layout.addStretch()
-        perf_layout.addLayout(auto_refresh_layout)
+        retry_form.addRow(
+            self._settings_label("Auto-refresh After N Jobs"),
+            self.spin_auto_refresh_after_jobs,
+        )
 
-        auto_restart_fail_layout = QHBoxLayout()
-        auto_restart_fail_layout.addWidget(QLabel("Auto-restart After N reCAPTCHA Fails:"))
         self.spin_restart_threshold = QSpinBox()
         self.spin_restart_threshold.setRange(0, 20)
         self.spin_restart_threshold.setValue(
             max(0, min(20, get_int_setting("auto_restart_recap_fail_threshold", 3)))
         )
-        auto_restart_fail_layout.addWidget(self.spin_restart_threshold)
-        auto_restart_fail_layout.addWidget(QLabel("in last"))
         self.spin_restart_window = QSpinBox()
         self.spin_restart_window.setRange(5, 50)
         self.spin_restart_window.setValue(
             max(5, min(50, get_int_setting("auto_restart_recap_fail_window", 10)))
         )
-        auto_restart_fail_layout.addWidget(self.spin_restart_window)
-        auto_restart_fail_layout.addWidget(QLabel("attempts"))
-        auto_restart_fail_layout.addStretch()
-        perf_layout.addLayout(auto_restart_fail_layout)
+        restart_row = QWidget()
+        restart_row_l = QHBoxLayout(restart_row)
+        restart_row_l.setContentsMargins(0, 0, 0, 0)
+        restart_row_l.setSpacing(8)
+        restart_row_l.addWidget(self.spin_restart_threshold)
+        _sep1 = QLabel("in last")
+        _sep1.setObjectName("settingsRowSeparator")
+        restart_row_l.addWidget(_sep1)
+        restart_row_l.addWidget(self.spin_restart_window)
+        _sep2 = QLabel("attempts")
+        _sep2.setObjectName("settingsRowSeparator")
+        restart_row_l.addWidget(_sep2)
+        restart_row_l.addStretch()
+        retry_form.addRow(
+            self._settings_label("Auto-restart After N reCAPTCHA Fails"),
+            restart_row,
+        )
 
-        auto_restart_cooldown_layout = QHBoxLayout()
-        auto_restart_cooldown_layout.addWidget(QLabel("Cooldown Before Auto-restart (sec):"))
         self.spin_restart_cooldown = QSpinBox()
         self.spin_restart_cooldown.setRange(10, 120)
         self.spin_restart_cooldown.setValue(
             max(10, min(120, get_int_setting("auto_restart_recap_cooldown_seconds", 30)))
         )
-        auto_restart_cooldown_layout.addWidget(self.spin_restart_cooldown)
-        auto_restart_cooldown_layout.addStretch()
-        perf_layout.addLayout(auto_restart_cooldown_layout)
+        retry_form.addRow(
+            self._settings_label("Cooldown Before Auto-restart (sec)"),
+            self.spin_restart_cooldown,
+        )
 
         self.chk_api_captcha_submit_lock = QCheckBox(
             "Legacy API submit lane (disabled; stagger controls now handle pacing)"
@@ -3583,10 +4472,17 @@ class MainWindow(QMainWindow):
         self.chk_api_captcha_submit_lock.setToolTip(
             "Submit-lane throttling has been removed. Same-account and global stagger settings now control pacing."
         )
-        perf_layout.addWidget(self.chk_api_captcha_submit_lock)
+        retry_form.addRow("", self.chk_api_captcha_submit_lock)
+        layout.addWidget(retry_card)
 
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("Image Execution Mode:"))
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 3 — Browser & Stealth
+        # ═══════════════════════════════════════════════════════════
+        browser_card, browser_form = self._settings_card(
+            "Browser & Stealth",
+            "Choose the browser engine used for generation and how it's displayed.",
+        )
+
         self.cmb_image_execution_mode = QComboBox()
         self.cmb_image_execution_mode.addItem("API only (queue retries on failure)", "api_only")
         self.cmb_image_execution_mode.setCurrentIndex(0)
@@ -3594,13 +4490,14 @@ class MainWindow(QMainWindow):
         self.cmb_image_execution_mode.setToolTip(
             "Generation uses API-only mode. Transient failures retry through the queue."
         )
-        self.cmb_image_execution_mode.currentIndexChanged.connect(lambda _=None: self._update_runtime_badges())
-        mode_layout.addWidget(self.cmb_image_execution_mode)
-        mode_layout.addStretch()
-        perf_layout.addLayout(mode_layout)
+        self.cmb_image_execution_mode.currentIndexChanged.connect(
+            lambda _=None: self._update_runtime_badges()
+        )
+        browser_form.addRow(
+            self._settings_label("Image Execution Mode"),
+            self.cmb_image_execution_mode,
+        )
 
-        browser_layout = QHBoxLayout()
-        browser_layout.addWidget(QLabel("Browser Mode:"))
         self.cmb_browser_mode = QComboBox()
         self.cmb_browser_mode.addItem("Headless (Playwright)", "headless")
         self.cmb_browser_mode.addItem("Visible (Playwright)", "visible")
@@ -3614,10 +4511,9 @@ class MainWindow(QMainWindow):
         if browser_mode_index < 0:
             browser_mode_index = self.cmb_browser_mode.findData("cloakbrowser")
         self.cmb_browser_mode.setCurrentIndex(browser_mode_index)
-        browser_layout.addWidget(self.cmb_browser_mode)
+        browser_form.addRow(self._settings_label("Browser Mode"), self.cmb_browser_mode)
 
-        self.lbl_chrome_display = QLabel("Chrome Display:")
-        browser_layout.addWidget(self.lbl_chrome_display)
+        # Chrome Display (visible only when Real Chrome selected)
         self.cmb_chrome_display = QComboBox()
         self.cmb_chrome_display.addItem("Visible (window dikhega)", "visible")
         self.cmb_chrome_display.addItem("Headless (background me chalega)", "headless")
@@ -3626,10 +4522,10 @@ class MainWindow(QMainWindow):
         if chrome_display_index < 0:
             chrome_display_index = self.cmb_chrome_display.findData("headless")
         self.cmb_chrome_display.setCurrentIndex(chrome_display_index)
-        browser_layout.addWidget(self.cmb_chrome_display)
+        self.lbl_chrome_display = self._settings_label("Chrome Display")
+        browser_form.addRow(self.lbl_chrome_display, self.cmb_chrome_display)
 
-        self.lbl_cloak_display = QLabel("Cloak Display:")
-        browser_layout.addWidget(self.lbl_cloak_display)
+        # Cloak Display (visible only when CloakBrowser selected)
         self.cmb_cloak_display = QComboBox()
         self.cmb_cloak_display.addItem("Headless", "headless")
         self.cmb_cloak_display.addItem("Visible", "visible")
@@ -3638,14 +4534,9 @@ class MainWindow(QMainWindow):
         if cloak_display_index < 0:
             cloak_display_index = self.cmb_cloak_display.findData("headless")
         self.cmb_cloak_display.setCurrentIndex(cloak_display_index)
-        browser_layout.addWidget(self.cmb_cloak_display)
-        browser_layout.addStretch()
-        perf_layout.addLayout(browser_layout)
-        self._on_browser_mode_changed(self.cmb_browser_mode.currentIndex())
+        self.lbl_cloak_display = self._settings_label("Cloak Display")
+        browser_form.addRow(self.lbl_cloak_display, self.cmb_cloak_display)
 
-        # ── Generation Mode ──
-        gen_mode_layout = QHBoxLayout()
-        gen_mode_layout.addWidget(QLabel("Generation Mode:"))
         self.cmb_generation_mode = QComboBox()
         self.cmb_generation_mode.setObjectName("settingInput")
         self.cmb_generation_mode.setMinimumHeight(38)
@@ -3662,23 +4553,101 @@ class MainWindow(QMainWindow):
         if gen_mode_idx < 0:
             gen_mode_idx = 0
         self.cmb_generation_mode.setCurrentIndex(gen_mode_idx)
-        gen_mode_layout.addWidget(self.cmb_generation_mode)
-        gen_mode_layout.addStretch()
-        perf_layout.addLayout(gen_mode_layout)
+        browser_form.addRow(self._settings_label("Generation Mode"), self.cmb_generation_mode)
 
         self.chk_random_fingerprint = QCheckBox("Random fingerprint per session (like GoLogin)")
         self.chk_random_fingerprint.setChecked(get_bool_setting("random_fingerprint_per_session", False))
-        self.chk_random_fingerprint.setStyleSheet("color: #94A3B8; font-size: 12px;")
-        perf_layout.addWidget(self.chk_random_fingerprint)
+        browser_form.addRow("", self.chk_random_fingerprint)
 
-        warmup_checkbox_style = (
-            "QCheckBox { color: #94A3B8; font-size: 12px; padding: 2px 0; }"
-            "QCheckBox::indicator { width: 16px; height: 16px; }"
-            "QCheckBox::indicator:checked { background: #2563EB; border: 1px solid #3B82F6; border-radius: 3px; }"
-            "QCheckBox::indicator:unchecked { background: #1E293B; border: 1px solid #475569; border-radius: 3px; }"
+        # CloakBrowser version row (inside Browser card)
+        self.cloak_update_widget = QWidget()
+        cloak_update_layout = QHBoxLayout(self.cloak_update_widget)
+        cloak_update_layout.setContentsMargins(0, 0, 0, 0)
+        cloak_update_layout.setSpacing(10)
+        self.lbl_cloak_version = QLabel("CloakBrowser: checking...")
+        self.lbl_cloak_version.setObjectName("settingsInlineInfo")
+        _CloakUpdateCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_cloak_update = _CloakUpdateCls()
+        self.btn_cloak_update.setText("Check for Updates")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_cloak_update.setIcon(FluentIcon.SYNC)
+            except Exception:
+                pass
+        self.btn_cloak_update.setFixedWidth(200)
+        self.btn_cloak_update.setFixedHeight(34)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_cloak_update.setStyleSheet(
+                "QPushButton { background-color: #334155; color: white; "
+                "border: 1px solid #475569; border-radius: 4px; font-size: 12px; "
+                "padding: 4px 12px; } "
+                "QPushButton:hover { background-color: #475569; } "
+                "QPushButton:disabled { background-color: #1E293B; color: #64748B; }"
+            )
+        self.btn_cloak_update.clicked.connect(self._on_cloak_update_clicked)
+        cloak_update_layout.addWidget(self.lbl_cloak_version, 1)
+        cloak_update_layout.addWidget(self.btn_cloak_update)
+        browser_form.addRow(self._settings_label("CloakBrowser"), self.cloak_update_widget)
+
+        # Download progress bar — hidden until an update download starts.
+        # Updated live via CloakUpdateWorker.progress_changed signal which
+        # is driven by a logging handler hooked into cloakbrowser.download.
+        self.cloak_progress_wrap = QWidget()
+        cloak_progress_layout = QHBoxLayout(self.cloak_progress_wrap)
+        cloak_progress_layout.setContentsMargins(0, 4, 0, 0)
+        cloak_progress_layout.setSpacing(10)
+        self.cloak_progress_bar = QProgressBar()
+        self.cloak_progress_bar.setObjectName("cloakDownloadProgress")
+        self.cloak_progress_bar.setRange(0, 100)
+        self.cloak_progress_bar.setValue(0)
+        self.cloak_progress_bar.setTextVisible(True)
+        self.cloak_progress_bar.setFormat("%p%")
+        self.cloak_progress_bar.setFixedHeight(18)
+        self.lbl_cloak_progress_text = QLabel("0 / 0 MB")
+        self.lbl_cloak_progress_text.setObjectName("settingsInlineInfo")
+        self.lbl_cloak_progress_text.setFixedWidth(90)
+        cloak_progress_layout.addWidget(self.cloak_progress_bar, 1)
+        cloak_progress_layout.addWidget(self.lbl_cloak_progress_text)
+        self.cloak_progress_wrap.setVisible(False)
+        browser_form.addRow("", self.cloak_progress_wrap)
+
+        self.lbl_cloak_update_status = QLabel("")
+        self.lbl_cloak_update_status.setObjectName("settingsHint")
+        self.lbl_cloak_update_status.setVisible(False)
+        browser_form.addRow("", self.lbl_cloak_update_status)
+        layout.addWidget(browser_card)
+
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 4 — Humanization & Warm-up
+        # ═══════════════════════════════════════════════════════════
+        warmup_card, warmup_form = self._settings_card(
+            "Humanization & Warm-up",
+            "Human-like pacing delays and cookie warm-up behavior to improve reCAPTCHA scores.",
         )
 
-        self.chk_cookie_warmup = QCheckBox("Cookie warm-up on first login (heavy — 2 searches + 3-4 site visits)")
+        self.spin_warmup_min = QDoubleSpinBox()
+        self.spin_warmup_min.setRange(0.0, 10.0)
+        self.spin_warmup_min.setDecimals(1)
+        self.spin_warmup_min.setSingleStep(0.1)
+        self.spin_warmup_min.setValue(
+            max(0.0, min(10.0, get_float_setting("api_humanized_warmup_min_seconds", 0.2)))
+        )
+        self.spin_warmup_max = QDoubleSpinBox()
+        self.spin_warmup_max.setRange(0.0, 10.0)
+        self.spin_warmup_max.setDecimals(1)
+        self.spin_warmup_max.setSingleStep(0.1)
+        saved_warmup_max = get_float_setting("api_humanized_warmup_max_seconds", 0.4)
+        self.spin_warmup_max.setValue(
+            max(self.spin_warmup_min.value(), min(10.0, saved_warmup_max))
+        )
+        warmup_form.addRow(
+            self._settings_label("Warmup Delay (sec)"),
+            self._settings_range_row(self.spin_warmup_min, self.spin_warmup_max),
+        )
+
+        self.chk_cookie_warmup = QCheckBox(
+            "Cookie warm-up on first login (heavy — 2 searches + 3-4 site visits)"
+        )
         self.chk_cookie_warmup.setChecked(get_bool_setting("cookie_warmup", True))
         self.chk_cookie_warmup.setToolTip(
             "When enabled, performs a full cookie warm-up after first login:\n"
@@ -3686,88 +4655,114 @@ class MainWindow(QMainWindow):
             "Takes ~4-5 minutes. Improves reCAPTCHA score significantly.\n"
             "Only runs ONCE per account (won't repeat after first login)."
         )
-        self.chk_cookie_warmup.setStyleSheet(warmup_checkbox_style)
-        perf_layout.addWidget(self.chk_cookie_warmup)
+        warmup_form.addRow("", self.chk_cookie_warmup)
 
-        self.chk_light_warmup = QCheckBox("Quick warm-up before each run (light — 1 search + 0-1 site visit)")
+        self.chk_light_warmup = QCheckBox(
+            "Quick warm-up before each run (light — 1 search + 0-1 site visit)"
+        )
         self.chk_light_warmup.setChecked(get_bool_setting("light_warmup", True))
         self.chk_light_warmup.setToolTip(
             "When enabled, performs a quick cookie refresh before each generation run:\n"
             "1 Google Search + click result + maybe 1 random site.\n"
             "Takes ~30-45 seconds. Keeps cookies fresh between runs."
         )
-        self.chk_light_warmup.setStyleSheet(warmup_checkbox_style)
-        perf_layout.addWidget(self.chk_light_warmup)
+        warmup_form.addRow("", self.chk_light_warmup)
+        layout.addWidget(warmup_card)
 
-        self.cloak_update_widget = QWidget()
-        cloak_update_layout = QHBoxLayout(self.cloak_update_widget)
-        cloak_update_layout.setContentsMargins(0, 5, 0, 5)
-        cloak_update_layout.setSpacing(10)
-        self.lbl_cloak_version = QLabel("CloakBrowser: checking...")
-        self.lbl_cloak_version.setStyleSheet("color: #94A3B8; font-size: 12px;")
-        self.btn_cloak_update = QPushButton("🔄 Check for Updates")
-        self.btn_cloak_update.setFixedWidth(200)
-        self.btn_cloak_update.setFixedHeight(30)
-        self.btn_cloak_update.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #334155;
-                color: white;
-                border: 1px solid #475569;
-                border-radius: 4px;
-                font-size: 12px;
-                padding: 4px 12px;
-            }
-            QPushButton:hover {
-                background-color: #475569;
-            }
-            QPushButton:disabled {
-                background-color: #1E293B;
-                color: #64748B;
-            }
-            """
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 5 — Output Folder
+        # ═══════════════════════════════════════════════════════════
+        output_card, output_form = self._settings_card(
+            "Output Folder",
+            "Where the app saves generated images and videos.",
         )
-        self.btn_cloak_update.clicked.connect(self._on_cloak_update_clicked)
-        cloak_update_layout.addWidget(self.lbl_cloak_version, 1)
-        cloak_update_layout.addWidget(self.btn_cloak_update)
-        perf_layout.addWidget(self.cloak_update_widget)
 
-        self.lbl_cloak_update_status = QLabel("")
-        self.lbl_cloak_update_status.setStyleSheet("color: #94A3B8; font-size: 11px;")
-        self.lbl_cloak_update_status.setVisible(False)
-        perf_layout.addWidget(self.lbl_cloak_update_status)
-
-        output_dir_layout = QHBoxLayout()
-        output_dir_layout.addWidget(QLabel("Output Folder:"))
+        output_row = QWidget()
+        output_row_l = QHBoxLayout(output_row)
+        output_row_l.setContentsMargins(0, 0, 0, 0)
+        output_row_l.setSpacing(8)
         self.output_dir_input = QLineEdit()
         self.output_dir_input.setReadOnly(True)
         self.output_dir_input.setPlaceholderText("Choose where generated files should be saved")
         self.output_dir_input.setText(self._outputs_dir())
-        output_dir_layout.addWidget(self.output_dir_input, 1)
-        self.btn_browse_output_dir = QPushButton("Browse…")
-        self.btn_browse_output_dir.setProperty("role", "browse")
+        output_row_l.addWidget(self.output_dir_input, 1)
+
+        _OutputBrowseCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_browse_output_dir = _OutputBrowseCls()
+        self.btn_browse_output_dir.setText("Browse…")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_browse_output_dir.setIcon(FluentIcon.FOLDER)
+            except Exception:
+                pass
+        else:
+            self.btn_browse_output_dir.setProperty("role", "browse")
+        self.btn_browse_output_dir.setFixedHeight(34)
         self.btn_browse_output_dir.clicked.connect(self._browse_output_directory)
-        output_dir_layout.addWidget(self.btn_browse_output_dir)
-        self.btn_reset_output_dir = QPushButton("Reset")
-        self.btn_reset_output_dir.setProperty("role", "secondary")
+        output_row_l.addWidget(self.btn_browse_output_dir)
+
+        self.btn_reset_output_dir = _OutputBrowseCls()
+        self.btn_reset_output_dir.setText("Reset")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_reset_output_dir.setIcon(FluentIcon.CANCEL)
+            except Exception:
+                pass
+        else:
+            self.btn_reset_output_dir.setProperty("role", "secondary")
+        self.btn_reset_output_dir.setFixedHeight(34)
         self.btn_reset_output_dir.clicked.connect(self._reset_output_directory)
-        output_dir_layout.addWidget(self.btn_reset_output_dir)
-        perf_layout.addLayout(output_dir_layout)
+        output_row_l.addWidget(self.btn_reset_output_dir)
+        output_form.addRow(self._settings_label("Folder"), output_row)
+        layout.addWidget(output_card)
 
-        note = QLabel(
-            "Note: More slots increase RAM and CPU usage. "
-            "If your system gets slow, reduce slots to 1-2."
+        # ═══════════════════════════════════════════════════════════
+        # SECTION 6 — Action buttons (Save + Clean Profiles)
+        # ═══════════════════════════════════════════════════════════
+        actions_wrap = QFrame()
+        actions_wrap.setObjectName("settingsActionsBar")
+        actions_layout = QVBoxLayout(actions_wrap)
+        actions_layout.setContentsMargins(22, 18, 22, 18)
+        actions_layout.setSpacing(12)
+
+        actions_title = QLabel("Save & Maintenance")
+        actions_title.setObjectName("settingsCardTitle")
+        actions_layout.addWidget(actions_title)
+        actions_subtitle = QLabel(
+            "Apply your changes, or run maintenance. Clean Profiles removes cache but keeps login cookies."
         )
-        note.setWordWrap(True)
-        perf_layout.addWidget(note)
+        actions_subtitle.setObjectName("settingsCardSubtitle")
+        actions_subtitle.setWordWrap(True)
+        actions_layout.addWidget(actions_subtitle)
 
-        self.btn_save_settings = QPushButton("Save Settings")
-        self.btn_save_settings.setProperty("role", "primary")
+        actions_divider = QFrame()
+        actions_divider.setObjectName("settingsCardDivider")
+        actions_divider.setFrameShape(QFrame.HLine)
+        actions_divider.setFixedHeight(1)
+        actions_layout.addWidget(actions_divider)
+        actions_layout.addSpacing(6)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        _SaveSettingsCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_save_settings = _SaveSettingsCls()
+        self.btn_save_settings.setText("Save Settings")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_save_settings.setIcon(FluentIcon.SAVE)
+            except Exception:
+                pass
+        else:
+            self.btn_save_settings.setProperty("role", "primary")
+        self.btn_save_settings.setFixedHeight(44)
+        self.btn_save_settings.setMinimumWidth(220)
         self.btn_save_settings.clicked.connect(self.save_settings)
-        perf_layout.addWidget(self.btn_save_settings)
+        btn_row.addWidget(self.btn_save_settings, 2)
 
+        # Clean Profiles stays as stock QPushButton with red color
+        # override (Fluent PushButton conflicts with bg color overrides).
         self.btn_clean_profiles = QPushButton("Clean All Browser Profiles")
-        self.btn_clean_profiles.setProperty("role", "danger")
         self.btn_clean_profiles.setToolTip(
             "Removes accumulated cache, service workers, and tracking data.\n"
             "Preserves login cookies and session.\n"
@@ -3775,25 +4770,164 @@ class MainWindow(QMainWindow):
             "Same effect as reinstalling but without losing accounts."
         )
         self.btn_clean_profiles.setStyleSheet(
-            "QPushButton { background-color: #DC2626; color: white; padding: 8px 16px; "
-            "border-radius: 6px; font-weight: 600; border: none; min-height: 36px; } "
+            "QPushButton { background-color: #DC2626; color: white; padding: 10px 18px; "
+            "border-radius: 7px; font-weight: 700; border: none; min-height: 44px; "
+            "font-size: 14px; } "
             "QPushButton:hover { background-color: #EF4444; } "
             "QPushButton:pressed { background-color: #B91C1C; }"
         )
         self.btn_clean_profiles.setCursor(Qt.PointingHandCursor)
         self.btn_clean_profiles.clicked.connect(lambda: self._on_clean_profiles())
-        perf_layout.addWidget(self.btn_clean_profiles)
+        btn_row.addWidget(self.btn_clean_profiles, 1)
+        actions_layout.addLayout(btn_row)
+        layout.addWidget(actions_wrap)
 
-        perf_group.setLayout(perf_layout)
-        layout.addWidget(perf_group)
-        layout.addStretch()
+        layout.addStretch(1)
+
+        settings_scroll.setWidget(scroll_content)
+        root.addWidget(settings_scroll)
+
         self._cloak_update_worker = None
         self._auto_check_cloak_on_startup()
         self._on_browser_mode_changed(self.cmb_browser_mode.currentIndex())
 
+    # ──────────────────────────────────────────────────────────────────
+    # Phase 4A: Fluent dialog helpers.
+    # These wrap qfluentwidgets.MessageBox with a QMessageBox-like API
+    # so existing call sites can migrate with minimal change. They fall
+    # back cleanly to QMessageBox when Fluent is unavailable.
+    # ──────────────────────────────────────────────────────────────────
+    def _fluent_confirm(self, title, content, confirm_label="Yes", cancel_label="No"):
+        """Show a Yes/No confirmation dialog. Returns True if user confirmed."""
+        if _FLUENT_UI_AVAILABLE and FluentMessageBox is not None:
+            try:
+                box = FluentMessageBox(str(title), str(content), self)
+                box.yesButton.setText(str(confirm_label))
+                box.cancelButton.setText(str(cancel_label))
+                return bool(box.exec())
+            except Exception:
+                pass
+        reply = QMessageBox.question(
+            self,
+            str(title),
+            str(content),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _fluent_notify(self, title, content, cancel_only=True):
+        """Show an informational dialog with a single OK button."""
+        if _FLUENT_UI_AVAILABLE and FluentMessageBox is not None:
+            try:
+                box = FluentMessageBox(str(title), str(content), self)
+                box.yesButton.setText("OK")
+                if cancel_only:
+                    box.cancelButton.hide()
+                return box.exec()
+            except Exception:
+                pass
+        QMessageBox.information(self, str(title), str(content))
+        return True
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase 5: InfoBar toast notifications.
+    # Slide-in from top-right, auto-dismiss, colored variants. Replace
+    # call sites that currently use QMessageBox.information (simple OK
+    # popups) with these — non-blocking, more modern.
+    # ──────────────────────────────────────────────────────────────────
+    def _toast_success(self, title, content="", duration=3000):
+        if _FLUENT_UI_AVAILABLE and InfoBar is not None:
+            try:
+                InfoBar.success(
+                    title=str(title),
+                    content=str(content),
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=int(duration),
+                    parent=self,
+                )
+                return
+            except Exception:
+                pass
+
+    def _toast_info(self, title, content="", duration=3000):
+        if _FLUENT_UI_AVAILABLE and InfoBar is not None:
+            try:
+                InfoBar.info(
+                    title=str(title),
+                    content=str(content),
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=int(duration),
+                    parent=self,
+                )
+                return
+            except Exception:
+                pass
+
+    def _toast_warning(self, title, content="", duration=4000):
+        if _FLUENT_UI_AVAILABLE and InfoBar is not None:
+            try:
+                InfoBar.warning(
+                    title=str(title),
+                    content=str(content),
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=int(duration),
+                    parent=self,
+                )
+                return
+            except Exception:
+                pass
+
+    def _toast_error(self, title, content="", duration=5000):
+        if _FLUENT_UI_AVAILABLE and InfoBar is not None:
+            try:
+                InfoBar.error(
+                    title=str(title),
+                    content=str(content),
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=int(duration),
+                    parent=self,
+                )
+                return
+            except Exception:
+                pass
+
+    def _install_wheel_filters(self):
+        """Walk the widget tree and install our wheel event filter on
+        every QAbstractSpinBox and QComboBox. Also install on the
+        inner QLineEdit of each spinbox so wheel events hitting the
+        edit field are also caught."""
+        try:
+            # Spin boxes (both Fluent and stock variants)
+            for sb in self.findChildren(QAbstractSpinBox):
+                try:
+                    sb.installEventFilter(self._wheel_filter)
+                    le = sb.lineEdit() if hasattr(sb, "lineEdit") else None
+                    if le is not None:
+                        le.installEventFilter(self._wheel_filter)
+                except Exception:
+                    pass
+            # Combo boxes
+            for cb in self.findChildren(QComboBox):
+                try:
+                    cb.installEventFilter(self._wheel_filter)
+                    # ComboBox uses an internal view — install on the
+                    # widget itself, Qt will filter before view gets it.
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _apply_modern_theme(self):
-        self.setStyleSheet(
-            """
+        stylesheet = """
             QMainWindow, QWidget {
                 background-color: #0F172A;
                 color: #F8FAFC;
@@ -3807,11 +4941,21 @@ class MainWindow(QMainWindow):
                 background: #0B1120;
                 border: none;
             }
+            /* Phase 6: Match title + stats wrap backgrounds to the
+               sidebar frame so Fluent NavigationInterface sits flush
+               between two uniformly-colored areas. */
+            QWidget#sidebarTitleWrap {
+                background: #0B1120;
+            }
+            QWidget#sidebarStatsWrap {
+                background: #0B1120;
+            }
             QLabel#sidebarTitle {
                 color: #F8FAFC;
                 font-size: 19px;
                 font-weight: 800;
                 padding: 4px 4px 14px 4px;
+                background: transparent;
             }
             QFrame#sidebarDivider, QFrame#sidebarShellDivider {
                 background: #1E293B;
@@ -3836,20 +4980,73 @@ class MainWindow(QMainWindow):
                 background: #2563EB;
                 color: #FFFFFF;
             }
+            /* Sidebar stats — mini card rows with colored dots */
+            QLabel#sidebarStatsHeader {
+                color: #64748B;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 1.5px;
+                padding: 0 4px;
+                background: transparent;
+            }
+            QFrame#sidebarStatRow {
+                background: #0F172A;
+                border: 1px solid #1E293B;
+                border-radius: 8px;
+            }
+            QFrame#sidebarStatRow:hover {
+                background: #1E293B;
+                border: 1px solid #334155;
+            }
+            QFrame#sidebarStatRow[variant="failed"][hasFailures="true"] {
+                background: #2A1020;
+                border: 1px solid #7F1D1D;
+            }
+            QFrame#sidebarStatRow[variant="failed"][hasFailures="true"]:hover {
+                background: #3A1525;
+                border: 1px solid #B91C1C;
+            }
+            QLabel#sidebarStatLabel {
+                color: #94A3B8;
+                font-size: 11px;
+                font-weight: 600;
+                background: transparent;
+            }
+            QLabel#sidebarStatCount {
+                color: #F8FAFC;
+                font-size: 13px;
+                font-weight: 800;
+                background: transparent;
+                min-width: 24px;
+            }
+            QLabel#sidebarStatCount[variant="pending"] { color: #CBD5E1; }
+            QLabel#sidebarStatCount[variant="running"] { color: #60A5FA; }
+            QLabel#sidebarStatCount[variant="done"] { color: #22C55E; }
+            QLabel#sidebarStatCount[variant="failed"] { color: #94A3B8; }
+            QLabel#sidebarStatCount[variant="failed"][hasFailures="true"] { color: #FCA5A5; }
+            QFrame#sidebarStatsInnerDivider {
+                background: #1E293B;
+                color: #1E293B;
+                border: none;
+            }
+            /* Legacy selectors kept for fallback (when Fluent unavailable) */
             QLabel#sidebarStat {
                 color: #94A3B8;
                 font-size: 11px;
                 padding: 2px 4px;
+                background: transparent;
             }
             QLabel#sidebarStatRunning {
                 color: #60A5FA;
                 font-size: 11px;
                 padding: 2px 4px;
+                background: transparent;
             }
             QLabel#sidebarStatDone {
                 color: #22C55E;
                 font-size: 11px;
                 padding: 2px 4px;
+                background: transparent;
             }
             QPushButton#sidebarFailedButton {
                 background: transparent;
@@ -3872,7 +5069,10 @@ class MainWindow(QMainWindow):
             QLabel#sidebarSession {
                 color: #64748B;
                 font-size: 10px;
-                padding: 2px 4px;
+                font-weight: 600;
+                padding: 4px;
+                background: transparent;
+                letter-spacing: 0.3px;
             }
             QTabWidget#mainTabs {
                 background: #0F172A;
@@ -3913,29 +5113,33 @@ class MainWindow(QMainWindow):
                 border: none;
             }
             QTabWidget::pane {
-                border: 1px solid #334155;
+                border: 1px solid #1E293B;
+                border-top: 1px solid #334155;
                 border-radius: 10px;
-                background: #1E293B;
+                background: #111827;
                 padding: 0px;
                 margin-top: -1px;
             }
+            /* Fluent Pivot-style tab bar — thicker underline, smooth hover.
+               Active tab gets a prominent blue underline like Windows 11
+               Settings navigation. */
             QTabBar::tab {
-                padding: 10px 22px;
+                padding: 12px 26px;
                 font-weight: 700;
                 font-size: 13px;
                 color: #94A3B8;
                 background: transparent;
                 border: none;
-                border-bottom: 2px solid transparent;
-                margin-right: 4px;
+                border-bottom: 3px solid transparent;
+                margin-right: 6px;
             }
             QTabBar::tab:selected {
-                color: #3B82F6;
-                border-bottom: 2px solid #3B82F6;
+                color: #F8FAFC;
+                border-bottom: 3px solid #2563EB;
             }
             QTabBar::tab:hover:!selected {
-                color: #CBD5E1;
-                background: #131C30;
+                color: #E2E8F0;
+                border-bottom: 3px solid #1E3A5F;
             }
             QFrame#heroCard, QFrame#dashboardTopBar {
                 background: #1E293B;
@@ -3960,7 +5164,14 @@ class MainWindow(QMainWindow):
                 padding: 7px 12px;
                 font-weight: 700;
             }
-            QFrame#accountOverviewCard, QFrame#statCard {
+            /* Fluent-style Account Health overview card */
+            QFrame#accountOverviewCard {
+                background: #111827;
+                border: 1px solid #1E293B;
+                border-top: 1px solid #334155;
+                border-radius: 10px;
+            }
+            QFrame#statCard {
                 background: #1E293B;
                 border: 1px solid #334155;
                 border-radius: 14px;
@@ -4009,18 +5220,247 @@ class MainWindow(QMainWindow):
                 background: #3B82F6;
                 border-radius: 7px;
             }
+            /* ─────────── Settings page — professional card layout ─────────── */
+            QScrollArea#settingsScrollArea, QWidget#settingsScrollContent {
+                background: #0F172A;
+                border: none;
+            }
+            QFrame#settingsHeader {
+                background: #111827;
+                border: 1px solid #1E293B;
+                border-left: 3px solid #2563EB;
+                border-radius: 10px;
+            }
+            QLabel#settingsPageTitle {
+                color: #F8FAFC;
+                font-size: 22px;
+                font-weight: 800;
+                letter-spacing: -0.3px;
+                background: transparent;
+            }
+            QLabel#settingsPageSubtitle {
+                color: #94A3B8;
+                font-size: 13px;
+                font-weight: 500;
+                background: transparent;
+            }
+            QGroupBox#settingsCard, QFrame#settingsActionsBar {
+                background: #111827;
+                border: 1px solid #1E293B;
+                border-top: 1px solid #334155;
+                border-radius: 10px;
+                margin-top: 0px;
+                padding: 0px;
+            }
+            QGroupBox#settingsCard::title {
+                padding: 0px;
+                margin: 0px;
+                color: transparent;
+                background: transparent;
+            }
+            QLabel#settingsCardTitle {
+                color: #F8FAFC;
+                font-size: 15px;
+                font-weight: 800;
+                letter-spacing: 0.2px;
+                background: transparent;
+            }
+            QLabel#settingsCardSubtitle {
+                color: #64748B;
+                font-size: 12px;
+                font-weight: 500;
+                background: transparent;
+            }
+            QFrame#settingsCardDivider {
+                background: #1E293B;
+                color: #1E293B;
+                border: none;
+            }
+            QLabel#settingsRowLabel {
+                color: #CBD5E1;
+                font-size: 13px;
+                font-weight: 600;
+                background: transparent;
+                padding-right: 8px;
+                min-width: 200px;
+            }
+            QLabel#settingsRowSeparator {
+                color: #64748B;
+                font-size: 12px;
+                font-weight: 500;
+                background: transparent;
+                padding: 0 4px;
+            }
+            QLabel#settingsHint {
+                color: #64748B;
+                font-size: 11px;
+                font-weight: 500;
+                background: transparent;
+                padding-top: 4px;
+            }
+            QLabel#settingsInlineInfo {
+                color: #60A5FA;
+                font-size: 12px;
+                font-weight: 600;
+                background: transparent;
+            }
+            /* ─────────── Failed Jobs page ─────────── */
+            QFrame#failedJobsCard {
+                background: #111827;
+                border: 1px solid #1E293B;
+                border-top: 1px solid #334155;
+                border-radius: 10px;
+            }
+            QTableWidget#failedJobsTable {
+                background: transparent;
+                border: none;
+                color: #E2E8F0;
+                font-size: 12px;
+                gridline-color: #1E293B;
+                selection-background-color: #1E3A5F;
+                selection-color: #F8FAFC;
+            }
+            QTableWidget#failedJobsTable::item {
+                padding: 10px 8px;
+                border-bottom: 1px solid #1E293B;
+            }
+            QTableWidget#failedJobsTable::item:selected {
+                background: #1E3A5F;
+                color: #F8FAFC;
+            }
+            QTableWidget#failedJobsTable QHeaderView::section {
+                background: #0F172A;
+                color: #64748B;
+                font-size: 10px;
+                font-weight: 800;
+                text-transform: uppercase;
+                letter-spacing: 0.8px;
+                padding: 14px 10px;
+                border: none;
+                border-bottom: 2px solid #1E293B;
+            }
+            /* In-place cell editor — when user double-clicks a prompt
+               cell to edit, a QLineEdit is created by Qt. Style it so
+               the text is visible against the dark row background. */
+            QTableWidget#failedJobsTable QLineEdit {
+                background: #0B1220;
+                color: #F8FAFC;
+                border: 2px solid #3B82F6;
+                border-radius: 4px;
+                padding: 6px 8px;
+                font-size: 12px;
+                selection-background-color: #2563EB;
+                selection-color: #FFFFFF;
+            }
+            QLabel#failedJobsEmpty {
+                color: #475569;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 80px 40px;
+                background: transparent;
+            }
+            QFrame#failedJobsActionsBar {
+                background: #111827;
+                border: 1px solid #1E293B;
+                border-top: 1px solid #334155;
+                border-radius: 10px;
+            }
+            /* CloakBrowser download progress bar — visible during updates */
+            QProgressBar#cloakDownloadProgress {
+                background: #0F172A;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                text-align: center;
+                color: #F8FAFC;
+                font-weight: 700;
+                font-size: 10px;
+                padding: 1px;
+            }
+            QProgressBar#cloakDownloadProgress::chunk {
+                background: #2563EB;
+                border-radius: 3px;
+            }
+            /* ─────────── Checkboxes — bigger, high-contrast, Fluent ───────────
+               Visible in any card background. 20x20 indicator with
+               clear borders. Checked state uses theme blue + white
+               checkmark via unicode. */
+            QCheckBox {
+                color: #E2E8F0;
+                font-size: 13px;
+                font-weight: 500;
+                spacing: 10px;
+                padding: 6px 0;
+                background: transparent;
+            }
+            QCheckBox:disabled {
+                color: #64748B;
+            }
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+                border-radius: 5px;
+            }
+            QCheckBox::indicator:unchecked {
+                background: #0F172A;
+                border: 2px solid #475569;
+            }
+            QCheckBox::indicator:unchecked:hover {
+                border: 2px solid #60A5FA;
+                background: #1E293B;
+            }
+            QCheckBox::indicator:checked {
+                background: #2563EB;
+                border: 2px solid #60A5FA;
+            }
+            QCheckBox::indicator:checked:hover {
+                background: #3B82F6;
+                border: 2px solid #60A5FA;
+            }
+            QCheckBox::indicator:disabled {
+                background: #1E293B;
+                border: 2px solid #334155;
+            }
             QLabel#accountOverviewTitle {
                 color: #F8FAFC;
-                font-size: 16px;
-                font-weight: 700;
+                font-size: 17px;
+                font-weight: 800;
+                letter-spacing: 0.2px;
+                background: transparent;
             }
+            /* Color-variant metric chips for Account Health panel.
+               variant="neutral" / "muted" / "info" / "success" / "warning"
+               Each chip gets a distinct accent for quick visual scanning. */
             QLabel#accountMetricChip {
-                background: #172033;
-                border: 1px solid #334155;
-                border-radius: 10px;
+                background: #0F172A;
+                border: 1px solid #1E293B;
+                border-radius: 8px;
                 color: #CBD5E1;
                 font-weight: 700;
-                padding: 7px 10px;
+                font-size: 12px;
+                padding: 8px 14px;
+            }
+            QLabel#accountMetricChip[variant="neutral"] {
+                color: #E2E8F0;
+                border: 1px solid #334155;
+            }
+            QLabel#accountMetricChip[variant="muted"] {
+                color: #64748B;
+                border: 1px solid #1E293B;
+            }
+            QLabel#accountMetricChip[variant="info"] {
+                color: #60A5FA;
+                border: 1px solid #1E3A5F;
+                background: #0C1A33;
+            }
+            QLabel#accountMetricChip[variant="success"] {
+                color: #34D399;
+                border: 1px solid #14532D;
+                background: #0B1F18;
+            }
+            QLabel#accountMetricChip[variant="warning"] {
+                color: #FBBF24;
+                border: 1px solid #78350F;
+                background: #1F1608;
             }
             QLabel#statValue {
                 background: transparent;
@@ -4030,21 +5470,29 @@ class MainWindow(QMainWindow):
                 background: transparent;
                 border: none;
             }
+            /* Fluent-style card panels — darker background for subtle
+               lift, accent-tinted border, prominent title bar. */
             QGroupBox, QGroupBox#dashboardPanel, QFrame#dashboardPanel {
                 font-weight: 700;
                 font-size: 14px;
                 color: #F8FAFC;
-                border: 1px solid #334155;
-                border-radius: 14px;
-                margin-top: 10px;
-                padding: 18px 14px 14px 14px;
-                background: #1E293B;
+                border: 1px solid #1E293B;
+                border-top: 1px solid #334155;
+                border-radius: 10px;
+                margin-top: 14px;
+                padding: 22px 16px 16px 16px;
+                background: #111827;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 16px;
-                padding: 0 8px;
-                color: #F8FAFC;
+                subcontrol-position: top left;
+                left: 18px;
+                padding: 2px 10px;
+                color: #E2E8F0;
+                background: #111827;
+                font-size: 13px;
+                font-weight: 700;
+                letter-spacing: 0.3px;
             }
             QLabel {
                 color: #94A3B8;
@@ -4070,52 +5518,91 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 font-weight: 500;
             }
-            QLineEdit, QTextEdit, QSpinBox, QTableWidget {
-                background: #1E293B;
+            /* Input fields — includes QPlainTextEdit so pipeline
+               Image/Video prompt boxes have visible borders. The
+               color rule applies uniformly even if pasted rich text
+               tries to override (works for rich text too). */
+            QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QTableWidget {
+                background: #0F172A;
                 color: #F8FAFC;
                 border: 1px solid #334155;
                 border-radius: 8px;
+                padding: 8px 10px;
                 selection-background-color: #1E2D4A;
                 selection-color: #FFFFFF;
             }
-            QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {
+            QTextEdit, QPlainTextEdit {
+                /* Force text color — wins over pasted rich-text
+                   embedded colors. Qt QTextEdit honors this for
+                   plain-text-only mode (setAcceptRichText=False). */
+                color: #F8FAFC;
+            }
+            QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover {
+                border-color: #475569;
+            }
+            QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus {
                 border-color: #3B82F6;
             }
-            QComboBox, QComboBox#settingInput, QSpinBox#settingInput {
-                padding: 8px 12px;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                background: #1E293B;
+            /* Fluent SpinBox / DoubleSpinBox ship with their own native
+               styling — we do NOT override them. QComboBox stays stock
+               (Fluent ComboBox broke Qt internals) but gets custom QSS
+               with a real SVG chevron for visible dropdown arrow. */
+            QComboBox {
+                padding: 10px 14px;
+                padding-right: 36px;
+                border: 1px solid #1E293B;
+                border-bottom: 2px solid #334155;
+                border-radius: 7px;
+                background: #111827;
                 color: #F8FAFC;
                 font-size: 13px;
-                min-height: 20px;
-                min-width: 150px;
+                min-height: 24px;
+                min-width: 110px;
             }
-            QComboBox:hover, QSpinBox#settingInput:hover {
-                border-color: #3B82F6;
+            QComboBox:hover {
+                background: #1E293B;
+                border-bottom: 2px solid #2563EB;
             }
-            QComboBox:focus, QSpinBox#settingInput:focus {
-                border-color: #3B82F6;
+            QComboBox:focus, QComboBox:on {
+                border: 1px solid #2563EB;
+                border-bottom: 2px solid #3B82F6;
+                background: #1E293B;
             }
             QComboBox::drop-down {
                 border: none;
-                width: 24px;
+                width: 32px;
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                background: transparent;
             }
             QComboBox::down-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid #94A3B8;
-                margin-right: 8px;
+                image: url(%CHEVRON%);
+                width: 14px;
+                height: 14px;
+                margin-right: 10px;
+            }
+            QComboBox::down-arrow:on {
+                /* When popup is open, flip chevron isn't possible in
+                   QSS — keep same image. */
+                image: url(%CHEVRON%);
             }
             QComboBox QAbstractItemView {
-                background: #1E293B;
+                background: #0F172A;
                 color: #F8FAFC;
                 border: 1px solid #334155;
-                border-radius: 6px;
-                selection-background-color: #3B82F6;
+                border-radius: 7px;
+                selection-background-color: #2563EB;
                 selection-color: white;
-                padding: 4px;
+                padding: 6px;
+                outline: 0;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 8px 12px;
+                border-radius: 5px;
+                min-height: 24px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background: #1E293B;
             }
             QPushButton {
                 padding: 8px 16px;
@@ -4131,16 +5618,23 @@ class MainWindow(QMainWindow):
                 border-color: #334155;
                 background: #253246;
             }
+            /* Fluent primary button — matches theme accent, rounded
+               corners, clean Fluent feel. Used for Save Settings and
+               other big primary actions. */
             QPushButton[role="primary"], QPushButton[role="primaryGradient"], QPushButton[role="startGradient"] {
                 color: white;
                 border: none;
-                background: #3B82F6;
+                border-radius: 7px;
+                background: #2563EB;
                 padding: 12px 24px;
                 font-size: 14px;
                 font-weight: 700;
             }
             QPushButton[role="primary"]:hover, QPushButton[role="primaryGradient"]:hover, QPushButton[role="startGradient"]:hover {
-                background: #2563EB;
+                background: #3B82F6;
+            }
+            QPushButton[role="primary"]:pressed, QPushButton[role="primaryGradient"]:pressed {
+                background: #1D4ED8;
             }
             QPushButton[role="outlineWarning"], QPushButton[role="warning"] {
                 background: transparent;
@@ -4178,27 +5672,36 @@ class MainWindow(QMainWindow):
                 background: #334155;
                 color: #F8FAFC;
             }
+            /* Fluent-styled browse button — clean solid border, no
+               dashed look. Used for reference image selectors, start
+               image, end image pickers. */
             QPushButton[role="browse"] {
-                background: #172240;
+                background: #0F172A;
                 color: #60A5FA;
-                border: 1px dashed #3B82F6;
-                border-radius: 8px;
-                padding: 8px 16px;
+                border: 1px solid #1E293B;
+                border-bottom: 2px solid #2563EB;
+                border-radius: 7px;
+                padding: 10px 18px;
                 font-weight: 600;
             }
             QPushButton[role="browse"]:hover {
-                background: #1A2744;
-                border-style: solid;
+                background: #1E293B;
+                color: #93C5FD;
+                border-bottom: 2px solid #3B82F6;
             }
+            /* Fluent-styled danger button — red with subtle bg tint,
+               proper radius, no harsh border. Used for Clean All
+               Browser Profiles + Clear Reference buttons. */
             QPushButton[role="danger"], QPushButton#refClearButton {
-                background: #1F1A2A;
-                color: #EF4444;
-                border: 1px solid #EF4444;
-                border-radius: 6px;
+                background: #DC2626;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 7px;
+                padding: 10px 18px;
                 font-weight: 700;
             }
             QPushButton[role="danger"]:hover, QPushButton#refClearButton:hover {
-                background: #2A1D2C;
+                background: #EF4444;
             }
             QPushButton#refClearButton {
                 min-width: 34px;
@@ -4292,7 +5795,9 @@ class MainWindow(QMainWindow):
                 background: #1A2744;
             }
             """
-        )
+        # Inject runtime-generated chevron SVG path into QSS
+        stylesheet = stylesheet.replace("%CHEVRON%", _CHEVRON_PATH or "")
+        self.setStyleSheet(stylesheet)
 
     def _set_status_item_style(self, item, status_text):
         status = str(status_text or "").strip().lower()
@@ -4988,14 +6493,13 @@ class MainWindow(QMainWindow):
             return
 
         account_name = str(account.get("name") or "").strip()
-        reply = QMessageBox.question(
-            self,
+        if not self._fluent_confirm(
             "Reset Session",
-            f"Reset session for '{account_name}'?\n\nThis deletes saved cookies/session clones and opens a fresh login browser.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+            f"Reset session for '{account_name}'?\n\n"
+            f"This deletes saved cookies/session clones and opens a fresh login browser.",
+            confirm_label="Reset",
+            cancel_label="Cancel",
+        ):
             return
 
         self._start_account_session_refresh(account_id, action_label="Session reset")
@@ -5009,8 +6513,7 @@ class MainWindow(QMainWindow):
         account_name = str(account.get("name") or "").strip()
 
         # Confirmation dialog — prevent accidental deletion
-        reply = QMessageBox.question(
-            self,
+        if not self._fluent_confirm(
             "Delete Account",
             f"Are you sure you want to delete '{account_name}'?\n\n"
             f"This will permanently remove:\n"
@@ -5018,10 +6521,9 @@ class MainWindow(QMainWindow):
             f"  • Saved login session and cookies\n"
             f"  • All pending/running jobs will be reassigned\n\n"
             f"This action CANNOT be undone.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+            confirm_label="Delete",
+            cancel_label="Cancel",
+        ):
             return
 
         self._start_background_task(
@@ -5266,14 +6768,13 @@ class MainWindow(QMainWindow):
             return
 
         account_name = str(account.get("name") or "").strip()
-        reply = QMessageBox.question(
-            self,
+        if not self._fluent_confirm(
             "Reset Session",
-            f"Reset session for '{account_name}'?\n\nThis deletes saved cookies/session clones and opens a fresh login browser.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+            f"Reset session for '{account_name}'?\n\n"
+            f"This deletes saved cookies/session clones and opens a fresh login browser.",
+            confirm_label="Reset",
+            cancel_label="Cancel",
+        ):
             return
 
         self._start_account_session_refresh(account_id, action_label="Session reset")
@@ -5287,8 +6788,7 @@ class MainWindow(QMainWindow):
         account_name = str(account.get("name") or "").strip()
 
         # Confirmation dialog — prevent accidental deletion
-        reply = QMessageBox.question(
-            self,
+        if not self._fluent_confirm(
             "Delete Account",
             f"Are you sure you want to delete '{account_name}'?\n\n"
             f"This will permanently remove:\n"
@@ -5296,10 +6796,9 @@ class MainWindow(QMainWindow):
             f"  • Saved login session and cookies\n"
             f"  • All pending/running jobs will be reassigned\n\n"
             f"This action CANNOT be undone.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+            confirm_label="Delete",
+            cancel_label="Cancel",
+        ):
             return
 
         self._start_background_task(
@@ -5593,14 +7092,19 @@ class MainWindow(QMainWindow):
             install_mode = True
 
         self.btn_cloak_update.setEnabled(False)
-        self.btn_cloak_update.setText("⏳ Updating...")
-        self.lbl_cloak_update_status.setVisible(True)
         self.btn_cloak_update.setText("Updating...")
+        self.lbl_cloak_update_status.setVisible(True)
         self.lbl_cloak_update_status.setText("Starting update...")
         self.lbl_cloak_update_status.setStyleSheet("color: #60A5FA; font-size: 11px;")
+        # Reset + show progress bar (initially 0%)
+        if hasattr(self, "cloak_progress_wrap"):
+            self.cloak_progress_bar.setValue(0)
+            self.lbl_cloak_progress_text.setText("0 / 0 MB")
+            self.cloak_progress_wrap.setVisible(True)
 
         self._cloak_update_worker = CloakUpdateWorker(install_mode=install_mode, parent=self)
         self._cloak_update_worker.status_changed.connect(self._on_cloak_update_status)
+        self._cloak_update_worker.progress_changed.connect(self._on_cloak_download_progress)
         self._cloak_update_worker.finished.connect(self._on_cloak_update_finished)
         self._cloak_update_worker.start()
 
@@ -5610,10 +7114,26 @@ class MainWindow(QMainWindow):
         self.lbl_cloak_update_status.setStyleSheet(f"color: {color}; font-size: 11px;")
         self.lbl_cloak_update_status.setVisible(True)
 
+    def _on_cloak_download_progress(self, percent, done_mb, total_mb):
+        """Live progress update from CloakUpdateWorker log hook."""
+        if hasattr(self, "cloak_progress_bar"):
+            try:
+                self.cloak_progress_bar.setValue(int(percent))
+            except Exception:
+                pass
+        if hasattr(self, "lbl_cloak_progress_text"):
+            try:
+                self.lbl_cloak_progress_text.setText(f"{int(done_mb)} / {int(total_mb)} MB")
+            except Exception:
+                pass
+
     def _on_cloak_update_finished(self, success, message):
         message = str(message or "").encode("ascii", "ignore").decode().strip() or str(message or "")
         self.btn_cloak_update.setEnabled(True)
         self._refresh_cloak_version_display()
+        # Auto-hide progress bar after completion
+        if hasattr(self, "cloak_progress_wrap"):
+            QTimer.singleShot(2500, lambda: self.cloak_progress_wrap.setVisible(False))
         if success:
             self.btn_cloak_update.setText("✅ Up to Date")
             self.lbl_cloak_update_status.setText(f"✅ {message}")
@@ -6273,7 +7793,7 @@ class MainWindow(QMainWindow):
         )
         if self.queue_manager and self.queue_manager.isRunning():
             self.append_log("[SETTINGS] Restart Queue Manager to apply new slot settings.")
-        QMessageBox.information(self, "Settings Saved", "Automation settings saved successfully.")
+        self._toast_success("Settings Saved", "Automation settings saved successfully.")
         
     def start_login(self):
         acc_name = self.acc_name_input.text().strip()
@@ -6663,6 +8183,15 @@ class MainWindow(QMainWindow):
         self.btn_copy_failed.setEnabled(has_rows)
         self.btn_clear_failed.setEnabled(has_rows)
         self.chk_select_all_failed.setEnabled(has_rows)
+        self._update_failed_empty_state()
+
+    def _update_failed_empty_state(self):
+        """Show the empty-state overlay when there are zero failed jobs."""
+        if not hasattr(self, "failed_empty_overlay") or not hasattr(self, "failed_table"):
+            return
+        has_rows = self.failed_table.rowCount() > 0
+        self.failed_empty_overlay.setVisible(not has_rows)
+        self.failed_table.setVisible(has_rows)
 
     def _checked_failed_rows(self):
         rows = []
@@ -6743,7 +8272,10 @@ class MainWindow(QMainWindow):
         self._apply_failed_prompt_edit_style(row)
 
     def load_failed_jobs(self, jobs=None):
-        if jobs is not None:
+        # Defensive: Qt signals sometimes pass a bool (from clicked)
+        # or other non-iterable. Only treat `jobs` as data if it's
+        # an actual list/tuple of dicts.
+        if isinstance(jobs, (list, tuple)):
             self._populate_failed_jobs_table(jobs)
             return
         self._request_failed_jobs_refresh(force=self.tabs.currentWidget() is self.tab_failed_jobs)
@@ -6800,15 +8332,31 @@ class MainWindow(QMainWindow):
                 original_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.failed_table.setItem(i, 5, original_item)
 
-                badge_text = "⚠️ Moderated" if is_moderated else "❌ Failed"
+                # Dark-theme-friendly status badges: bright accent text
+                # on subtle tinted backgrounds. Previously used light-
+                # theme colors (pink bg + dark red text) which washed
+                # out against the Fluent dark table.
+                badge_text = "⚠ MODERATED" if is_moderated else "✕ FAILED"
                 badge_item = QTableWidgetItem(badge_text)
                 badge_item.setToolTip(
                     "Blocked by Google content filter. Edit the prompt before retrying."
                     if is_moderated
                     else f"{str(j.get('job_type') or 'image').title()} job failed after queue retries."
                 )
-                badge_item.setForeground(QColor("#2B1600") if is_moderated else QColor("#5A0F12"))
-                badge_item.setBackground(QColor("#F8D98B") if is_moderated else QColor("#F4B7BD"))
+                if is_moderated:
+                    # Bright amber for moderation
+                    badge_item.setForeground(QColor("#FBBF24"))
+                    badge_item.setBackground(QColor("#2A1F08"))
+                else:
+                    # Bright red for generic failure
+                    badge_item.setForeground(QColor("#F87171"))
+                    badge_item.setBackground(QColor("#2A0F12"))
+                # Bold font for emphasis
+                badge_font = QFont()
+                badge_font.setBold(True)
+                badge_font.setPointSize(10)
+                badge_item.setFont(badge_font)
+                badge_item.setTextAlignment(Qt.AlignCenter)
                 badge_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.failed_table.setItem(i, 6, badge_item)
         finally:
@@ -6819,7 +8367,7 @@ class MainWindow(QMainWindow):
 
     def _retry_failed_rows(self, rows):
         if not rows:
-            QMessageBox.information(self, "No Failed Jobs Selected", "Select at least one failed job to retry.")
+            self._toast_warning("No Failed Jobs Selected", "Select at least one failed job to retry.")
             return
 
         retried = 0
@@ -6911,23 +8459,78 @@ class MainWindow(QMainWindow):
             if prompt_text:
                 prompts.append(prompt_text)
         if not prompts:
-            QMessageBox.information(self, "No Failed Prompts", "There are no failed prompts to copy.")
+            self._toast_warning("No Failed Prompts", "There are no failed prompts to copy.")
             return
 
         QApplication.clipboard().setText("\n".join(prompts))
         self.append_log(f"Copied {len(prompts)} failed prompt(s) to clipboard.")
+        self._toast_success(
+            "Copied to Clipboard",
+            f"{len(prompts)} failed prompt(s) copied. Rewrite them and use Paste Rewritten.",
+        )
+
+    def paste_rewritten_failed_prompts(self):
+        """Bulk-replace failed job prompts from clipboard text.
+        Each line in clipboard becomes the new prompt for the failed
+        job at the same row index. Count must match row count."""
+        row_count = self.failed_table.rowCount()
+        if row_count <= 0:
+            self._toast_warning("No Failed Jobs", "Nothing to paste into.")
+            return
+
+        clipboard_text = QApplication.clipboard().text() or ""
+        # Split by newlines, keep only non-empty lines
+        lines = [ln.strip() for ln in clipboard_text.splitlines() if ln.strip()]
+        if not lines:
+            self._toast_warning(
+                "Clipboard Empty",
+                "No text in clipboard. Copy your rewritten prompts first (one per line).",
+            )
+            return
+
+        if len(lines) != row_count:
+            # Count mismatch — ask the user how to proceed
+            proceed = self._fluent_confirm(
+                "Prompt Count Mismatch",
+                f"Clipboard has {len(lines)} line(s) but there are {row_count} failed job(s).\n\n"
+                f"Continue anyway? Extra clipboard lines will be ignored, "
+                f"and any rows beyond the clipboard count will be left unchanged.",
+                confirm_label="Paste Anyway",
+                cancel_label="Cancel",
+            )
+            if not proceed:
+                return
+
+        # Apply rewrites — walk rows in order, overwrite prompt cell
+        # text. The itemChanged handler auto-tracks edits and updates
+        # self.failed_prompt_edits so Retry Selected/All picks them up.
+        applied = 0
+        for row in range(min(row_count, len(lines))):
+            prompt_item = self.failed_table.item(row, 2)
+            if prompt_item is None:
+                continue
+            new_text = lines[row]
+            if not new_text:
+                continue
+            prompt_item.setText(new_text)
+            applied += 1
+
+        self._toast_success(
+            "Prompts Pasted",
+            f"Updated {applied} failed prompt(s). Click Retry Selected or Retry All to run them.",
+        )
+        self.append_log(f"Pasted {applied} rewritten prompt(s) from clipboard.")
+        self._update_failed_jobs_actions()
 
     def clear_failed_jobs_list(self):
         if self.failed_table.rowCount() <= 0:
             return
-        confirm = QMessageBox.question(
-            self,
+        if not self._fluent_confirm(
             "Clear Failed Jobs",
             "Remove all failed jobs from the list?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
+            confirm_label="Clear",
+            cancel_label="Cancel",
+        ):
             return
 
         self._start_background_task(
@@ -7137,10 +8740,10 @@ class MainWindow(QMainWindow):
     def add_bulk_i2v_to_queue(self, mode_key):
         images, prompts, pairs = self._build_bulk_pairs(mode_key)
         if not images:
-            QMessageBox.warning(self, "No Images", "Load images first for bulk image-to-video.")
+            self._toast_warning("No Images", "Load images first for bulk image-to-video.")
             return
         if not pairs:
-            QMessageBox.warning(self, "No Pairs", "No image/prompt pairs are ready to add to the queue.")
+            self._toast_warning("No Pairs", "No image/prompt pairs are ready to add to the queue.")
             return
 
         bulk_sub_mode = str(mode_key or "")
@@ -7448,7 +9051,7 @@ class MainWindow(QMainWindow):
 
         text = self.pipe_txt_img_prompts.toPlainText().strip() if hasattr(self, "pipe_txt_img_prompts") else ""
         if not text:
-            QMessageBox.warning(self, "No Prompts", "Enter at least one image prompt.")
+            self._toast_warning("No Prompts", "Enter at least one image prompt.")
             return
 
         image_prompts = [line.strip() for line in text.splitlines() if line.strip()]
@@ -7526,17 +9129,17 @@ class MainWindow(QMainWindow):
         end_image_path = str(settings.get("end_image_path") or "").strip()
 
         if sub_mode == "ingredients" and not ref_path:
-            QMessageBox.warning(self, "Missing Reference Image", "Ingredients mode needs a reference image.")
+            self._toast_warning("Missing Reference Image", "Ingredients mode needs a reference image.")
             return False
         if sub_mode == "frames_start" and not start_image_path:
-            QMessageBox.warning(self, "Missing Start Image", "Frames - Start Image mode needs a start image.")
+            self._toast_warning("Missing Start Image", "Frames - Start Image mode needs a start image.")
             return False
         if sub_mode == "frames_start_end":
             if not start_image_path:
-                QMessageBox.warning(self, "Missing Start Image", "Frames - Start + End mode needs a start image.")
+                self._toast_warning("Missing Start Image", "Frames - Start + End mode needs a start image.")
                 return False
             if not end_image_path:
-                QMessageBox.warning(self, "Missing End Image", "Frames - Start + End mode needs an end image.")
+                self._toast_warning("Missing End Image", "Frames - Start + End mode needs an end image.")
                 return False
         return True
 
@@ -7738,18 +9341,18 @@ class MainWindow(QMainWindow):
             with open(file_path, "r", encoding="latin-1") as handle:
                 content = handle.read()
         except Exception as exc:
-            QMessageBox.warning(self, "Import Failed", f"Unable to read file:\n{exc}")
+            self._toast_error("Import Failed", f"Unable to read file: {exc}")
             return
 
         self.prompts_input.setPlainText(content)
 
     def add_prompts_to_queue(self):
         if hasattr(self, "mode_tabs") and self.mode_tabs.currentIndex() == 4:
-            QMessageBox.information(self, "Use Pipeline Add Button", "Use the Pipeline tab's 'Add All to Queue' button.")
+            self._toast_info("Use Pipeline Add Button", "Use the Pipeline tab's 'Add All to Queue' button.")
             return
         text = self.prompts_input.toPlainText().strip()
         if not text:
-            QMessageBox.warning(self, "Warning", "Please enter at least one prompt.")
+            self._toast_warning("No Prompts", "Please enter at least one prompt.")
             return
 
         current_settings = self._current_generation_settings()
@@ -7798,14 +9401,12 @@ class MainWindow(QMainWindow):
         )
 
     def clear_queue(self):
-        reply = QMessageBox.question(
-            self,
-            'Confirm Clear',
-            'Clear all task queue history (pending, running, completed, failed) in one click?',
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
+        if self._fluent_confirm(
+            "Confirm Clear",
+            "Clear all task queue history (pending, running, completed, failed) in one click?",
+            confirm_label="Clear All",
+            cancel_label="Cancel",
+        ):
             if self.queue_manager and self.queue_manager.isRunning():
                 self.pending_clear_all = True
                 self.queue_manager.stop()
@@ -7946,6 +9547,10 @@ class MainWindow(QMainWindow):
         self._set_queue_controls_state("running")
         self._show_session_warning("")
         self.append_log("Queue Manager Started. Dispatching bots...")
+        self._toast_success(
+            "Automation Started",
+            f"{pending_count} pending job(s) • {selected_slots} slot(s)/account",
+        )
 
     def pause_queue_manager(self):
         if not self.queue_manager or not self.queue_manager.isRunning():
@@ -7959,6 +9564,10 @@ class MainWindow(QMainWindow):
         self.append_log(
             f"[SYSTEM] Queue paused. {running} account(s) still running will finish current jobs. No new jobs will dispatch until resumed."
         )
+        self._toast_warning(
+            "Queue Paused",
+            f"{running} account(s) finishing current jobs. No new dispatch.",
+        )
 
     def resume_queue_manager(self):
         if not self.queue_manager or not self.queue_manager.isRunning():
@@ -7970,23 +9579,23 @@ class MainWindow(QMainWindow):
         self._set_queue_controls_state("running")
         pending = self._cached_pending_count()
         self.append_log(f"[SYSTEM] Queue resumed. {pending} pending job(s) ready for dispatch.")
+        self._toast_success("Queue Resumed", f"{pending} pending job(s) ready for dispatch.")
 
     def stop_queue_manager(self):
         if self.queue_manager and self.queue_manager.isRunning():
             self.queue_manager.stop()
             self._set_queue_controls_state("stopping")
             self.append_log("[SYSTEM] Stop requested. Active jobs are being cancelled and queue state will reset.")
+            self._toast_info("Stop Requested", "Cancelling active jobs...")
 
     def force_stop_and_clear_queue(self):
-        reply = QMessageBox.warning(
-            self,
+        if not self._fluent_confirm(
             "Force Stop + Instant Clear",
-            "This will cancel active jobs immediately and clear full queue now.\n"
+            "This will cancel active jobs immediately and clear the full queue now.\n"
             "Running tasks may be lost. Continue?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
+            confirm_label="Force Stop",
+            cancel_label="Cancel",
+        ):
             return
 
         from src.db.db_manager import clear_all_jobs

@@ -800,7 +800,7 @@ class HttpModeManager:
             self._log("[HTTP] No accounts configured.")
             return
 
-        slots_per_account = max(1, min(40, get_int_setting("slots_per_account", 3)))
+        slots_per_account = max(1, min(40, get_int_setting("slots_per_account", 5)))
         self._log(
             f"[HTTP] Starting: {len(all_accs)} account(s), "
             f"{slots_per_account} worker(s) each."

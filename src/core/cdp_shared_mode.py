@@ -2151,7 +2151,7 @@ class CDPSharedManager:
             self._log("[CDPShared] No accounts configured.")
             return
 
-        slots_per_account = max(1, min(40, get_int_setting("slots_per_account", 3)))
+        slots_per_account = max(1, min(40, get_int_setting("slots_per_account", 5)))
         base_port = random.randint(9222, 9280)
 
         # Count pending jobs so start() can create only needed contexts

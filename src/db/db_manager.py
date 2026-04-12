@@ -9,7 +9,7 @@ from src.core.app_paths import get_jobs_db_path, get_outputs_dir
 DB_PATH = str(get_jobs_db_path())
 
 DEFAULT_APP_SETTINGS = {
-    "slots_per_account": "3",
+    "slots_per_account": "5",
     "same_account_stagger_seconds": "1.0",
     "global_stagger_min_seconds": "0.3",
     "global_stagger_max_seconds": "0.6",
@@ -190,7 +190,10 @@ def _ensure_db_schema(conn):
         )
 
     legacy_default_updates = {
-        "slots_per_account": {("2", "2.0"): "3"},
+        # Migration: old defaults of 2 or 3 (before the Fluent UI
+        # redesign) now bump to 5. Users who explicitly chose other
+        # values (1, 4, 6, etc.) are left alone.
+        "slots_per_account": {("2", "2.0", "3", "3.0"): "5"},
         "same_account_stagger_seconds": {("1.5", "3", "3.0"): "1.0"},
         "global_stagger_min_seconds": {("0.5", "1", "1.0"): "0.3"},
         "global_stagger_max_seconds": {("1.0", "3", "3.0"): "0.6"},

@@ -14,6 +14,15 @@ from PySide6.QtWidgets import QApplication
 from src.core.app_paths import get_app_data_dir
 from src.ui.main_window import MainWindow
 
+# Phase 1: Fluent theme foundation — applies globally to all Qt widgets.
+# Theme accent matches existing palette (#2563EB = Tailwind blue-600).
+# Existing custom QSS in _apply_modern_theme() layers on top.
+try:
+    from qfluentwidgets import setTheme, setThemeColor, Theme
+    _FLUENT_AVAILABLE = True
+except Exception:
+    _FLUENT_AVAILABLE = False
+
 
 APP_DATA_DIR = str(get_app_data_dir())
 
@@ -49,6 +58,16 @@ def main():
 
     # Set global application style
     app.setStyle("Fusion")
+
+    # Phase 1: Apply Fluent dark theme globally. Must happen AFTER
+    # QApplication is created but BEFORE any widget is instantiated.
+    # setThemeColor accents buttons/focus rings/nav highlights.
+    if _FLUENT_AVAILABLE:
+        try:
+            setTheme(Theme.DARK)
+            setThemeColor("#2563EB")
+        except Exception:
+            pass
 
     window = MainWindow()
     window.show()
