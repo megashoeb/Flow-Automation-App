@@ -19,7 +19,8 @@ def _ensure_dependencies():
         return
     _ensure_dependencies._done = True
 
-    if getattr(sys, "frozen", False):
+    # Skip in any packaged/frozen build (.exe, .app, PyInstaller)
+    if getattr(sys, "frozen", False) or getattr(sys, "_MEIPASS", None) or hasattr(sys, "_MEIPASS"):
         return  # .exe build — pip not available
 
     req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
