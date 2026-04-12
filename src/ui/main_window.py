@@ -445,6 +445,22 @@ class CloakUpdateWorker(QThread):
         except Exception:
             pass
 
+    def _pip_show_version(self):
+        """Get real installed cloakbrowser version via pip show (no cache issues)."""
+        try:
+            _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "show", "cloakbrowser"],
+                capture_output=True, text=True, timeout=15, **_no_win,
+            )
+            if result.returncode == 0 and result.stdout:
+                for line in result.stdout.splitlines():
+                    if line.startswith("Version:"):
+                        return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return "unknown"
+
     def run(self):
         import importlib
 
@@ -453,13 +469,8 @@ class CloakUpdateWorker(QThread):
         try:
             is_frozen = getattr(sys, "frozen", False)
 
-            # ── Get version BEFORE upgrade ──
-            pkg_version_before = "none"
-            try:
-                _cb_pre = importlib.import_module("cloakbrowser")
-                pkg_version_before = str(getattr(_cb_pre, "__version__", "none"))
-            except Exception:
-                pass
+            # ── Get version BEFORE upgrade (via pip show — no cache) ──
+            pkg_version_before = self._pip_show_version()
 
             if is_frozen:
                 self.status_changed.emit(
@@ -501,7 +512,10 @@ class CloakUpdateWorker(QThread):
 
             self.status_changed.emit("⏳ Checking for binary updates...", "#60A5FA")
 
-            # Force clean reimport after pip upgrade to pick up new version
+            # ── Get version AFTER pip upgrade (via pip show — no cache) ──
+            pkg_version_after = self._pip_show_version()
+
+            # Force clean reimport for binary operations
             importlib.invalidate_caches()
             for mod_name in list(sys.modules.keys()):
                 if mod_name == "cloakbrowser" or mod_name.startswith("cloakbrowser."):
@@ -522,19 +536,15 @@ class CloakUpdateWorker(QThread):
 
             info_before = binary_info() or {}
             bin_version_before = str(info_before.get("version") or "none")
-            pkg_version_after = str(getattr(cloakbrowser, "__version__", "unknown"))
 
             self.status_changed.emit("⏳ Downloading latest binary if available...", "#60A5FA")
-            # Install log handler to capture download progress %, then
-            # ensure_binary() — the handler emits progress_changed as
-            # CloakBrowser logs "Download progress: N% (done/total MB)".
             _log_handler = self._install_download_log_handler()
             try:
                 ensure_binary()
             finally:
                 self._remove_download_log_handler(_log_handler)
 
-            # Reimport again to get fresh binary_info after ensure_binary
+            # Reimport for fresh binary_info after ensure_binary
             for mod_name in list(sys.modules.keys()):
                 if mod_name == "cloakbrowser" or mod_name.startswith("cloakbrowser."):
                     del sys.modules[mod_name]
@@ -545,14 +555,13 @@ class CloakUpdateWorker(QThread):
             info_after = binary_info() or {}
             bin_version_after = str(info_after.get("version") or "none")
             installed = bool(info_after.get("installed"))
-            pkg_version_after = str(getattr(cloakbrowser, "__version__", "unknown"))
 
             if not installed:
                 self.finished.emit(False, "Binary download failed.")
                 return
 
             # Check if either pip package or binary was updated
-            pkg_updated = pkg_version_before != "none" and pkg_version_before != pkg_version_after
+            pkg_updated = pkg_version_before not in ("none", "unknown") and pkg_version_before != pkg_version_after
             bin_updated = bin_version_before != bin_version_after
 
             if pkg_updated or bin_updated:
