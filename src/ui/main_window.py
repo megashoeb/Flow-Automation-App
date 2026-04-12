@@ -8413,23 +8413,29 @@ class MainWindow(QMainWindow):
                 original_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.failed_table.setItem(i, 5, original_item)
 
-                # Dark-theme-friendly status badges: bright accent text
-                # on subtle tinted backgrounds. Previously used light-
-                # theme colors (pink bg + dark red text) which washed
-                # out against the Fluent dark table.
-                badge_text = "⚠ MODERATED" if is_moderated else "✕ FAILED"
+                # Status badge: RETRYING / MODERATED / FAILED
+                job_status = str(j.get("status") or "failed").strip().lower()
+                is_retrying = job_status in ("pending", "running") and j.get("is_retry")
+
+                if is_retrying:
+                    badge_text = "🔄 RETRYING"
+                    badge_tooltip = "Job is being retried. Will disappear when successful."
+                elif is_moderated:
+                    badge_text = "⚠ MODERATED"
+                    badge_tooltip = "Blocked by Google content filter. Edit the prompt before retrying."
+                else:
+                    badge_text = "✕ FAILED"
+                    badge_tooltip = f"{str(j.get('job_type') or 'image').title()} job failed after queue retries."
+
                 badge_item = QTableWidgetItem(badge_text)
-                badge_item.setToolTip(
-                    "Blocked by Google content filter. Edit the prompt before retrying."
-                    if is_moderated
-                    else f"{str(j.get('job_type') or 'image').title()} job failed after queue retries."
-                )
-                if is_moderated:
-                    # Bright amber for moderation
+                badge_item.setToolTip(badge_tooltip)
+                if is_retrying:
+                    badge_item.setForeground(QColor("#60A5FA"))
+                    badge_item.setBackground(QColor("#0C2D5E"))
+                elif is_moderated:
                     badge_item.setForeground(QColor("#FBBF24"))
                     badge_item.setBackground(QColor("#2A1F08"))
                 else:
-                    # Bright red for generic failure
                     badge_item.setForeground(QColor("#F87171"))
                     badge_item.setBackground(QColor("#2A0F12"))
                 # Bold font for emphasis
@@ -9739,7 +9745,8 @@ class MainWindow(QMainWindow):
 
     def on_job_updated(self, job_id, status, account, error_msg):
         self._request_queue_snapshot()
-        if str(status or "").strip().lower() in ("failed", "pending", "completed"):
+        # Refresh failed tab on any status change — retrying jobs show there too
+        if str(status or "").strip().lower() in ("failed", "pending", "completed", "running"):
             self._schedule_failed_jobs_refresh()
 
     def resizeEvent(self, event):

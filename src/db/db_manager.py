@@ -816,12 +816,16 @@ def retry_failed_jobs_to_top(job_updates, retry_source="failed_tab"):
 def get_failed_jobs():
     conn = get_connection()
     cursor = conn.cursor()
+    # Include failed jobs AND retrying jobs (is_retry=1, status pending/running)
+    # so they stay visible in Failed tab until successfully completed.
     cursor.execute(
         '''
-        SELECT id, queue_no, prompt, job_type, model, error_message
+        SELECT id, queue_no, prompt, job_type, model, error_message,
+               COALESCE(output_index, queue_no) as original_sno, status, is_retry
         FROM jobs
         WHERE status = 'failed'
-        ORDER BY queue_no ASC, created_at ASC
+           OR (is_retry = 1 AND status IN ('pending', 'running'))
+        ORDER BY COALESCE(output_index, queue_no) ASC, created_at ASC
         '''
     )
     jobs = cursor.fetchall()
@@ -829,16 +833,19 @@ def get_failed_jobs():
     return [
         {
             "id": j[0],
-            "queue_no": j[1],
+            "queue_no": j[2 + 4],       # original_sno (output_index or queue_no)
             "prompt": j[2],
             "job_type": j[3],
             "model": j[4],
             "error": j[5],
+            "status": j[7],
+            "is_retry": bool(j[8] or 0),
         }
         for j in jobs
     ]
 
 def clear_failed_jobs():
+    """Delete only permanently failed jobs. Don't touch retrying jobs."""
     deleted_count = 0
     def _op(conn):
         nonlocal deleted_count
