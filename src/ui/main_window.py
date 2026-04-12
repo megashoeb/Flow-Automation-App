@@ -453,6 +453,14 @@ class CloakUpdateWorker(QThread):
         try:
             is_frozen = getattr(sys, "frozen", False)
 
+            # ── Get version BEFORE upgrade ──
+            pkg_version_before = "none"
+            try:
+                _cb_pre = importlib.import_module("cloakbrowser")
+                pkg_version_before = str(getattr(_cb_pre, "__version__", "none"))
+            except Exception:
+                pass
+
             if is_frozen:
                 self.status_changed.emit(
                     "⏳ Checking binary updates (pip update not available in .exe)...",
@@ -461,47 +469,46 @@ class CloakUpdateWorker(QThread):
             else:
                 self.status_changed.emit("⏳ Updating CloakBrowser package...", "#60A5FA")
                 python_exe = sys.executable
-                pip_cmd = [
-                    python_exe,
-                    "-m",
-                    "pip",
-                    "install",
-                    "cloakbrowser",
-                    "--upgrade",
-                    "--quiet",
+                _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
+                pip_success = False
+
+                # Try multiple pip strategies for cross-platform compatibility
+                pip_strategies = [
+                    [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--quiet"],
+                    [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--quiet", "--break-system-packages"],
+                    [python_exe, "-m", "pip", "install", "cloakbrowser", "--upgrade", "--quiet", "--user"],
                 ]
-                try:
-                    _no_win = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform.startswith("win") else {}
-                    result = subprocess.run(
-                        pip_cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
-                        **_no_win,
-                    )
-                    if result.returncode != 0:
-                        pip_cmd_with_break = list(pip_cmd) + ["--break-system-packages"]
+                for pip_cmd in pip_strategies:
+                    try:
                         result = subprocess.run(
-                            pip_cmd_with_break,
+                            pip_cmd,
                             capture_output=True,
                             text=True,
                             timeout=120,
                             **_no_win,
                         )
-                        if result.returncode != 0:
-                            error_msg = (result.stderr or result.stdout or "Unknown error").strip()[:100]
-                            self.status_changed.emit(f"⚠ pip update failed: {error_msg}", "#F59E0B")
-                except subprocess.TimeoutExpired:
-                    self.status_changed.emit("⚠ pip update timed out. Checking binary...", "#F59E0B")
-                except FileNotFoundError:
-                    self.status_changed.emit("⚠ pip not found. Checking binary...", "#F59E0B")
+                        if result.returncode == 0:
+                            pip_success = True
+                            self.status_changed.emit("✓ Package upgraded via pip.", "#22C55E")
+                            break
+                    except (subprocess.TimeoutExpired, FileNotFoundError):
+                        continue
+                    except Exception:
+                        continue
+
+                if not pip_success:
+                    self.status_changed.emit("⚠ pip upgrade failed — checking binary anyway...", "#F59E0B")
 
             self.status_changed.emit("⏳ Checking for binary updates...", "#60A5FA")
+
+            # Force clean reimport after pip upgrade to pick up new version
             importlib.invalidate_caches()
+            for mod_name in list(sys.modules.keys()):
+                if mod_name == "cloakbrowser" or mod_name.startswith("cloakbrowser."):
+                    del sys.modules[mod_name]
 
             try:
                 cloakbrowser = importlib.import_module("cloakbrowser")
-                cloakbrowser = importlib.reload(cloakbrowser)
             except ImportError:
                 self.finished.emit(False, "CloakBrowser not installed. Install via pip first.")
                 return
@@ -514,7 +521,8 @@ class CloakUpdateWorker(QThread):
                 return
 
             info_before = binary_info() or {}
-            version_before = str(info_before.get("version") or "none")
+            bin_version_before = str(info_before.get("version") or "none")
+            pkg_version_after = str(getattr(cloakbrowser, "__version__", "unknown"))
 
             self.status_changed.emit("⏳ Downloading latest binary if available...", "#60A5FA")
             # Install log handler to capture download progress %, then
@@ -526,21 +534,38 @@ class CloakUpdateWorker(QThread):
             finally:
                 self._remove_download_log_handler(_log_handler)
 
+            # Reimport again to get fresh binary_info after ensure_binary
+            for mod_name in list(sys.modules.keys()):
+                if mod_name == "cloakbrowser" or mod_name.startswith("cloakbrowser."):
+                    del sys.modules[mod_name]
+            importlib.invalidate_caches()
+            cloakbrowser = importlib.import_module("cloakbrowser")
+            binary_info = getattr(cloakbrowser, "binary_info")
+
             info_after = binary_info() or {}
-            version_after = str(info_after.get("version") or "none")
+            bin_version_after = str(info_after.get("version") or "none")
             installed = bool(info_after.get("installed"))
-            pkg_version = str(getattr(cloakbrowser, "__version__", "unknown"))
+            pkg_version_after = str(getattr(cloakbrowser, "__version__", "unknown"))
 
             if not installed:
                 self.finished.emit(False, "Binary download failed.")
                 return
 
-            if version_before != version_after:
-                self.finished.emit(True, f"Updated! {version_before} → {version_after}")
+            # Check if either pip package or binary was updated
+            pkg_updated = pkg_version_before != "none" and pkg_version_before != pkg_version_after
+            bin_updated = bin_version_before != bin_version_after
+
+            if pkg_updated or bin_updated:
+                changes = []
+                if pkg_updated:
+                    changes.append(f"pkg {pkg_version_before} → {pkg_version_after}")
+                if bin_updated:
+                    changes.append(f"binary {bin_version_before} → {bin_version_after}")
+                self.finished.emit(True, f"Updated! {', '.join(changes)}")
             else:
                 self.finished.emit(
                     True,
-                    f"Already on latest version (v{pkg_version}, binary {version_after})",
+                    f"Already on latest version (v{pkg_version_after}, binary {bin_version_after})",
                 )
         except Exception as exc:
             error_str = str(exc)[:100]
@@ -7006,6 +7031,10 @@ class MainWindow(QMainWindow):
         try:
             import importlib
 
+            # Force clean reimport to pick up any pip-upgraded version
+            for _mod in list(sys.modules.keys()):
+                if _mod == "cloakbrowser" or _mod.startswith("cloakbrowser."):
+                    del sys.modules[_mod]
             importlib.invalidate_caches()
             cloakbrowser = importlib.import_module("cloakbrowser")
             binary_info = getattr(cloakbrowser, "binary_info", None)
