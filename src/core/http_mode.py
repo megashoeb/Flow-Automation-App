@@ -1217,6 +1217,9 @@ class HttpModeManager:
 
     def _report_recaptcha_fail(self, account_name):
         """Track reCAPTCHA failure. Trigger restart if threshold reached."""
+        # If restart already queued for this account, don't keep counting
+        if account_name in self._restart_pending:
+            return
         self._recaptcha_fails[account_name] = self._recaptcha_fails.get(account_name, 0) + 1
         count = self._recaptcha_fails[account_name]
         self._log(
@@ -1418,7 +1421,9 @@ class HttpModeManager:
         job_type = job.get("job_type", "image")
         prompt = job.get("prompt", "")
         model = job.get("model", "")
-        queue_no = job.get("queue_no")
+        # Use output_index (preserved original S.No.) for file naming;
+        # queue_no can be negative for retry jobs.
+        queue_no = job.get("output_index") or job.get("queue_no")
 
         self._log(f"[{worker.slot_id}] Processing job {job_id[:6]}...: {prompt[:40]}...")
 
@@ -1426,6 +1431,13 @@ class HttpModeManager:
         last_error = ""
 
         for attempt in range(max_retries + 1):
+            # If browser restart is pending for this account, re-queue immediately
+            if worker.account_name in self._restart_pending:
+                update_job_status(job_id, "pending", account="")
+                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                self._log(f"[{worker.slot_id}] Job {job_id[:6]}... re-queued (browser restarting).")
+                return
+
             try:
                 if "video" in job_type:
                     video_model = job.get("video_model") or model
