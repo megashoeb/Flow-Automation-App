@@ -41,7 +41,9 @@ from src.db.db_manager import (
     get_setting,
     get_int_setting,
     get_bool_setting,
+    get_output_directory,
     update_job_status,
+    update_job_runtime_state,
 )
 
 DATA_DIR = str(get_sessions_dir())
@@ -121,11 +123,12 @@ class SharedBrowser:
     No separate HTTP clients needed.
     """
 
-    def __init__(self, account_name, session_path, cookies_json_path, log_fn, project_id=None):
+    def __init__(self, account_name, session_path, cookies_json_path, log_fn, project_id=None, headless=True):
         self.account_name = account_name
         self._session_path = session_path
         self._cookies_json = cookies_json_path
         self._log = log_fn
+        self._headless = headless
         self._context = None
         self._page = None
         self._project_id = project_id
@@ -151,10 +154,13 @@ class SharedBrowser:
 
             await self._page.goto(
                 "https://labs.google/fx/tools/flow",
-                wait_until="domcontentloaded",
+                wait_until="load",
                 timeout=30000,
             )
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
+
+            # Warmup: humanized scroll to improve reCAPTCHA score
+            await self._warmup_page()
 
             # Extract project ID
             if self._project_id:
@@ -165,6 +171,19 @@ class SharedBrowser:
             if not self._project_id:
                 self._log(f"[SharedBrowser:{self.account_name}] No project ID found. Check login.")
                 return False
+
+            # Navigate to the project URL so reCAPTCHA runs in correct context
+            current_url = self._page.url
+            if self._project_id and f"/project/{self._project_id}" not in current_url:
+                try:
+                    await self._page.goto(
+                        f"https://labs.google/fx/tools/flow/project/{self._project_id}",
+                        wait_until="load", timeout=15000,
+                    )
+                    await asyncio.sleep(3)
+                    self._log(f"[SharedBrowser:{self.account_name}] Navigated to project URL.")
+                except Exception as e:
+                    self._log(f"[SharedBrowser:{self.account_name}] Project URL nav warn: {str(e)[:60]}")
 
             # Verify reCAPTCHA is loaded
             recap_ok = await self._check_recaptcha()
@@ -205,20 +224,19 @@ class SharedBrowser:
 
             if cloak_api.get("available") and cloak_persistent:
                 seed = random.randint(10000, 99999)
-                if platform.system() == "Darwin":
-                    # Mac: fresh profile + imported cookies (avoid lock conflicts)
-                    profile = self._session_path + "_shared_browser"
-                    os.makedirs(profile, exist_ok=True)
-                    self._clean_locks(profile)
-                else:
-                    # Windows: use account's session directly (persistent cookies)
-                    profile = self._session_path
-                    self._clean_locks(profile)
+                # Use separate profile to avoid lock conflicts with main browser
+                profile = self._session_path + "_shared_browser"
+                os.makedirs(profile, exist_ok=True)
+                self._clean_locks(profile)
+
+                # Copy trust data from main profile (reCAPTCHA score, localStorage)
+                self._copy_profile_trust_data(self._session_path, profile)
 
                 self._log(f"[SharedBrowser:{self.account_name}] Profile path: {profile}")
 
+                self._log(f"[SharedBrowser:{self.account_name}] Headless: {self._headless}")
                 self._context = await cloak_persistent(
-                    profile, headless=True,
+                    profile, headless=self._headless,
                     args=[f"--fingerprint={seed}"], humanize=True,
                 )
 
@@ -246,7 +264,7 @@ class SharedBrowser:
 
                 return True
         except Exception as e:
-            self._log(f"[SharedBrowser:{self.account_name}] CloakBrowser not available: {str(e)[:40]}")
+            self._log(f"[SharedBrowser:{self.account_name}] CloakBrowser not available: {str(e)[:120]}")
 
         # Fallback: Playwright
         try:
@@ -254,7 +272,7 @@ class SharedBrowser:
             self._log(f"[SharedBrowser:{self.account_name}] Profile path: {self._session_path}")
 
             self._context = await playwright_instance.chromium.launch_persistent_context(
-                self._session_path, headless=True,
+                self._session_path, headless=self._headless,
                 args=["--disable-gpu", "--no-sandbox", "--disable-blink-features=AutomationControlled"],
                 ignore_default_args=["--enable-automation"],
             )
@@ -359,31 +377,20 @@ class SharedBrowser:
         await self._trigger_bearer_capture()
         return self._bearer_token
 
-    async def _extract_project_id(self):
-        """Extract Flow project ID from page."""
-        if not self._page:
-            return None
-
-        url = self._page.url
-        self._log(f"[SharedBrowser:{self.account_name}] Current URL: {url}")
-
-        if "accounts.google.com" in url or "signin" in url.lower():
-            self._log(f"[SharedBrowser:{self.account_name}] Redirected to sign-in — cookies not working!")
-            return None
-
-        # URL patterns
+    def _extract_project_id_from_url(self, url):
+        """Extract project ID from a URL string."""
         match = re.search(r"/project/([a-z0-9-]{16,})", url, re.IGNORECASE)
         if match:
-            self._log(f"[SharedBrowser:{self.account_name}] Project ID from URL: {match.group(1)}")
             return match.group(1)
-
         match = re.search(r"/flow/([a-f0-9-]{36})", url)
         if match:
             return match.group(1)
+        return None
 
-        # DOM hints
+    async def _extract_project_id_from_dom(self):
+        """Extract project ID from DOM hints."""
         try:
-            pid = await self._page.evaluate("""
+            return await self._page.evaluate("""
                 () => {
                     const regex = /\\/project\\/([a-z0-9-]{16,})/i;
                     const candidates = [String(window.location.href || "")];
@@ -404,40 +411,161 @@ class SharedBrowser:
                     return null;
                 }
             """)
-            if pid:
-                self._log(f"[SharedBrowser:{self.account_name}] Project ID from DOM: {pid}")
-                return pid
-        except Exception as e:
-            self._log(f"[SharedBrowser:{self.account_name}] DOM extraction error: {str(e)[:50]}")
-
-        # bot_engine shared cache
-        try:
-            from src.core.bot_engine import GoogleLabsBot
-            cached = GoogleLabsBot._shared_flow_project_id_by_account.get(self.account_name)
-            if cached:
-                self._log(f"[SharedBrowser:{self.account_name}] Project ID from cache: {cached}")
-                return cached
         except Exception:
-            pass
+            return None
 
-        # Click "New project"
+    async def _click_new_project(self):
+        """Click 'New project' button using multiple strategies (mirrors bot_engine)."""
+        # Strategy 1: XPath text match
         try:
-            self._log(f"[SharedBrowser:{self.account_name}] Clicking 'New project'...")
             btn = self._page.locator(
                 "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
                 " 'abcdefghijklmnopqrstuvwxyz'), 'new project')]"
             ).first
-            if await btn.is_visible():
+            if await btn.is_visible(timeout=3000):
                 await btn.click(force=True)
-                await asyncio.sleep(5)
-                url = self._page.url
-                match = re.search(r"/project/([a-z0-9-]{16,})", url, re.IGNORECASE)
-                if match:
-                    return match.group(1)
+                self._log(f"[SharedBrowser:{self.account_name}] Clicked 'New project' (text match).")
+                return True
         except Exception:
             pass
 
-        self._log(f"[SharedBrowser:{self.account_name}] No project ID found. URL: {self._page.url}")
+        # Strategy 2: Heuristic button search (same as bot_engine)
+        try:
+            result = await self._page.evaluate("""
+                () => {
+                    const isVisible = (el) => {
+                        if (!el || !el.isConnected) return false;
+                        const s = window.getComputedStyle(el);
+                        if (!s || s.display === "none" || s.visibility === "hidden" || s.opacity === "0") return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 10 && r.height > 10;
+                    };
+                    const btns = Array.from(document.querySelectorAll("button, [role='button']"));
+                    let best = null;
+                    let bestScore = -1e9;
+                    for (const b of btns) {
+                        if (!isVisible(b)) continue;
+                        const txt = String(b.textContent || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                        const aria = String(b.getAttribute("aria-label") || "").toLowerCase();
+                        const title = String(b.getAttribute("title") || "").toLowerCase();
+                        const icon = String(
+                            b.querySelector("i, mat-icon, .material-symbols, .material-symbols-outlined")?.textContent || ""
+                        ).toLowerCase().trim();
+                        const looksCreate =
+                            txt.includes("new project") ||
+                            (txt.includes("new") && txt.includes("project")) ||
+                            txt.includes("create") ||
+                            aria.includes("new project") ||
+                            aria.includes("create project") ||
+                            title.includes("new project") ||
+                            txt === "+" ||
+                            icon === "add" ||
+                            icon === "add_2";
+                        if (!looksCreate) continue;
+                        const r = b.getBoundingClientRect();
+                        let score = 0;
+                        score += (r.right || 0) * 0.1;
+                        score -= (r.top || 0) * 0.08;
+                        if (txt.includes("new project") || aria.includes("new project")) score += 500;
+                        if (txt === "+" || icon === "add" || icon === "add_2") score += 100;
+                        if (score > bestScore) { bestScore = score; best = b; }
+                    }
+                    if (!best) return { ok: false };
+                    try { best.click(); } catch {
+                        best.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                    }
+                    return { ok: true };
+                }
+            """)
+            if result and result.get("ok"):
+                self._log(f"[SharedBrowser:{self.account_name}] Clicked 'New project' (heuristic).")
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    async def _extract_project_id(self):
+        """Extract Flow project ID — robust multi-strategy approach (mirrors bot_engine)."""
+        if not self._page:
+            return None
+
+        url = self._page.url
+        self._log(f"[SharedBrowser:{self.account_name}] Current URL: {url}")
+
+        if "accounts.google.com" in url or "signin" in url.lower():
+            self._log(f"[SharedBrowser:{self.account_name}] Redirected to sign-in — cookies not working!")
+            return None
+
+        # 1. bot_engine shared cache — try navigating to cached project directly
+        cached_pid = None
+        try:
+            from src.core.bot_engine import GoogleLabsBot
+            cached_pid = GoogleLabsBot._shared_flow_project_id_by_account.get(self.account_name)
+        except Exception:
+            pass
+
+        if cached_pid:
+            self._log(f"[SharedBrowser:{self.account_name}] Trying cached project: {cached_pid}")
+            try:
+                await self._page.goto(
+                    f"https://labs.google/fx/tools/flow/project/{cached_pid}",
+                    wait_until="domcontentloaded", timeout=15000,
+                )
+                await asyncio.sleep(2)
+                pid = self._extract_project_id_from_url(self._page.url)
+                if pid:
+                    self._log(f"[SharedBrowser:{self.account_name}] Project ID from cache nav: {pid}")
+                    return pid
+            except Exception:
+                pass
+
+        # 2. Check current URL
+        pid = self._extract_project_id_from_url(self._page.url)
+        if pid:
+            self._log(f"[SharedBrowser:{self.account_name}] Project ID from URL: {pid}")
+            return pid
+
+        # 3. DOM hints
+        pid = await self._extract_project_id_from_dom()
+        if pid:
+            self._log(f"[SharedBrowser:{self.account_name}] Project ID from DOM: {pid}")
+            return pid
+
+        # 4. Click "New project" with retries + polling (like bot_engine)
+        for attempt in range(1, 4):
+            self._log(f"[SharedBrowser:{self.account_name}] New project attempt {attempt}/3...")
+            clicked = await self._click_new_project()
+            if clicked:
+                await asyncio.sleep(1.5)
+            else:
+                self._log(f"[SharedBrowser:{self.account_name}] 'New project' button not found.")
+                await asyncio.sleep(1)
+
+            # Poll for project ID in URL or DOM (14 checks × 0.5s = ~7s)
+            for poll in range(14):
+                pid = self._extract_project_id_from_url(self._page.url)
+                if pid:
+                    self._log(f"[SharedBrowser:{self.account_name}] Project ID from URL (poll {poll}): {pid}")
+                    return pid
+                pid = await self._extract_project_id_from_dom()
+                if pid:
+                    self._log(f"[SharedBrowser:{self.account_name}] Project ID from DOM (poll {poll}): {pid}")
+                    return pid
+                await asyncio.sleep(0.5)
+
+            # Reload flow page between attempts
+            if attempt < 3:
+                try:
+                    await self._page.goto(
+                        "https://labs.google/fx/tools/flow",
+                        wait_until="domcontentloaded", timeout=15000,
+                    )
+                    await asyncio.sleep(2)
+                except Exception:
+                    pass
+
+        self._log(f"[SharedBrowser:{self.account_name}] No project ID found after 3 attempts. URL: {self._page.url}")
         return None
 
     async def _check_recaptcha(self):
@@ -448,6 +576,28 @@ class SharedBrowser:
             )
         except Exception:
             return False
+
+    async def _warmup_page(self):
+        """Humanized scroll warmup to improve reCAPTCHA score."""
+        if not self._page:
+            return
+        self._log(f"[SharedBrowser:{self.account_name}] Warming up page (humanized scroll)...")
+        try:
+            direction = 1
+            for _ in range(8):
+                delta = random.randint(90, 260) * direction
+                await self._page.mouse.wheel(0, delta)
+                if random.random() < 0.3:
+                    direction *= -1
+                await asyncio.sleep(random.uniform(0.3, 0.6))
+            # Random mouse movements
+            for _ in range(3):
+                x = random.randint(200, 800)
+                y = random.randint(200, 600)
+                await self._page.mouse.move(x, y)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
+        except Exception:
+            pass
 
     def get_page(self):
         return self._page
@@ -513,6 +663,47 @@ class SharedBrowser:
                 self._log(f"[SharedBrowser:{self.account_name}] Imported {imported}/{len(cookies)} cookies (some failed).")
             return imported
 
+    def _copy_profile_trust_data(self, src_profile, dst_profile):
+        """Copy reCAPTCHA trust data (Local Storage, IndexedDB, Cookies) from main profile to shared profile."""
+        import shutil
+        # Browser profile data is inside Default/ subdirectory
+        src_default = os.path.join(src_profile, "Default")
+        dst_default = os.path.join(dst_profile, "Default")
+        if not os.path.isdir(src_default):
+            src_default = src_profile
+        os.makedirs(dst_default, exist_ok=True)
+
+        dirs_to_copy = ["Local Storage", "IndexedDB", "Session Storage"]
+        files_to_copy = ["Cookies", "Cookies-journal"]
+        copied = []
+
+        for d in dirs_to_copy:
+            src = os.path.join(src_default, d)
+            dst = os.path.join(dst_default, d)
+            if os.path.isdir(src):
+                try:
+                    if os.path.isdir(dst):
+                        shutil.rmtree(dst, ignore_errors=True)
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                    copied.append(d)
+                except Exception:
+                    pass
+
+        for f in files_to_copy:
+            src = os.path.join(src_default, f)
+            dst = os.path.join(dst_default, f)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, dst)
+                    copied.append(f)
+                except Exception:
+                    pass
+
+        if copied:
+            self._log(f"[SharedBrowser:{self.account_name}] Copied trust data: {', '.join(copied)}")
+        else:
+            self._log(f"[SharedBrowser:{self.account_name}] No trust data found to copy from main profile.")
+
     def _clean_locks(self, path):
         for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
             lp = os.path.join(path, lock)
@@ -553,83 +744,114 @@ class BrowserFetchWorker:
         self.jobs_completed = 0
 
     async def generate_image(self, prompt, model, ratio, references=None):
-        """Generate image: reCAPTCHA + fetch with Bearer token in ONE evaluate."""
+        """Generate image: auth/session + reCAPTCHA + fetch in ONE evaluate (matches bot_engine)."""
         self.is_busy = True
         try:
             page = self._browser.get_page()
             project_id = self._browser.get_project_id()
-            bearer = await self._browser.get_bearer_token()
             if not page or not project_id:
                 return None, "No browser page or project ID"
-            if not bearer:
-                return None, "No Bearer token — auth will fail"
 
             api_model = _resolve_image_model(model)
             api_ratio = _resolve_image_ratio(ratio)
             seed = random.randint(100000, 999999)
-            session_id = f";{int(time.time() * 1000)}"
             batch_id = str(uuid.uuid4())
+            prompt_text = prompt if prompt.endswith("\n") else f"{prompt}\n"
 
             self._log(f"[{self.slot_id}] Image: model={model} -> {api_model}, ratio={api_ratio}")
 
             result = await page.evaluate(
                 """
-                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, refInputs, bearerToken]) => {
-                    try {
-                        // Step 1: Generate reCAPTCHA token
-                        let recaptchaToken = null;
+                async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, referenceMediaIds, recaptchaAction }) => {
+                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+                    // Step 1: Get fresh auth session (same as bot_engine)
+                    const getAuthSession = async () => {
                         try {
-                            const scripts = document.querySelectorAll("script[src*='recaptcha'][src*='render=']");
+                            const resp = await fetch("https://labs.google/fx/api/auth/session", {
+                                method: "GET", credentials: "include"
+                            });
+                            if (!resp.ok) return null;
+                            const data = await resp.json().catch(() => null);
+                            if (!data || !data.access_token) return null;
+                            return data;
+                        } catch { return null; }
+                    };
+
+                    // Step 2: Get reCAPTCHA token with proper timing (same as bot_engine)
+                    const getRecaptchaContext = async () => {
+                        try {
+                            const enterprise = window.grecaptcha?.enterprise;
+                            if (!enterprise || typeof enterprise.execute !== "function") return null;
+
                             let siteKey = null;
-                            for (const s of scripts) {
-                                const m = s.src.match(/render=([^&]+)/);
-                                if (m && m[1] !== 'explicit') { siteKey = m[1]; break; }
+                            const scripts = Array.from(document.querySelectorAll("script[src*='recaptcha'][src*='render=']"));
+                            for (const script of scripts) {
+                                try {
+                                    const u = new URL(script.src);
+                                    const render = u.searchParams.get("render");
+                                    if (render && render !== "explicit") { siteKey = render; break; }
+                                } catch {}
                             }
-                            if (siteKey && typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
-                                recaptchaToken = await grecaptcha.enterprise.execute(siteKey, {action: 'generate'});
+                            if (!siteKey) return null;
+
+                            // Wait for reCAPTCHA to be ready
+                            if (typeof enterprise.ready === "function") {
+                                await new Promise((resolve) => enterprise.ready(resolve));
                             }
-                        } catch(e) {
-                            return { error: 'reCAPTCHA failed: ' + e.message };
+
+                            // Human-like delay before executing
+                            await sleep(500 + Math.floor(Math.random() * 1000));
+                            const token = await enterprise.execute(siteKey, { action: recaptchaAction });
+                            if (token) {
+                                await sleep(300 + Math.floor(Math.random() * 500));
+                            }
+                            if (!token) return null;
+                            return { token, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
+                        } catch { return null; }
+                    };
+
+                    try {
+                        const authSession = await getAuthSession();
+                        if (!authSession || !authSession.access_token) {
+                            return { error: "missing auth session access token" };
                         }
 
-                        // Step 2: Build payload — clientContext at BOTH levels (HAR confirmed)
+                        const recaptchaContext = await getRecaptchaContext();
                         const clientContext = {
-                            projectId: projectId,
-                            tool: 'PINHOLE',
-                            sessionId: sessionId
+                            projectId, tool: "PINHOLE", sessionId: ";" + Date.now()
                         };
-                        if (recaptchaToken) {
-                            clientContext.recaptchaContext = {
-                                token: recaptchaToken,
-                                applicationType: 'RECAPTCHA_APPLICATION_TYPE_WEB'
-                            };
+                        if (recaptchaContext) {
+                            clientContext.recaptchaContext = recaptchaContext;
                         }
 
-                        const payload = {
-                            clientContext: clientContext,
-                            mediaGenerationContext: { batchId: batchId },
+                        const body = {
+                            clientContext,
+                            mediaGenerationContext: { batchId },
                             useNewMedia: true,
                             requests: [{
-                                clientContext: clientContext,
-                                imageModelName: model,
-                                imageAspectRatio: ratio,
+                                clientContext,
+                                imageModelName: modelName,
+                                imageAspectRatio: aspectRatio,
                                 structuredPrompt: { parts: [{ text: prompt }] },
-                                seed: seed,
-                                imageInputs: refInputs || []
+                                seed,
+                                imageInputs: Array.isArray(referenceMediaIds) && referenceMediaIds.length > 0
+                                    ? referenceMediaIds.map((id) => ({ imageInputType: "IMAGE_INPUT_TYPE_REFERENCE", name: id }))
+                                    : []
                             }]
                         };
 
-                        // Step 3: fetch with Bearer token + cookies
-                        const url = `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`;
-                        const resp = await fetch(url, {
-                            method: 'POST',
-                            credentials: 'include',
-                            headers: {
-                                'Content-Type': 'text/plain;charset=UTF-8',
-                                'Authorization': bearerToken
-                            },
-                            body: JSON.stringify(payload)
-                        });
+                        const resp = await fetch(
+                            `https://aisandbox-pa.googleapis.com/v1/projects/${projectId}/flowMedia:batchGenerateImages`,
+                            {
+                                method: "POST", credentials: "include",
+                                headers: {
+                                    "content-type": "text/plain;charset=UTF-8",
+                                    "authorization": `Bearer ${authSession.access_token}`
+                                },
+                                body: JSON.stringify(body)
+                            }
+                        );
 
                         if (!resp.ok) {
                             const errText = await resp.text();
@@ -642,7 +864,13 @@ class BrowserFetchWorker:
                     }
                 }
                 """,
-                [project_id, prompt, api_model, api_ratio, seed, session_id, batch_id, references or [], bearer],
+                {
+                    "projectId": project_id, "prompt": prompt_text,
+                    "modelName": api_model, "aspectRatio": api_ratio,
+                    "batchId": batch_id, "seed": seed,
+                    "referenceMediaIds": references or [],
+                    "recaptchaAction": "IMAGE_GENERATION",
+                },
             )
 
             await self._browser.maybe_reload()
@@ -662,64 +890,91 @@ class BrowserFetchWorker:
             self.is_busy = False
 
     async def generate_video(self, prompt, model, ratio):
-        """Generate video: reCAPTCHA + fetch with Bearer token in ONE evaluate."""
+        """Generate video: auth/session + reCAPTCHA + fetch in ONE evaluate (matches bot_engine)."""
         self.is_busy = True
         try:
             page = self._browser.get_page()
             project_id = self._browser.get_project_id()
-            bearer = await self._browser.get_bearer_token()
             if not page or not project_id:
                 return None, "No browser page or project ID"
-            if not bearer:
-                return None, "No Bearer token — auth will fail"
 
             api_model = _resolve_video_model(model)
             api_ratio = _resolve_video_ratio(ratio)
             seed = random.randint(100000, 999999)
-            session_id = f";{int(time.time() * 1000)}"
             batch_id = str(uuid.uuid4())
 
             self._log(f"[{self.slot_id}] Video: model={model} -> {api_model}, ratio={api_ratio}")
 
             result = await page.evaluate(
                 """
-                async ([projectId, prompt, model, ratio, seed, sessionId, batchId, bearerToken]) => {
-                    try {
-                        let recaptchaToken = null;
+                async ({ projectId, prompt, model, ratio, seed, batchId }) => {
+                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+                    const getAuthSession = async () => {
                         try {
-                            const scripts = document.querySelectorAll("script[src*='recaptcha'][src*='render=']");
+                            const resp = await fetch("https://labs.google/fx/api/auth/session", {
+                                method: "GET", credentials: "include"
+                            });
+                            if (!resp.ok) return null;
+                            const data = await resp.json().catch(() => null);
+                            if (!data || !data.access_token) return null;
+                            return data;
+                        } catch { return null; }
+                    };
+
+                    const getRecaptchaContext = async () => {
+                        try {
+                            const enterprise = window.grecaptcha?.enterprise;
+                            if (!enterprise || typeof enterprise.execute !== "function") return null;
+
                             let siteKey = null;
-                            for (const s of scripts) {
-                                const m = s.src.match(/render=([^&]+)/);
-                                if (m && m[1] !== 'explicit') { siteKey = m[1]; break; }
+                            const scripts = Array.from(document.querySelectorAll("script[src*='recaptcha'][src*='render=']"));
+                            for (const script of scripts) {
+                                try {
+                                    const u = new URL(script.src);
+                                    const render = u.searchParams.get("render");
+                                    if (render && render !== "explicit") { siteKey = render; break; }
+                                } catch {}
                             }
-                            if (siteKey && typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
-                                recaptchaToken = await grecaptcha.enterprise.execute(siteKey, {action: 'generate'});
+                            if (!siteKey) return null;
+
+                            if (typeof enterprise.ready === "function") {
+                                await new Promise((resolve) => enterprise.ready(resolve));
                             }
-                        } catch(e) {
-                            return { error: 'reCAPTCHA failed: ' + e.message };
+
+                            await sleep(500 + Math.floor(Math.random() * 1000));
+                            const token = await enterprise.execute(siteKey, { action: "VIDEO_GENERATION" });
+                            if (token) {
+                                await sleep(300 + Math.floor(Math.random() * 500));
+                            }
+                            if (!token) return null;
+                            return { token, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
+                        } catch { return null; }
+                    };
+
+                    try {
+                        const authSession = await getAuthSession();
+                        if (!authSession || !authSession.access_token) {
+                            return { error: "missing auth session access token" };
                         }
 
+                        const recaptchaContext = await getRecaptchaContext();
                         const clientContext = {
-                            projectId: projectId,
-                            tool: 'PINHOLE',
-                            userPaygateTier: 'PAYGATE_TIER_TWO',
-                            sessionId: sessionId
+                            projectId, tool: "PINHOLE",
+                            userPaygateTier: "PAYGATE_TIER_TWO",
+                            sessionId: ";" + Date.now()
                         };
-                        if (recaptchaToken) {
-                            clientContext.recaptchaContext = {
-                                token: recaptchaToken,
-                                applicationType: 'RECAPTCHA_APPLICATION_TYPE_WEB'
-                            };
+                        if (recaptchaContext) {
+                            clientContext.recaptchaContext = recaptchaContext;
                         }
 
-                        const payload = {
-                            mediaGenerationContext: { batchId: batchId },
-                            clientContext: clientContext,
+                        const body = {
+                            mediaGenerationContext: { batchId },
+                            clientContext,
                             requests: [{
-                                clientContext: clientContext,
+                                clientContext,
                                 aspectRatio: ratio,
-                                seed: seed,
+                                seed,
                                 textInput: { structuredPrompt: { parts: [{ text: prompt }] } },
                                 videoModelKey: model,
                                 metadata: {}
@@ -728,15 +983,14 @@ class BrowserFetchWorker:
                         };
 
                         const resp = await fetch(
-                            'https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText',
+                            "https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText",
                             {
-                                method: 'POST',
-                                credentials: 'include',
+                                method: "POST", credentials: "include",
                                 headers: {
-                                    'Content-Type': 'text/plain;charset=UTF-8',
-                                    'Authorization': bearerToken
+                                    "content-type": "text/plain;charset=UTF-8",
+                                    "authorization": `Bearer ${authSession.access_token}`
                                 },
-                                body: JSON.stringify(payload)
+                                body: JSON.stringify(body)
                             }
                         );
 
@@ -751,7 +1005,11 @@ class BrowserFetchWorker:
                     }
                 }
                 """,
-                [project_id, prompt, api_model, api_ratio, seed, session_id, batch_id, bearer],
+                {
+                    "projectId": project_id, "prompt": prompt,
+                    "model": api_model, "ratio": api_ratio,
+                    "seed": seed, "batchId": batch_id,
+                },
             )
 
             await self._browser.maybe_reload()
@@ -790,6 +1048,9 @@ class HttpModeManager:
         self._shared_browsers = {}   # account_name -> SharedBrowser
         self._workers = {}           # account_name -> [BrowserFetchWorker, ...]
         self._active_tasks = []
+        # Read display setting
+        cloak_display = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
+        self._headless = cloak_display != "visible"
 
     async def run(self):
         """Main entry — start shared browsers, dispatch jobs."""
@@ -822,7 +1083,7 @@ class HttpModeManager:
                     except Exception:
                         pass
 
-                    browser = SharedBrowser(name, session_path, cookies_json, self._log, project_id=cached_pid)
+                    browser = SharedBrowser(name, session_path, cookies_json, self._log, project_id=cached_pid, headless=self._headless)
                     success = await browser.start(p)
 
                     if not success:
@@ -928,12 +1189,116 @@ class HttpModeManager:
                     return worker
         return None
 
+    async def _download_and_save(self, worker, job_id, api_data, queue_no=None):
+        """Download generated image/video from API response and save to output directory."""
+        browser = worker._browser
+        context = browser._context
+        if not context:
+            return None, "No browser context for download"
+
+        # Extract media URL from API response
+        media_list = api_data.get("media", []) if isinstance(api_data, dict) else []
+        fife_url = None
+        media_name = None
+
+        for item in media_list:
+            url = (item.get("image", {}).get("generatedImage", {}).get("fifeUrl", "")
+                   if isinstance(item, dict) else "")
+            name = item.get("name", "") if isinstance(item, dict) else ""
+            if url:
+                fife_url = url
+                media_name = name
+                break
+            if name and not fife_url:
+                media_name = name
+
+        if not fife_url and media_name:
+            fife_url = f"https://labs.google/fx/api/trpc/backbone.redirect?input=%7B%22name%22%3A%22{media_name}%22%7D"
+
+        if not fife_url:
+            # Try workflows fallback
+            workflows = api_data.get("workflows", []) if isinstance(api_data, dict) else []
+            if workflows:
+                primary_id = workflows[0].get("metadata", {}).get("primaryMediaId", "")
+                if primary_id:
+                    fife_url = f"https://labs.google/fx/api/trpc/backbone.redirect?input=%7B%22name%22%3A%22{primary_id}%22%7D"
+
+        if not fife_url:
+            self._log(f"[{worker.slot_id}] API response keys: {list(api_data.keys()) if isinstance(api_data, dict) else 'not dict'}")
+            return None, "No downloadable media in API response"
+
+        self._log(f"[{worker.slot_id}] Downloading from: {fife_url[:100]}...")
+
+        # Download via Playwright request context (avoids CORS — same as bot_engine)
+        try:
+            request_ctx = context.request
+            resp = await request_ctx.get(fife_url, timeout=90000)
+
+            if not resp.ok:
+                return None, f"Download HTTP {resp.status}"
+
+            content_type = str(resp.headers.get("content-type", "")).lower()
+            ext_map = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+                "video/mp4": ".mp4",
+                "video/webm": ".webm",
+            }
+            ext = ".jpg"
+            for mime, candidate_ext in ext_map.items():
+                if mime in content_type:
+                    ext = candidate_ext
+                    break
+
+            data = await resp.body()
+            if not data:
+                return None, "Downloaded empty file"
+
+            # Build output path (same naming as bot_engine)
+            output_dir = get_output_directory()
+            os.makedirs(output_dir, exist_ok=True)
+
+            normalized_qno = None
+            try:
+                val = int(queue_no)
+                if val > 0:
+                    normalized_qno = val
+            except Exception:
+                pass
+
+            if normalized_qno is not None:
+                filename = f"{normalized_qno}{ext}"
+            else:
+                safe_job = (job_id or "job").replace("-", "")[:8]
+                ts = int(time.time() * 1000)
+                nonce = random.randint(1000, 9999)
+                filename = f"{safe_job}_{ts}_{nonce}_generation{ext}"
+
+            output_path = os.path.join(output_dir, filename)
+
+            with open(output_path, "wb") as f:
+                f.write(data)
+
+            # Update job runtime state with output path
+            try:
+                update_job_runtime_state(job_id, output_path=output_path)
+            except Exception:
+                pass
+
+            self._log(f"[{worker.slot_id}] Saved: {filename} ({len(data)} bytes)")
+            return output_path, None
+
+        except Exception as e:
+            return None, f"Download exception: {str(e)[:200]}"
+
     async def _run_job(self, worker, job):
         """Execute a single job with retries."""
         job_id = job["id"]
         job_type = job.get("job_type", "image")
         prompt = job.get("prompt", "")
         model = job.get("model", "")
+        queue_no = job.get("queue_no")
 
         self._log(f"[{worker.slot_id}] Processing job {job_id[:6]}...: {prompt[:40]}...")
 
@@ -951,10 +1316,21 @@ class HttpModeManager:
                     result, error = await worker.generate_image(prompt, model, ratio)
 
                 if result and not error:
-                    update_job_status(job_id, "completed", account=worker.account_name)
-                    self.qm.signals.job_updated.emit(job_id, "completed", worker.account_name, "")
-                    self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed!")
-                    return
+                    # Download and save the generated media
+                    output_path, dl_error = await self._download_and_save(
+                        worker, job_id, result, queue_no=queue_no
+                    )
+                    if dl_error:
+                        last_error = dl_error
+                        self._log(f"[{worker.slot_id}] Download failed: {dl_error[:200]}")
+                        if attempt < max_retries:
+                            await asyncio.sleep(5)
+                            continue
+                    else:
+                        update_job_status(job_id, "completed", account=worker.account_name)
+                        self.qm.signals.job_updated.emit(job_id, "completed", worker.account_name, "")
+                        self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed! Saved: {output_path}")
+                        return
 
                 last_error = error or "Unknown error"
                 self._log(

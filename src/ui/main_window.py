@@ -4605,9 +4605,13 @@ class MainWindow(QMainWindow):
         self.cmb_generation_mode.setObjectName("settingInput")
         self.cmb_generation_mode.setMinimumHeight(38)
         self.cmb_generation_mode.addItem("Browser per slot (stable)", "browser_per_slot")
+        self.cmb_generation_mode.addItem("HTTP Shared (lowest RAM)", "http_shared")
         self.cmb_generation_mode.addItem("CDP Shared (low RAM — experimental)", "cdp_shared")
         self.cmb_generation_mode.setToolTip(
             "Browser per slot: Each slot opens its own browser (~300MB each). Proven stable.\n\n"
+            "HTTP Shared: 1 browser per account for reCAPTCHA only.\n"
+            "All API calls via shared page.evaluate(fetch()). ~300MB per account total.\n"
+            "5 slots = ~300MB vs ~1.5GB. Fastest and most RAM efficient.\n\n"
             "CDP Shared: 1 CloakBrowser process per account, N contexts via CDP.\n"
             "Each context = independent cookies + session (~30MB each).\n"
             "20 slots = ~900MB total vs ~6GB. EXPERIMENTAL."
