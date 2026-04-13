@@ -98,7 +98,7 @@ class AsyncQueueManager(QThread):
             chrome_display_raw = "headless"
         self.chrome_display = chrome_display_raw
         cloak_display_raw = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
-        if cloak_display_raw not in {"visible", "headless"}:
+        if cloak_display_raw not in {"visible", "headless", "stealth_visible"}:
             cloak_display_raw = "headless"
         self.cloak_display = cloak_display_raw
         self.light_warmup_enabled = get_bool_setting("light_warmup", True)

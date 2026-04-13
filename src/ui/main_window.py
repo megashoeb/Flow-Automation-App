@@ -4593,6 +4593,7 @@ class MainWindow(QMainWindow):
         self.cmb_cloak_display = QComboBox()
         self.cmb_cloak_display.addItem("Headless", "headless")
         self.cmb_cloak_display.addItem("Visible", "visible")
+        self.cmb_cloak_display.addItem("Stealth Visible (hidden but not headless)", "stealth_visible")
         saved_cloak_display = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
         cloak_display_index = self.cmb_cloak_display.findData(saved_cloak_display)
         if cloak_display_index < 0:

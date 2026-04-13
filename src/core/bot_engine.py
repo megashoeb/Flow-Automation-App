@@ -882,8 +882,13 @@ class GoogleLabsBot:
             return
 
         headless = self.cloak_display == "headless"
+        stealth_visible = self.cloak_display == "stealth_visible"
+        if stealth_visible:
+            headless = False  # Launch as visible for reCAPTCHA trust
         seed = self._build_cloak_fingerprint_seed()
         cloak_args = self._build_cloak_launch_args(seed)
+        if stealth_visible:
+            cloak_args.extend(["--window-position=-3000,-3000", "--window-size=800,600"])
 
         # Login now uses pure Chrome on ALL platforms. Chrome's session files
         # are incompatible with CloakBrowser. Always use a fresh _cloak profile
@@ -923,6 +928,10 @@ class GoogleLabsBot:
             pages = list(getattr(self.context, "pages", []) or [])
             self.page = pages[0] if pages else await self._maybe_await(self.context.new_page())
             self.page.set_default_timeout(60000)
+
+            if stealth_visible and callable(log_callback):
+                log_callback(f"[{self.account_name}] Stealth visible: window launched off-screen.")
+
             await self._apply_browser_overrides(self.page, log_callback)
             await self._apply_fingerprint(self.page, log_callback)
             await self._apply_stealth_to_page(self.page, log_callback)

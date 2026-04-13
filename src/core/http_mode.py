@@ -123,12 +123,13 @@ class SharedBrowser:
     No separate HTTP clients needed.
     """
 
-    def __init__(self, account_name, session_path, cookies_json_path, log_fn, project_id=None, headless=True):
+    def __init__(self, account_name, session_path, cookies_json_path, log_fn, project_id=None, headless=True, stealth_visible=False):
         self.account_name = account_name
         self._session_path = session_path
         self._cookies_json = cookies_json_path
         self._log = log_fn
         self._headless = headless
+        self._stealth_visible = stealth_visible
         self._context = None
         self._page = None
         self._project_id = project_id
@@ -234,10 +235,13 @@ class SharedBrowser:
 
                 self._log(f"[SharedBrowser:{self.account_name}] Profile path: {profile}")
 
-                self._log(f"[SharedBrowser:{self.account_name}] Headless: {self._headless}")
+                self._log(f"[SharedBrowser:{self.account_name}] Headless: {self._headless}, Stealth: {self._stealth_visible}")
+                cloak_args = [f"--fingerprint={seed}"]
+                if self._stealth_visible:
+                    cloak_args.extend(["--window-position=-3000,-3000", "--window-size=800,600"])
                 self._context = await cloak_persistent(
                     profile, headless=self._headless,
-                    args=[f"--fingerprint={seed}"], humanize=True,
+                    args=cloak_args, humanize=True,
                 )
 
                 # Import cookies — CRITICAL for login session
@@ -606,9 +610,9 @@ class SharedBrowser:
         return self._project_id
 
     async def maybe_reload(self):
-        """Reload page every 100 jobs to keep reCAPTCHA fresh."""
+        """Reload page every 40 jobs to keep reCAPTCHA fresh."""
         self._jobs_since_reload += 1
-        if self._jobs_since_reload >= 100 and (time.time() - self._last_page_reload) > 60:
+        if self._jobs_since_reload >= 40 and (time.time() - self._last_page_reload) > 60:
             self._log(f"[SharedBrowser:{self.account_name}] Refreshing page (every 100 jobs)...")
             try:
                 await self._page.goto(
@@ -1048,9 +1052,17 @@ class HttpModeManager:
         self._shared_browsers = {}   # account_name -> SharedBrowser
         self._workers = {}           # account_name -> [BrowserFetchWorker, ...]
         self._active_tasks = []
+        self._account_info = {}      # account_name -> {session_path, cookies_json}
+        # reCAPTCHA fail tracking per account
+        self._recaptcha_fails = {}   # account_name -> count
+        self._recaptcha_fail_max = get_int_setting("auto_restart_recaptcha_fails", 3)
+        self._restart_cooldown = get_int_setting("restart_cooldown_seconds", 30)
+        self._last_restart_time = {}  # account_name -> timestamp
+        self._restart_pending = set()  # account names needing restart
         # Read display setting
         cloak_display = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
-        self._headless = cloak_display != "visible"
+        self._stealth_visible = cloak_display == "stealth_visible"
+        self._headless = cloak_display == "headless"  # stealth_visible = visible (not headless)
 
     async def run(self):
         """Main entry — start shared browsers, dispatch jobs."""
@@ -1083,7 +1095,14 @@ class HttpModeManager:
                     except Exception:
                         pass
 
-                    browser = SharedBrowser(name, session_path, cookies_json, self._log, project_id=cached_pid, headless=self._headless)
+                    # Store account info for restart
+                    self._account_info[name] = {
+                        "session_path": session_path,
+                        "cookies_json": cookies_json,
+                    }
+                    self._recaptcha_fails[name] = 0
+
+                    browser = SharedBrowser(name, session_path, cookies_json, self._log, project_id=cached_pid, headless=self._headless, stealth_visible=self._stealth_visible)
                     success = await browser.start(p)
 
                     if not success:
@@ -1122,6 +1141,10 @@ class HttpModeManager:
                     if self.qm.pause_requested:
                         await asyncio.sleep(1)
                         continue
+
+                    # Check for browser restarts needed
+                    if self._restart_pending:
+                        await self._process_restarts(p, slots_per_account)
 
                     self._active_tasks = [t for t in self._active_tasks if not t.done()]
 
@@ -1183,11 +1206,108 @@ class HttpModeManager:
                 self._log("[HTTP] All browsers and workers stopped.")
 
     def _get_available_worker(self, busy_slots):
-        for workers in self._workers.values():
+        for account_name, workers in self._workers.items():
+            # Skip accounts pending restart
+            if account_name in self._restart_pending:
+                continue
             for worker in workers:
                 if worker.slot_id not in busy_slots and not worker.is_busy:
                     return worker
         return None
+
+    def _report_recaptcha_fail(self, account_name):
+        """Track reCAPTCHA failure. Trigger restart if threshold reached."""
+        self._recaptcha_fails[account_name] = self._recaptcha_fails.get(account_name, 0) + 1
+        count = self._recaptcha_fails[account_name]
+        self._log(
+            f"[HTTP] {account_name}: reCAPTCHA fail #{count}/{self._recaptcha_fail_max}"
+        )
+        if count >= self._recaptcha_fail_max:
+            # Check cooldown
+            last_restart = self._last_restart_time.get(account_name, 0)
+            if (time.time() - last_restart) >= self._restart_cooldown:
+                self._restart_pending.add(account_name)
+                self._log(
+                    f"[HTTP] {account_name}: {count} reCAPTCHA fails — browser restart queued."
+                )
+            else:
+                remaining = int(self._restart_cooldown - (time.time() - last_restart))
+                self._log(
+                    f"[HTTP] {account_name}: restart cooldown ({remaining}s remaining)."
+                )
+
+    def _report_recaptcha_success(self, account_name):
+        """Reset reCAPTCHA fail counter on success."""
+        if self._recaptcha_fails.get(account_name, 0) > 0:
+            self._recaptcha_fails[account_name] = 0
+
+    async def _process_restarts(self, playwright_instance, slots_per_account):
+        """Restart browsers for accounts that hit reCAPTCHA fail threshold."""
+        import shutil
+        for account_name in list(self._restart_pending):
+            # Wait for active tasks on this account to finish
+            account_tasks = [
+                t for t in self._active_tasks
+                if hasattr(t, "get_name") and t.get_name().startswith(account_name) and not t.done()
+            ]
+            if account_tasks:
+                self._log(f"[HTTP] {account_name}: waiting for {len(account_tasks)} active task(s) before restart...")
+                await asyncio.gather(*account_tasks, return_exceptions=True)
+
+            self._log(f"[HTTP] {account_name}: Restarting browser (reCAPTCHA refresh)...")
+
+            # Stop old browser
+            old_browser = self._shared_browsers.pop(account_name, None)
+            if old_browser:
+                await old_browser.stop()
+
+            # Remove old workers
+            old_workers = self._workers.pop(account_name, [])
+            for w in old_workers:
+                await w.close()
+
+            # Delete shared browser profile for fresh start
+            info = self._account_info.get(account_name, {})
+            session_path = info.get("session_path", "")
+            shared_profile = session_path + "_shared_browser"
+            if os.path.isdir(shared_profile):
+                try:
+                    shutil.rmtree(shared_profile, ignore_errors=True)
+                    self._log(f"[HTTP] {account_name}: Deleted old shared profile.")
+                except Exception:
+                    pass
+
+            # Cooldown before restart
+            self._log(f"[HTTP] {account_name}: Cooling down {self._restart_cooldown}s...")
+            await asyncio.sleep(self._restart_cooldown)
+
+            # Start fresh browser
+            cookies_json = info.get("cookies_json", "")
+            new_browser = SharedBrowser(
+                account_name, session_path, cookies_json, self._log,
+                headless=self._headless, stealth_visible=self._stealth_visible,
+            )
+            success = await new_browser.start(playwright_instance)
+
+            if success:
+                self._shared_browsers[account_name] = new_browser
+                # Create new workers
+                new_workers = []
+                for idx in range(1, slots_per_account + 1):
+                    slot_id = f"{account_name}#h{idx}"
+                    worker = BrowserFetchWorker(slot_id, new_browser, self._log)
+                    new_workers.append(worker)
+                self._workers[account_name] = new_workers
+                self._recaptcha_fails[account_name] = 0
+                self._last_restart_time[account_name] = time.time()
+                self._log(
+                    f"[HTTP] {account_name}: Browser restarted! "
+                    f"{len(new_workers)} workers ready."
+                )
+            else:
+                self._log(f"[HTTP] {account_name}: Restart FAILED! Account offline.")
+
+            self._restart_pending.discard(account_name)
 
     async def _download_and_save(self, worker, job_id, api_data, queue_no=None):
         """Download generated image/video from API response and save to output directory."""
@@ -1316,6 +1436,9 @@ class HttpModeManager:
                     result, error = await worker.generate_image(prompt, model, ratio)
 
                 if result and not error:
+                    # reCAPTCHA succeeded — reset fail counter
+                    self._report_recaptcha_success(worker.account_name)
+
                     # Download and save the generated media
                     output_path, dl_error = await self._download_and_save(
                         worker, job_id, result, queue_no=queue_no
@@ -1337,6 +1460,17 @@ class HttpModeManager:
                     f"[{worker.slot_id}] Attempt {attempt + 1}/{max_retries + 1} "
                     f"failed: {last_error[:200]}"
                 )
+
+                # Detect reCAPTCHA failure
+                is_recaptcha_fail = "recaptcha" in last_error.lower() or "captcha" in last_error.lower()
+                if is_recaptcha_fail:
+                    self._report_recaptcha_fail(worker.account_name)
+                    # If restart is pending, stop retrying — job will be re-queued
+                    if worker.account_name in self._restart_pending:
+                        update_job_status(job_id, "pending", account="")
+                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                        self._log(f"[{worker.slot_id}] Job {job_id[:6]}... re-queued (browser restarting).")
+                        return
 
                 # Force Bearer refresh on 401
                 if "401" in last_error or "auth" in last_error.lower():
