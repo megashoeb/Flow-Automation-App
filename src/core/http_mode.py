@@ -123,13 +123,14 @@ class SharedBrowser:
     No separate HTTP clients needed.
     """
 
-    def __init__(self, account_name, session_path, cookies_json_path, log_fn, project_id=None, headless=True, stealth_visible=False):
+    def __init__(self, account_name, session_path, cookies_json_path, log_fn, project_id=None, headless=True, stealth_visible=False, proxy=None):
         self.account_name = account_name
         self._session_path = session_path
         self._cookies_json = cookies_json_path
         self._log = log_fn
         self._headless = headless
         self._stealth_visible = stealth_visible
+        self._proxy = str(proxy or "").strip()
         self._context = None
         self._page = None
         self._project_id = project_id
@@ -239,6 +240,13 @@ class SharedBrowser:
                 cloak_args = [f"--fingerprint={seed}"]
                 if self._stealth_visible:
                     cloak_args.extend(["--window-position=-3000,-3000", "--window-size=800,600"])
+
+                # Proxy support — resolve SOCKS5 auth via bridge if needed
+                resolved_proxy = self._resolve_proxy()
+                if resolved_proxy:
+                    cloak_args.append(f"--proxy-server={resolved_proxy}")
+                    self._log(f"[SharedBrowser:{self.account_name}] Proxy: {resolved_proxy}")
+
                 self._context = await cloak_persistent(
                     profile, headless=self._headless,
                     args=cloak_args, humanize=True,
@@ -275,9 +283,15 @@ class SharedBrowser:
             self._clean_locks(self._session_path)
             self._log(f"[SharedBrowser:{self.account_name}] Profile path: {self._session_path}")
 
+            pw_args = ["--disable-gpu", "--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            resolved_proxy = self._resolve_proxy()
+            if resolved_proxy:
+                pw_args.append(f"--proxy-server={resolved_proxy}")
+                self._log(f"[SharedBrowser:{self.account_name}] Proxy: {resolved_proxy}")
+
             self._context = await playwright_instance.chromium.launch_persistent_context(
                 self._session_path, headless=self._headless,
-                args=["--disable-gpu", "--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                args=pw_args,
                 ignore_default_args=["--enable-automation"],
             )
 
@@ -297,6 +311,19 @@ class SharedBrowser:
         except Exception as e:
             self._log(f"[SharedBrowser:{self.account_name}] Browser launch failed: {str(e)[:60]}")
             return False
+
+    def _resolve_proxy(self):
+        """Resolve proxy URL — handle SOCKS5 auth via local bridge if needed."""
+        if not self._proxy:
+            return None
+        try:
+            from src.core.proxy_bridge import get_or_create_bridge
+            resolved = get_or_create_bridge(self._proxy)
+            return resolved or None
+        except ImportError:
+            return self._proxy
+        except Exception:
+            return self._proxy
 
     def _setup_request_interception(self):
         """Intercept browser requests to capture Authorization Bearer token."""
@@ -804,12 +831,8 @@ class BrowserFetchWorker:
                                 await new Promise((resolve) => enterprise.ready(resolve));
                             }
 
-                            // Human-like delay before executing
-                            await sleep(500 + Math.floor(Math.random() * 1000));
+                            // Execute immediately — fresh token = better score
                             const token = await enterprise.execute(siteKey, { action: recaptchaAction });
-                            if (token) {
-                                await sleep(300 + Math.floor(Math.random() * 500));
-                            }
                             if (!token) return null;
                             return { token, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
                         } catch { return null; }
@@ -946,11 +969,7 @@ class BrowserFetchWorker:
                                 await new Promise((resolve) => enterprise.ready(resolve));
                             }
 
-                            await sleep(500 + Math.floor(Math.random() * 1000));
                             const token = await enterprise.execute(siteKey, { action: "VIDEO_GENERATION" });
-                            if (token) {
-                                await sleep(300 + Math.floor(Math.random() * 500));
-                            }
                             if (!token) return null;
                             return { token, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
                         } catch { return null; }
@@ -1095,14 +1114,21 @@ class HttpModeManager:
                     except Exception:
                         pass
 
+                    account_proxy = str(acc.get("proxy") or "").strip()
+
                     # Store account info for restart
                     self._account_info[name] = {
                         "session_path": session_path,
                         "cookies_json": cookies_json,
+                        "proxy": account_proxy,
                     }
                     self._recaptcha_fails[name] = 0
 
-                    browser = SharedBrowser(name, session_path, cookies_json, self._log, project_id=cached_pid, headless=self._headless, stealth_visible=self._stealth_visible)
+                    browser = SharedBrowser(
+                        name, session_path, cookies_json, self._log,
+                        project_id=cached_pid, headless=self._headless,
+                        stealth_visible=self._stealth_visible, proxy=account_proxy,
+                    )
                     success = await browser.start(p)
 
                     if not success:
@@ -1286,9 +1312,11 @@ class HttpModeManager:
 
             # Start fresh browser
             cookies_json = info.get("cookies_json", "")
+            account_proxy = info.get("proxy", "")
             new_browser = SharedBrowser(
                 account_name, session_path, cookies_json, self._log,
                 headless=self._headless, stealth_visible=self._stealth_visible,
+                proxy=account_proxy,
             )
             success = await new_browser.start(playwright_instance)
 

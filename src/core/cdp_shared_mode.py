@@ -163,9 +163,7 @@ async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, recaptchaActi
             if (typeof enterprise.ready === "function") {
                 await new Promise((r) => enterprise.ready(r));
             }
-            await sleep(500 + Math.floor(Math.random() * 1000));
             const token = await enterprise.execute(siteKey, { action: recaptchaAction });
-            if (token) await sleep(300 + Math.floor(Math.random() * 500));
             if (!token) return null;
             return { token, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
         } catch { return null; }
@@ -274,10 +272,8 @@ async ({ projectId, prompt, modelKey, aspectRatio, batchId, seed, recaptchaActio
             }
             if (!siteKey) return null;
             if (typeof enterprise.ready === "function") await new Promise((r) => enterprise.ready(r));
-            await sleep(500 + Math.floor(Math.random() * 1000));
             const token = await enterprise.execute(siteKey, { action: recaptchaAction });
             if (!token) return null;
-            await sleep(300 + Math.floor(Math.random() * 500));
             return { token, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
         } catch { return null; }
     };

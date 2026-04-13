@@ -2626,11 +2626,7 @@ class GoogleLabsBot:
                             await new Promise((resolve) => enterprise.ready(resolve));
                         }
 
-                        await sleep(500 + Math.floor(Math.random() * 1000));
                         const token = await enterprise.execute(siteKey, { action: recaptchaAction });
-                        if (token) {
-                            await sleep(300 + Math.floor(Math.random() * 500));
-                        }
                         if (!token) return null;
                         return {
                             token,
@@ -3085,10 +3081,8 @@ class GoogleLabsBot:
                             if (typeof enterprise.ready === "function") {
                                 await new Promise((resolve) => enterprise.ready(resolve));
                             }
-                            await sleep(500 + Math.floor(Math.random() * 1000));
                             const token = await enterprise.execute(siteKey, { action: recaptchaAction });
                             if (token) {
-                                await sleep(300 + Math.floor(Math.random() * 500));
                                 recaptchaContext = {
                                     token,
                                     applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
@@ -3395,10 +3389,8 @@ class GoogleLabsBot:
                             if (typeof enterprise.ready === "function") {
                                 await new Promise((resolve) => enterprise.ready(resolve));
                             }
-                            await sleep(500 + Math.floor(Math.random() * 1000));
                             const token = await enterprise.execute(siteKey, { action: recaptchaAction });
                             if (token) {
-                                await sleep(300 + Math.floor(Math.random() * 500));
                                 recaptchaContext = {
                                     token,
                                     applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
