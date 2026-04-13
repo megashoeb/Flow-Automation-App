@@ -1192,6 +1192,9 @@ class HttpModeManager:
 
                     dispatched = 0
                     for job in pending:
+                        # Re-check stop inside dispatch loop
+                        if self.qm.stop_requested or self.qm.force_stop_requested:
+                            break
                         worker = self._get_available_worker(busy_slots)
                         if not worker:
                             break
@@ -1218,7 +1221,14 @@ class HttpModeManager:
                         await asyncio.sleep(self.qm.scheduler_poll_seconds)
 
                 if self._active_tasks:
-                    self._log(f"[HTTP] Waiting for {len(self._active_tasks)} active job(s)...")
+                    if self.qm.stop_requested or self.qm.force_stop_requested:
+                        # Cancel all active tasks immediately on stop
+                        self._log(f"[HTTP] Cancelling {len(self._active_tasks)} active job(s)...")
+                        for t in self._active_tasks:
+                            if not t.done():
+                                t.cancel()
+                    else:
+                        self._log(f"[HTTP] Waiting for {len(self._active_tasks)} active job(s)...")
                     await asyncio.gather(*self._active_tasks, return_exceptions=True)
 
             finally:
@@ -1459,6 +1469,12 @@ class HttpModeManager:
         last_error = ""
 
         for attempt in range(max_retries + 1):
+            # Stop requested — re-queue job immediately, don't waste time retrying
+            if self.qm.stop_requested or self.qm.force_stop_requested:
+                update_job_status(job_id, "pending", account="")
+                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                return
+
             # If browser restart is pending for this account, re-queue immediately
             if worker.account_name in self._restart_pending:
                 update_job_status(job_id, "pending", account="")
