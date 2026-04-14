@@ -719,17 +719,31 @@ class ExtensionModeManager:
                     f"failed: {last_error[:200]}"
                 )
 
-                # reCAPTCHA failure → ask extension to refresh
+                # no_recaptcha_enterprise → tab doesn't have reCAPTCHA loaded
+                # Extension already auto-reloads the tab, just wait for it
+                if "no_recaptcha_enterprise" in last_error:
+                    self._log(f"[{worker.slot_id}] Tab has no reCAPTCHA — waiting for auto-reload...")
+                    if self.qm.stop_requested or self.qm.force_stop_requested:
+                        update_job_status(job_id, "pending", account="")
+                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                        return
+                    await asyncio.sleep(8)  # wait for tab reload + reCAPTCHA init
+                    continue
+
+                # reCAPTCHA score/token failure → reload tab
                 if "recaptcha" in last_error.lower() or "captcha" in last_error.lower():
-                    self._bridge.send_command("clear_cookies", worker.account_email)
                     self._bridge.send_command("reload_tab", worker.account_email)
-                    # Check stop before sleeping
                     if self.qm.stop_requested or self.qm.force_stop_requested:
                         update_job_status(job_id, "pending", account="")
                         self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                         return
                     await asyncio.sleep(5)
                     continue
+
+                # 400 "invalid argument" — same prompt won't fix on retry, fail after 2 attempts
+                if "400" in last_error and attempt >= 1:
+                    self._log(f"[{worker.slot_id}] Same 400 error twice — skipping prompt.")
+                    break  # exit retry loop → mark as failed
 
                 if attempt < max_retries:
                     # Check stop before retry sleep

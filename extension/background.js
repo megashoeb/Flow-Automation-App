@@ -20,6 +20,10 @@ let connectedAccounts = {};  // tabId → { email, name, access_token, project_i
 let tokenCount = 0;
 let lastPollError = "";
 
+// ─── reCAPTCHA readiness cache (30s validity) ───
+const _recaptchaCache = {};  // tabId → { valid: bool, ts: timestamp }
+const _RECAPTCHA_CACHE_TTL = 30000;  // 30 seconds
+
 // ═══════════════════════════════════════════════════════════════════
 // Bridge Communication
 // ═══════════════════════════════════════════════════════════════════
@@ -72,12 +76,22 @@ async function pollBridge() {
 async function handleWork(work) {
   const { request_id, account, action } = work;
 
-  // Find the Labs tab for this account
+  // Check if any Labs tab exists at all (before reCAPTCHA validation)
+  const allLabsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+
+  // Find a Labs tab with reCAPTCHA ready for this account
   const tabId = await findLabsTab(account);
   if (!tabId) {
-    await submitResult(request_id, {
-      error: `no_labs_tab_for_${account || "any"}`,
-    });
+    // Distinguish: no tab at all vs tab exists but reCAPTCHA not loaded
+    if (allLabsTabs.length > 0) {
+      await submitResult(request_id, {
+        error: "no_recaptcha_enterprise",  // tab exists, reCAPTCHA not ready (auto-reloading)
+      });
+    } else {
+      await submitResult(request_id, {
+        error: `no_labs_tab_for_${account || "any"}`,
+      });
+    }
     return;
   }
 
@@ -278,18 +292,51 @@ async function submitResult(requestId, data) {
 // Tab Management
 // ═══════════════════════════════════════════════════════════════════
 
+async function checkRecaptchaReady(tabId) {
+  // Check cache first (valid for 30s)
+  const cached = _recaptchaCache[tabId];
+  if (cached && (Date.now() - cached.ts) < _RECAPTCHA_CACHE_TTL) {
+    return cached.valid;
+  }
+
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        return typeof grecaptcha !== "undefined" && !!grecaptcha.enterprise
+          && typeof grecaptcha.enterprise.execute === "function";
+      },
+    });
+    const valid = !!(results?.[0]?.result);
+    _recaptchaCache[tabId] = { valid, ts: Date.now() };
+    return valid;
+  } catch {
+    _recaptchaCache[tabId] = { valid: false, ts: Date.now() };
+    return false;
+  }
+}
+
+function invalidateRecaptchaCache(tabId) {
+  if (tabId) delete _recaptchaCache[tabId];
+  else Object.keys(_recaptchaCache).forEach(k => delete _recaptchaCache[k]);
+}
+
 async function findLabsTab(targetAccount) {
   const tabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
 
   if (!tabs.length) return null;
 
-  // If specific account requested, find matching tab
+  // If specific account requested, find matching tab with reCAPTCHA ready
   if (targetAccount) {
-    // Check cache first
+    // Check cache first — but also verify reCAPTCHA is ready
     for (const tab of tabs) {
       const cached = connectedAccounts[tab.id];
       if (cached && cached.email === targetAccount) {
-        return tab.id;
+        if (await checkRecaptchaReady(tab.id)) {
+          return tab.id;
+        }
+        // reCAPTCHA not ready on this tab — try others
       }
     }
 
@@ -318,16 +365,42 @@ async function findLabsTab(targetAccount) {
         const auth = results?.[0]?.result;
         if (auth && auth.email === targetAccount) {
           connectedAccounts[tab.id] = { ...auth, logged_in: true };
-          return tab.id;
+          if (await checkRecaptchaReady(tab.id)) {
+            return tab.id;
+          }
         }
       } catch {}
+    }
+
+    // No tab has reCAPTCHA ready — auto-reload first matching account tab
+    for (const tab of tabs) {
+      const cached = connectedAccounts[tab.id];
+      if (cached && cached.email === targetAccount) {
+        try {
+          await chrome.tabs.reload(tab.id);
+          invalidateRecaptchaCache(tab.id);
+        } catch {}
+        // Return null — caller will get no_recaptcha, Python side will wait & retry
+        return null;
+      }
     }
 
     return null;
   }
 
-  // No specific account — return first Labs tab
-  return tabs[0].id;
+  // No specific account — return first Labs tab with reCAPTCHA ready
+  for (const tab of tabs) {
+    if (await checkRecaptchaReady(tab.id)) {
+      return tab.id;
+    }
+  }
+
+  // None ready — reload first tab
+  try {
+    await chrome.tabs.reload(tabs[0].id);
+    invalidateRecaptchaCache(tabs[0].id);
+  } catch {}
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -472,6 +545,7 @@ setTimeout(detectAccounts, 2000);
 // Listen for Labs tab changes
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab.url && tab.url.startsWith(LABS_ORIGIN)) {
+    invalidateRecaptchaCache(tabId);  // force fresh check after reload
     setTimeout(() => detectAccounts(), 3000);
   }
 });
@@ -479,6 +553,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // Clean up when tab closes
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete connectedAccounts[tabId];
+  invalidateRecaptchaCache(tabId);
 });
 
 // Messages from popup
