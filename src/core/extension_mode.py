@@ -376,21 +376,21 @@ class ExtensionModeManager:
 
             # Wait for all account reports to arrive.
             # Each Chrome profile reports separately — wait until count stabilizes.
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
             connected = self._bridge.get_connected_accounts()
             prev_count = len(connected)
 
-            # Wait up to 15s for more accounts to trickle in
+            # Wait up to 20s for more accounts to trickle in
             stable_rounds = 0
-            for _ in range(15):
+            for _ in range(20):
                 if self.qm.stop_requested or self.qm.force_stop_requested:
                     return
                 await asyncio.sleep(1)
                 connected = self._bridge.get_connected_accounts()
                 if len(connected) == prev_count and prev_count > 0:
                     stable_rounds += 1
-                    if stable_rounds >= 3:
-                        break  # count stable for 3s — all profiles reported
+                    if stable_rounds >= 4:
+                        break  # count stable for 4s — all profiles reported
                 else:
                     stable_rounds = 0
                     prev_count = len(connected)
@@ -446,6 +446,23 @@ class ExtensionModeManager:
                 if self.qm.pause_requested:
                     await asyncio.sleep(1)
                     continue
+
+                # ─── Dynamic account discovery ───
+                # Check for new accounts that connected after initial worker creation
+                current_accounts = self._bridge.get_connected_accounts()
+                for email, info in current_accounts.items():
+                    if email and email not in self._workers:
+                        account_name = email or info.get("name", "unknown")
+                        workers = []
+                        for idx in range(1, slots_per_account + 1):
+                            slot_id = f"{account_name}#e{idx}"
+                            worker = ExtensionWorker(slot_id, account_name, self._bridge, self._log)
+                            workers.append(worker)
+                        self._workers[account_name] = workers
+                        self._log(
+                            f"[ExtMode] New account detected: {account_name} — "
+                            f"{len(workers)} worker(s) added dynamically."
+                        )
 
                 self._active_tasks = [t for t in self._active_tasks if not t.done()]
 
