@@ -163,21 +163,36 @@ class ExtensionBridge:
     # ═══════════════════════════════════════════════════════════════
 
     async def _handle_poll(self, request: web.Request) -> web.Response:
-        """Extension polls for work. Return pending token request or command."""
+        """Extension polls for work. Only return work this extension can handle.
+
+        The extension sends ?accounts=email1,email2 so the bridge knows which
+        accounts this particular Chrome profile can serve. Multi-profile setups
+        have multiple extensions, each with its own set of accounts.
+        """
         self._extension_last_seen = time.time()
+
+        # Parse which accounts this extension instance has
+        ext_accounts_param = request.query.get("accounts", "")
+        ext_accounts = set(
+            e.strip() for e in ext_accounts_param.split(",") if e.strip()
+        ) if ext_accounts_param else None  # None = legacy (accept any)
 
         response_data = {"work": None, "command": None}
 
-        # Check for pending token requests (oldest first)
+        # Check for pending token requests — match to this extension's accounts
         for req_id, req in list(self._pending_requests.items()):
             fut = req.get("future")
             if fut and not fut.done():
-                response_data["work"] = {
-                    "request_id": req_id,
-                    "account": req["account"],
-                    "action": req["action"],
-                }
-                break
+                target_account = req.get("account", "")
+                # Only give work if this extension has the target account
+                # (or if no accounts param = legacy/single-profile mode)
+                if ext_accounts is None or target_account in ext_accounts or not target_account:
+                    response_data["work"] = {
+                        "request_id": req_id,
+                        "account": target_account,
+                        "action": req["action"],
+                    }
+                    break
 
         # Check for pending commands
         if self._pending_commands:
@@ -218,15 +233,15 @@ class ExtensionBridge:
         return web.json_response({"ok": True}, headers={"Access-Control-Allow-Origin": "*"})
 
     async def _handle_accounts(self, request: web.Request) -> web.Response:
-        """Extension reports connected accounts."""
+        """Extension reports connected accounts. MERGE (don't replace) into global dict."""
         try:
             data = await request.json()
         except Exception:
             return web.json_response({"ok": False}, status=400)
 
         accounts = data.get("accounts", [])
-        self._connected_accounts.clear()
-
+        # MERGE — each Chrome profile reports its own accounts separately.
+        # Don't clear() — that erases accounts from other profiles.
         for acc in accounts:
             email = acc.get("email", "")
             if email:

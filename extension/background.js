@@ -26,7 +26,16 @@ let lastPollError = "";
 
 async function pollBridge() {
   try {
-    const resp = await fetch(`${BRIDGE_URL}/poll`, {
+    // Tell bridge which accounts THIS extension instance has
+    // so it only gives us work we can handle (multi-profile support)
+    const myAccounts = Object.values(connectedAccounts)
+      .filter((a) => a.logged_in && a.email)
+      .map((a) => a.email);
+    const accountsParam = myAccounts.length
+      ? `?accounts=${encodeURIComponent(myAccounts.join(","))}`
+      : "";
+
+    const resp = await fetch(`${BRIDGE_URL}/poll${accountsParam}`, {
       method: "GET",
       headers: { "Accept": "application/json" },
     });

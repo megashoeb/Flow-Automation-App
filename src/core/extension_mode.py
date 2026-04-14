@@ -374,11 +374,26 @@ class ExtensionModeManager:
 
             self._log("[ExtMode] Extension connected!")
 
-            # Wait for account detection
-            await asyncio.sleep(4)
-
-            # Use accounts detected by extension (no DB needed!)
+            # Wait for all account reports to arrive.
+            # Each Chrome profile reports separately — wait until count stabilizes.
+            await asyncio.sleep(3)
             connected = self._bridge.get_connected_accounts()
+            prev_count = len(connected)
+
+            # Wait up to 15s for more accounts to trickle in
+            stable_rounds = 0
+            for _ in range(15):
+                if self.qm.stop_requested or self.qm.force_stop_requested:
+                    return
+                await asyncio.sleep(1)
+                connected = self._bridge.get_connected_accounts()
+                if len(connected) == prev_count and prev_count > 0:
+                    stable_rounds += 1
+                    if stable_rounds >= 3:
+                        break  # count stable for 3s — all profiles reported
+                else:
+                    stable_rounds = 0
+                    prev_count = len(connected)
 
             if not connected:
                 self._log(
