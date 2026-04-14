@@ -37,7 +37,7 @@ class ExtensionBridge:
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
 
-        # Token request queue: request_id -> { account, action, future }
+        # Token request queue: request_id -> { account, action, future, ... }
         self._pending_requests: Dict[str, Dict[str, Any]] = {}
         self._request_counter = 0
 
@@ -49,6 +49,10 @@ class ExtensionBridge:
 
         # Pending commands for extension
         self._pending_commands = []
+
+        # Track which request was last dispatched to which extension
+        # request_id -> frozenset(ext_accounts) that currently has the work
+        self._dispatched_to: Dict[str, frozenset] = {}
 
         # Stats
         self._tokens_received = 0
@@ -90,6 +94,7 @@ class ExtensionBridge:
             if fut and not fut.done():
                 fut.set_result({"error": "bridge_stopped"})
         self._pending_requests.clear()
+        self._dispatched_to.clear()
 
         if self._site:
             await self._site.stop()
@@ -124,6 +129,8 @@ class ExtensionBridge:
             "action": action,
             "future": future,
             "created": time.time(),
+            "_failed_ext_keys": set(),   # frozensets of ext accounts that failed
+            "_reroute_count": 0,
         }
 
         try:
@@ -131,6 +138,7 @@ class ExtensionBridge:
             return result
         except asyncio.TimeoutError:
             self._pending_requests.pop(request_id, None)
+            self._dispatched_to.pop(request_id, None)
             return {"error": "timeout"}
 
     def send_command(self, command_type: str, account: str = "", data: Any = None):
@@ -175,23 +183,47 @@ class ExtensionBridge:
         ext_accounts_param = request.query.get("accounts", "")
         ext_accounts = set(
             e.strip() for e in ext_accounts_param.split(",") if e.strip()
-        ) if ext_accounts_param else None  # None = legacy (accept any)
+        ) if ext_accounts_param else set()
+
+        ext_key = frozenset(ext_accounts) if ext_accounts else None
 
         response_data = {"work": None, "command": None}
+
+        # If extension hasn't detected its accounts yet (empty param),
+        # DON'T give it any work — wait until it knows what it has.
+        # This prevents the race condition where a fresh extension grabs
+        # work it can't handle before detectAccounts() runs.
+        if not ext_accounts:
+            if self._pending_commands:
+                response_data["command"] = self._pending_commands.pop(0)
+            return web.json_response(response_data, headers={"Access-Control-Allow-Origin": "*"})
 
         # Check for pending token requests — match to this extension's accounts
         for req_id, req in list(self._pending_requests.items()):
             fut = req.get("future")
             if fut and not fut.done():
                 target_account = req.get("account", "")
+
+                # Skip if this extension already failed for this request
+                failed_ext_keys = req.get("_failed_ext_keys", set())
+                if ext_key and ext_key in failed_ext_keys:
+                    continue
+
+                # Skip if this request is currently dispatched to another extension
+                # (waiting for response — don't give same work to two extensions)
+                dispatched_key = self._dispatched_to.get(req_id)
+                if dispatched_key is not None and dispatched_key != ext_key:
+                    continue
+
                 # Only give work if this extension has the target account
-                # (or if no accounts param = legacy/single-profile mode)
-                if ext_accounts is None or target_account in ext_accounts or not target_account:
+                if target_account in ext_accounts or not target_account:
                     response_data["work"] = {
                         "request_id": req_id,
                         "account": target_account,
                         "action": req["action"],
                     }
+                    # Track that this request is now dispatched to this extension
+                    self._dispatched_to[req_id] = ext_key
                     break
 
         # Check for pending commands
@@ -208,7 +240,40 @@ class ExtensionBridge:
             return web.json_response({"ok": False}, status=400)
 
         request_id = data.get("request_id", "")
+        error = data.get("error", "")
+
+        # ─── Re-route on no_labs_tab errors ───
+        # If extension couldn't find the tab for this account, don't fail the
+        # request — put it back so a DIFFERENT extension instance can try.
+        if error and "no_labs_tab" in str(error):
+            req = self._pending_requests.get(request_id)
+            if req and req.get("future") and not req["future"].done():
+                # Mark which extension failed — use the dispatched_to tracking
+                failed_ext_key = self._dispatched_to.pop(request_id, None)
+                if failed_ext_key:
+                    req.setdefault("_failed_ext_keys", set()).add(failed_ext_key)
+
+                req["_reroute_count"] = req.get("_reroute_count", 0) + 1
+
+                # If too many reroutes (all extensions tried), give up
+                if req["_reroute_count"] >= 6:
+                    self._pending_requests.pop(request_id, None)
+                    req["future"].set_result({
+                        "token": None, "access_token": None,
+                        "email": None, "project_id": None,
+                        "error": f"all_extensions_failed: {error}",
+                    })
+                    self._log(f"[Bridge] Request {request_id} FAILED after {req['_reroute_count']} reroutes: {error}")
+                else:
+                    # Leave request in _pending_requests — DON'T pop, DON'T resolve
+                    # Next poll from a DIFFERENT extension will pick it up
+                    self._log(f"[Bridge] Re-queuing {request_id} (attempt #{req['_reroute_count']}): {error}")
+
+                return web.json_response({"ok": True}, headers={"Access-Control-Allow-Origin": "*"})
+
+        # ─── Normal result (success or non-routing error) ───
         req = self._pending_requests.pop(request_id, None)
+        self._dispatched_to.pop(request_id, None)
 
         if req and req.get("future") and not req["future"].done():
             result = {
