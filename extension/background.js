@@ -19,6 +19,7 @@ let bridgeConnected = false;
 let connectedAccounts = {};  // tabId → { email, name, access_token, project_id }
 let tokenCount = 0;
 let lastPollError = "";
+let _workInProgress = false;  // serialization lock — only one handleWork at a time
 
 // ─── reCAPTCHA readiness cache (30s validity) ───
 const _recaptchaCache = {};  // tabId → { valid: bool, ts: timestamp }
@@ -54,9 +55,15 @@ async function pollBridge() {
     lastPollError = "";
     const data = await resp.json();
 
-    // Handle pending work (token request)
-    if (data.work) {
-      await handleWork(data.work);
+    // Handle pending work (token request) — serialize to avoid
+    // 6 concurrent executeScript calls on the same tab hanging Chrome
+    if (data.work && !_workInProgress) {
+      _workInProgress = true;
+      try {
+        await handleWork(data.work);
+      } finally {
+        _workInProgress = false;
+      }
     }
 
     // Handle commands (cookie clear, tab reload, etc.)
@@ -533,8 +540,10 @@ async function handleCommand(cmd) {
 // Lifecycle
 // ═══════════════════════════════════════════════════════════════════
 
-// Start polling bridge
-setInterval(pollBridge, POLL_INTERVAL);
+// Start polling bridge — 500ms interval, but _workInProgress lock
+// prevents concurrent handleWork calls. This ensures fast pickup
+// of queued work (important when 6+ jobs are pending).
+setInterval(pollBridge, 500);
 
 // Detect accounts periodically
 setInterval(detectAccounts, ACCOUNT_DETECT_INTERVAL);
