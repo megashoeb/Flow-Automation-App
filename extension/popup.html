@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      padding: 16px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #333;
+    }
+    .header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      color: #fff;
+    }
+    .header .version {
+      font-size: 11px;
+      color: #888;
+      margin-left: auto;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 500;
+      margin-bottom: 14px;
+    }
+    .status-badge.connected {
+      background: rgba(76, 175, 80, 0.15);
+      color: #66bb6a;
+      border: 1px solid rgba(76, 175, 80, 0.3);
+    }
+    .status-badge.disconnected {
+      background: rgba(244, 67, 54, 0.15);
+      color: #ef5350;
+      border: 1px solid rgba(244, 67, 54, 0.3);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .dot.green { background: #66bb6a; }
+    .dot.red { background: #ef5350; }
+
+    .section {
+      margin-bottom: 14px;
+    }
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #888;
+      margin-bottom: 8px;
+    }
+    .account-card {
+      background: #16213e;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .account-card .icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: #0f3460;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .account-card .info {
+      flex: 1;
+      min-width: 0;
+    }
+    .account-card .email {
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .account-card .name {
+      font-size: 11px;
+      color: #888;
+    }
+    .no-accounts {
+      color: #666;
+      font-size: 12px;
+      text-align: center;
+      padding: 16px;
+    }
+    .stat {
+      display: flex;
+      justify-content: space-between;
+      padding: 6px 0;
+      font-size: 13px;
+    }
+    .stat .label { color: #888; }
+    .stat .value { color: #fff; font-weight: 500; }
+
+    .btn {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      margin-top: 4px;
+    }
+    .btn-primary {
+      background: #533483;
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #6a42a0;
+    }
+    .btn-secondary {
+      background: #16213e;
+      color: #aaa;
+      border: 1px solid #333;
+      margin-top: 6px;
+    }
+    .btn-secondary:hover {
+      background: #1a2a4e;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>G-Labs Studio Helper</h1>
+    <span class="version">v1.0.0</span>
+  </div>
+
+  <div id="statusBadge" class="status-badge disconnected">
+    <span id="statusDot" class="dot red"></span>
+    <span id="statusText">Disconnected</span>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Connected Accounts</div>
+    <div id="accountsList">
+      <div class="no-accounts">No accounts detected</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="stat">
+      <span class="label">Tokens Generated</span>
+      <span id="tokenCount" class="value">0</span>
+    </div>
+  </div>
+
+  <button id="btnOpenLabs" class="btn btn-primary">Open Labs Tab</button>
+  <button id="btnRefresh" class="btn btn-secondary">Refresh Accounts</button>
+
+  <script src="popup.js"></script>
+</body>
+</html>

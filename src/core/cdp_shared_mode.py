@@ -20,6 +20,7 @@ import subprocess
 from src.core.app_paths import get_sessions_dir
 from src.core.process_tracker import process_tracker, cleanup_session_locks
 from src.core.cloakbrowser_support import load_cloakbrowser_api
+from src.core.recaptcha_mainworld import get_recaptcha_token_mainworld
 from src.db.db_manager import (
     get_accounts,
     get_all_jobs,
@@ -463,9 +464,19 @@ class CDPSlotWorker:
                         f"with new seed (prev: {last_error[:60] if last_error else '?'})"
                     )
 
-                # Fix 5: Consume pre-generated token if fresh (saves ~200-500ms)
-                # Only use cache on attempt 1 — retries always regenerate
-                cached = self._consume_cached_token() if inline_attempt == 1 else None
+                # Main-world reCAPTCHA: get token via <script> tag injection
+                # (no CDP traces, like competitor's Chrome Extension approach)
+                # Falls back to inline evaluate if main-world fails
+                cached = None
+                try:
+                    cached = await get_recaptcha_token_mainworld(
+                        self._page, "IMAGE_GENERATION", self._log
+                    )
+                except Exception:
+                    pass
+                # If main-world failed, try pre-generated cache on attempt 1
+                if not cached and inline_attempt == 1:
+                    cached = self._consume_cached_token()
 
                 try:
                     result = await self._page.evaluate(
@@ -573,7 +584,16 @@ class CDPSlotWorker:
                         f"with new seed (prev: {last_error[:60] if last_error else '?'})"
                     )
 
-                cached = self._consume_cached_token() if inline_attempt == 1 else None
+                # Main-world reCAPTCHA token (same approach as image)
+                cached = None
+                try:
+                    cached = await get_recaptcha_token_mainworld(
+                        self._page, "VIDEO_GENERATION", self._log
+                    )
+                except Exception:
+                    pass
+                if not cached and inline_attempt == 1:
+                    cached = self._consume_cached_token()
 
                 try:
                     result = await self._page.evaluate(

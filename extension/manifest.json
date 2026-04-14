@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "G-Labs Studio Helper",
+  "version": "1.0.0",
+  "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image generation",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://labs.google/*",
+    "http://127.0.0.1:18924/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

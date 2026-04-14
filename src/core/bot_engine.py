@@ -24,6 +24,7 @@ from src.core.app_paths import get_session_clones_dir
 from src.core.cloakbrowser_support import (
     load_cloakbrowser_api,
 )
+from src.core.recaptcha_mainworld import get_recaptcha_token_mainworld
 from src.core.fingerprint_generator import FingerprintGenerator
 from src.core.process_tracker import process_tracker, cleanup_session_locks
 from src.db.db_manager import get_output_directory, get_setting, update_job_runtime_state
@@ -2582,9 +2583,19 @@ class GoogleLabsBot:
         recaptcha_action,
         reference_media_ids=None,
     ):
+        # Main-world reCAPTCHA: get token via <script> tag injection
+        # (no CDP traces, like competitor's Chrome Extension approach)
+        mainworld_token = None
+        try:
+            mainworld_token = await get_recaptcha_token_mainworld(
+                self.page, str(recaptcha_action)
+            )
+        except Exception:
+            pass
+
         return await self.page.evaluate(
             """
-            async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, referenceMediaIds, recaptchaAction }) => {
+            async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, referenceMediaIds, recaptchaAction, cachedToken }) => {
                 const getAuthSession = async () => {
                     try {
                         const resp = await fetch("https://labs.google/fx/api/auth/session", {
@@ -2604,7 +2615,6 @@ class GoogleLabsBot:
                     try {
                         const enterprise = window.grecaptcha?.enterprise;
                         if (!enterprise || typeof enterprise.execute !== "function") return null;
-                        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
                         let siteKey = null;
                         const scripts = Array.from(document.querySelectorAll("script[src*='recaptcha'][src*='render=']"));
@@ -2646,7 +2656,10 @@ class GoogleLabsBot:
                     };
                 }
 
-                const recaptchaContext = await getRecaptchaContext();
+                // Use main-world token if available, otherwise fall back to inline
+                const recaptchaContext = cachedToken
+                    ? { token: cachedToken, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" }
+                    : await getRecaptchaContext();
                 const clientContext = {
                     projectId,
                     tool: "PINHOLE",
@@ -2759,6 +2772,7 @@ class GoogleLabsBot:
                 "seed": int(seed),
                 "referenceMediaIds": list(reference_media_ids or []),
                 "recaptchaAction": str(recaptcha_action),
+                "cachedToken": mainworld_token,
             },
         )
 
@@ -3033,6 +3047,15 @@ class GoogleLabsBot:
         video_aspect = self._resolve_video_aspect_ratio(aspect_ratio)
         endpoint = endpoint or self._resolve_video_endpoint(video_sub_mode=video_sub_mode)
 
+        # Main-world reCAPTCHA token for video
+        mainworld_token = None
+        try:
+            mainworld_token = await get_recaptcha_token_mainworld(
+                self.page, "VIDEO_GENERATION"
+            )
+        except Exception:
+            pass
+
         result = await self.page.evaluate(
             """
             async ({
@@ -3048,6 +3071,7 @@ class GoogleLabsBot:
                 startImageMediaId,
                 endImageMediaId,
                 recaptchaAction,
+                cachedToken,
             }) => {
                 try {
                     const authResp = await fetch("https://labs.google/fx/api/auth/session", {
@@ -3059,34 +3083,41 @@ class GoogleLabsBot:
                         return { ok: false, error: "No auth token" };
                     }
 
+                    // Use main-world token if available, otherwise fall back to inline
                     let recaptchaContext = null;
-                    const enterprise = window.grecaptcha?.enterprise;
-                    if (enterprise && typeof enterprise.execute === "function") {
-                        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-                        const scripts = Array.from(document.querySelectorAll("script[src*='recaptcha'][src*='render=']"));
-                        let siteKey = null;
-                        for (const script of scripts) {
-                            try {
-                                const u = new URL(script.src);
-                                const render = u.searchParams.get("render");
-                                if (render && render !== "explicit") {
-                                    siteKey = render;
-                                    break;
+                    if (cachedToken) {
+                        recaptchaContext = {
+                            token: cachedToken,
+                            applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
+                        };
+                    } else {
+                        const enterprise = window.grecaptcha?.enterprise;
+                        if (enterprise && typeof enterprise.execute === "function") {
+                            const scripts = Array.from(document.querySelectorAll("script[src*='recaptcha'][src*='render=']"));
+                            let siteKey = null;
+                            for (const script of scripts) {
+                                try {
+                                    const u = new URL(script.src);
+                                    const render = u.searchParams.get("render");
+                                    if (render && render !== "explicit") {
+                                        siteKey = render;
+                                        break;
+                                    }
+                                } catch {
+                                    // keep searching
                                 }
-                            } catch {
-                                // keep searching
                             }
-                        }
-                        if (siteKey) {
-                            if (typeof enterprise.ready === "function") {
-                                await new Promise((resolve) => enterprise.ready(resolve));
-                            }
-                            const token = await enterprise.execute(siteKey, { action: recaptchaAction });
-                            if (token) {
-                                recaptchaContext = {
-                                    token,
-                                    applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
-                                };
+                            if (siteKey) {
+                                if (typeof enterprise.ready === "function") {
+                                    await new Promise((resolve) => enterprise.ready(resolve));
+                                }
+                                const token = await enterprise.execute(siteKey, { action: recaptchaAction });
+                                if (token) {
+                                    recaptchaContext = {
+                                        token,
+                                        applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB",
+                                    };
+                                }
                             }
                         }
                     }
@@ -3195,6 +3226,7 @@ class GoogleLabsBot:
                 "startImageMediaId": str(start_image_media_id or ""),
                 "endImageMediaId": str(end_image_media_id or ""),
                 "recaptchaAction": "VIDEO_GENERATION",
+                "cachedToken": mainworld_token,
             },
         )
 

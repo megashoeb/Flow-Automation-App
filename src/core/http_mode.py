@@ -35,6 +35,7 @@ except ImportError:
 from src.core.app_paths import get_sessions_dir
 from src.core.process_tracker import cleanup_session_locks
 from src.core.cloakbrowser_support import load_cloakbrowser_api
+from src.core.recaptcha_mainworld import get_recaptcha_token_mainworld
 from src.db.db_manager import (
     get_accounts,
     get_all_jobs,
@@ -362,20 +363,30 @@ class SharedBrowser:
 
         # Fallback: dummy generation POST
         try:
-            recap = await self._page.evaluate("""
-                async () => {
-                    try {
-                        const scripts = document.querySelectorAll("script[src*='recaptcha'][src*='render=']");
-                        let sk = null;
-                        for (const s of scripts) {
-                            const m = s.src.match(/render=([^&]+)/);
-                            if (m && m[1] !== 'explicit') { sk = m[1]; break; }
-                        }
-                        if (!sk || !grecaptcha || !grecaptcha.enterprise) return null;
-                        return await grecaptcha.enterprise.execute(sk, {action: 'generate'});
-                    } catch(e) { return null; }
-                }
-            """)
+            # Try main-world reCAPTCHA first
+            recap = None
+            try:
+                recap = await get_recaptcha_token_mainworld(
+                    self._page, "generate", self._log
+                )
+            except Exception:
+                pass
+            # Fall back to inline evaluate if main-world failed
+            if not recap:
+                recap = await self._page.evaluate("""
+                    async () => {
+                        try {
+                            const scripts = document.querySelectorAll("script[src*='recaptcha'][src*='render=']");
+                            let sk = null;
+                            for (const s of scripts) {
+                                const m = s.src.match(/render=([^&]+)/);
+                                if (m && m[1] !== 'explicit') { sk = m[1]; break; }
+                            }
+                            if (!sk || !grecaptcha || !grecaptcha.enterprise) return null;
+                            return await grecaptcha.enterprise.execute(sk, {action: 'generate'});
+                        } catch(e) { return null; }
+                    }
+                """)
             if recap and self._project_id:
                 await self._page.evaluate(
                     """async ([pid, tok]) => {
@@ -791,9 +802,19 @@ class BrowserFetchWorker:
 
             self._log(f"[{self.slot_id}] Image: model={model} -> {api_model}, ratio={api_ratio}")
 
+            # Main-world reCAPTCHA: get token via <script> tag injection
+            # (no CDP traces, like competitor's Chrome Extension approach)
+            mainworld_token = None
+            try:
+                mainworld_token = await get_recaptcha_token_mainworld(
+                    page, "IMAGE_GENERATION", self._log
+                )
+            except Exception:
+                pass
+
             result = await page.evaluate(
                 """
-                async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, referenceMediaIds, recaptchaAction }) => {
+                async ({ projectId, prompt, modelName, aspectRatio, batchId, seed, referenceMediaIds, cachedToken }) => {
                     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
                     // Step 1: Get fresh auth session (same as bot_engine)
@@ -809,7 +830,8 @@ class BrowserFetchWorker:
                         } catch { return null; }
                     };
 
-                    // Step 2: Get reCAPTCHA token with proper timing (same as bot_engine)
+                    // Step 2: Get reCAPTCHA token — prefer main-world cached token,
+                    // fall back to inline evaluate if not available
                     const getRecaptchaContext = async () => {
                         try {
                             const enterprise = window.grecaptcha?.enterprise;
@@ -826,13 +848,11 @@ class BrowserFetchWorker:
                             }
                             if (!siteKey) return null;
 
-                            // Wait for reCAPTCHA to be ready
                             if (typeof enterprise.ready === "function") {
                                 await new Promise((resolve) => enterprise.ready(resolve));
                             }
 
-                            // Execute immediately — fresh token = better score
-                            const token = await enterprise.execute(siteKey, { action: recaptchaAction });
+                            const token = await enterprise.execute(siteKey, { action: "IMAGE_GENERATION" });
                             if (!token) return null;
                             return { token, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" };
                         } catch { return null; }
@@ -844,7 +864,10 @@ class BrowserFetchWorker:
                             return { error: "missing auth session access token" };
                         }
 
-                        const recaptchaContext = await getRecaptchaContext();
+                        // Use main-world token if available, otherwise fall back
+                        const recaptchaContext = cachedToken
+                            ? { token: cachedToken, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" }
+                            : await getRecaptchaContext();
                         const clientContext = {
                             projectId, tool: "PINHOLE", sessionId: ";" + Date.now()
                         };
@@ -896,7 +919,7 @@ class BrowserFetchWorker:
                     "modelName": api_model, "aspectRatio": api_ratio,
                     "batchId": batch_id, "seed": seed,
                     "referenceMediaIds": references or [],
-                    "recaptchaAction": "IMAGE_GENERATION",
+                    "cachedToken": mainworld_token,
                 },
             )
 
@@ -932,9 +955,18 @@ class BrowserFetchWorker:
 
             self._log(f"[{self.slot_id}] Video: model={model} -> {api_model}, ratio={api_ratio}")
 
+            # Main-world reCAPTCHA token for video
+            mainworld_token = None
+            try:
+                mainworld_token = await get_recaptcha_token_mainworld(
+                    page, "VIDEO_GENERATION", self._log
+                )
+            except Exception:
+                pass
+
             result = await page.evaluate(
                 """
-                async ({ projectId, prompt, model, ratio, seed, batchId }) => {
+                async ({ projectId, prompt, model, ratio, seed, batchId, cachedToken }) => {
                     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
                     const getAuthSession = async () => {
@@ -981,7 +1013,10 @@ class BrowserFetchWorker:
                             return { error: "missing auth session access token" };
                         }
 
-                        const recaptchaContext = await getRecaptchaContext();
+                        // Use main-world token if available, otherwise fall back
+                        const recaptchaContext = cachedToken
+                            ? { token: cachedToken, applicationType: "RECAPTCHA_APPLICATION_TYPE_WEB" }
+                            : await getRecaptchaContext();
                         const clientContext = {
                             projectId, tool: "PINHOLE",
                             userPaygateTier: "PAYGATE_TIER_TWO",
@@ -1032,6 +1067,7 @@ class BrowserFetchWorker:
                     "projectId": project_id, "prompt": prompt,
                     "model": api_model, "ratio": api_ratio,
                     "seed": seed, "batchId": batch_id,
+                    "cachedToken": mainworld_token,
                 },
             )
 
