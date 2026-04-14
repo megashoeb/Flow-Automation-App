@@ -1114,6 +1114,15 @@ class HttpModeManager:
         self._restart_cooldown = get_int_setting("restart_cooldown_seconds", 30)
         self._last_restart_time = {}  # account_name -> timestamp
         self._restart_pending = set()  # account names needing restart
+        # Per-slot logic (same as browser-per-slot mode)
+        self._account_disabled = {}        # account_name -> True (on hold)
+        self._account_hold_until = {}      # account_name -> timestamp
+        self._account_hold_reason = {}     # account_name -> reason string
+        self._consecutive_failures = {}    # slot_id -> count
+        self._slot_disabled_until = {}     # slot_id -> timestamp
+        self._recaptcha_streak = {}        # account_name -> streak count
+        self._last_account_dispatch = {}   # account_name -> timestamp
+        self._same_account_stagger = float(getattr(queue_manager, 'same_account_stagger_seconds', 1.0))
         # Read display setting
         cloak_display = str(get_setting("cloak_display", "headless") or "headless").strip().lower()
         self._stealth_visible = cloak_display == "stealth_visible"
@@ -1204,6 +1213,9 @@ class HttpModeManager:
                         await asyncio.sleep(1)
                         continue
 
+                    # Check account holds (same as per-slot mode)
+                    self._check_account_holds()
+
                     # Check for browser restarts needed
                     if self._restart_pending:
                         await self._process_restarts(p, slots_per_account)
@@ -1226,11 +1238,18 @@ class HttpModeManager:
 
                     busy_slots = {t.get_name() for t in self._active_tasks if hasattr(t, "get_name")}
 
+                    now = time.time()
                     dispatched = 0
                     for job in pending:
                         # Re-check stop inside dispatch loop
                         if self.qm.stop_requested or self.qm.force_stop_requested:
                             break
+
+                        # Check retry_after (smart backoff from per-slot logic)
+                        retry_after = self.qm.job_retry_after.get(job["id"], 0)
+                        if retry_after > now:
+                            continue
+
                         worker = self._get_available_worker(busy_slots)
                         if not worker:
                             break
@@ -1238,6 +1257,9 @@ class HttpModeManager:
                         job_id = job["id"]
                         update_job_status(job_id, "running", account=worker.account_name)
                         self.qm.signals.job_updated.emit(job_id, "running", worker.account_name, "")
+
+                        # Track same-account stagger (per-slot style)
+                        self._last_account_dispatch[worker.account_name] = time.time()
 
                         task = asyncio.create_task(
                             self._run_job(worker, job), name=worker.slot_id,
@@ -1278,27 +1300,46 @@ class HttpModeManager:
                 self._log("[HTTP] All browsers and workers stopped.")
 
     def _get_available_worker(self, busy_slots):
+        now = time.time()
         for account_name, workers in self._workers.items():
             # Skip accounts pending restart
             if account_name in self._restart_pending:
                 continue
+            # Skip accounts on hold (rate-limited, auth expired, etc.)
+            if self._account_disabled.get(account_name):
+                continue
+            # Same-account stagger (per-slot style)
+            last_dispatch = self._last_account_dispatch.get(account_name, 0)
+            if now - last_dispatch < self._same_account_stagger:
+                continue
             for worker in workers:
+                # Skip slots in cooldown
+                if self._slot_disabled_until.get(worker.slot_id, 0) > now:
+                    continue
                 if worker.slot_id not in busy_slots and not worker.is_busy:
                     return worker
         return None
 
-    def _report_recaptcha_fail(self, account_name):
-        """Track reCAPTCHA failure. Trigger restart if threshold reached."""
+    def _report_recaptcha_fail(self, account_name, slot_id):
+        """Track reCAPTCHA failure with streak-based cooldown (per-slot style)."""
         # If restart already queued for this account, don't keep counting
         if account_name in self._restart_pending:
             return
         self._recaptcha_fails[account_name] = self._recaptcha_fails.get(account_name, 0) + 1
         count = self._recaptcha_fails[account_name]
+
+        # Streak-based slot cooldown (same as per-slot mode)
+        streak = self._recaptcha_streak.get(account_name, 0) + 1
+        self._recaptcha_streak[account_name] = streak
+        cooldown_seconds = self.qm.recaptcha_account_cooldown_seconds * min(streak, 3)
+        self._slot_disabled_until[slot_id] = time.time() + cooldown_seconds
         self._log(
-            f"[HTTP] {account_name}: reCAPTCHA fail #{count}/{self._recaptcha_fail_max}"
+            f"[HTTP] {slot_id}: reCAPTCHA fail #{count} — slot cooldown "
+            f"{cooldown_seconds}s (streak {streak}). Other slots continue."
         )
+
         if count >= self._recaptcha_fail_max:
-            # Check cooldown
+            # Check cooldown before restart
             last_restart = self._last_restart_time.get(account_name, 0)
             if (time.time() - last_restart) >= self._restart_cooldown:
                 self._restart_pending.add(account_name)
@@ -1312,9 +1353,41 @@ class HttpModeManager:
                 )
 
     def _report_recaptcha_success(self, account_name):
-        """Reset reCAPTCHA fail counter on success."""
+        """Reset reCAPTCHA fail counter and streak on success."""
         if self._recaptcha_fails.get(account_name, 0) > 0:
             self._recaptcha_fails[account_name] = 0
+        if self._recaptcha_streak.get(account_name, 0) > 0:
+            self._recaptcha_streak[account_name] = 0
+
+    def _put_account_on_hold(self, account_name, reason, hold_seconds):
+        """Put account on hold — stop dispatching jobs to it (same as per-slot)."""
+        self._account_hold_until[account_name] = time.time() + hold_seconds
+        self._account_hold_reason[account_name] = reason
+        self._account_disabled[account_name] = True
+        mins = hold_seconds // 60
+        secs = hold_seconds % 60
+        self._log(
+            f"[HTTP] Account {account_name} ON HOLD: {reason} "
+            f"(resume in {mins}m {secs}s)"
+        )
+        # Reassign pending jobs from this account
+        try:
+            from src.db.db_manager import reassign_account_jobs
+            count = reassign_account_jobs(account_name)
+            if count > 0:
+                self._log(f"[HTTP] Reassigned {count} job(s) from {account_name} to other accounts.")
+        except Exception:
+            pass
+
+    def _check_account_holds(self):
+        """Re-enable accounts whose hold has expired."""
+        now = time.time()
+        for account_name in list(self._account_hold_until.keys()):
+            if self._account_hold_until[account_name] <= now:
+                self._account_disabled.pop(account_name, None)
+                reason = self._account_hold_reason.pop(account_name, "")
+                self._account_hold_until.pop(account_name, None)
+                self._log(f"[HTTP] Account {account_name} hold expired ({reason}). Reactivated.")
 
     async def _process_restarts(self, playwright_instance, slots_per_account):
         """Restart browsers for accounts that hit reCAPTCHA fail threshold."""
@@ -1490,94 +1563,170 @@ class HttpModeManager:
             return None, f"Download exception: {str(e)[:200]}"
 
     async def _run_job(self, worker, job):
-        """Execute a single job with retries."""
+        """Execute a single job — per-slot style error handling with smart retry."""
         job_id = job["id"]
         job_type = job.get("job_type", "image")
         prompt = job.get("prompt", "")
         model = job.get("model", "")
-        # Use output_index (preserved original S.No.) for file naming;
-        # queue_no can be negative for retry jobs.
         queue_no = job.get("output_index") or job.get("queue_no")
+        slot_id = worker.slot_id
+        account_name = worker.account_name
 
-        self._log(f"[{worker.slot_id}] Processing job {job_id[:6]}...: {prompt[:40]}...")
+        self._log(f"[{slot_id}] Processing job {job_id[:6]}...: {prompt[:40]}...")
 
-        max_retries = max(1, get_int_setting("max_auto_retries_per_job", 3))
-        last_error = ""
+        # Stop check
+        if self.qm.stop_requested or self.qm.force_stop_requested:
+            update_job_status(job_id, "pending", account="")
+            self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+            return
 
-        for attempt in range(max_retries + 1):
-            # Stop requested — re-queue job immediately, don't waste time retrying
-            if self.qm.stop_requested or self.qm.force_stop_requested:
-                update_job_status(job_id, "pending", account="")
-                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
-                return
+        # Account on hold / restart pending — re-queue
+        if self._account_disabled.get(account_name) or account_name in self._restart_pending:
+            update_job_status(job_id, "pending", account="")
+            self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+            self._log(f"[{slot_id}] Job {job_id[:6]}... re-queued (account unavailable).")
+            return
 
-            # If browser restart is pending for this account, re-queue immediately
-            if worker.account_name in self._restart_pending:
-                update_job_status(job_id, "pending", account="")
-                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
-                self._log(f"[{worker.slot_id}] Job {job_id[:6]}... re-queued (browser restarting).")
-                return
+        try:
+            if "video" in job_type:
+                video_model = job.get("video_model") or model
+                ratio = job.get("aspect_ratio", "ASPECT_RATIO_16_9")
+                result, error = await worker.generate_video(prompt, video_model, ratio)
+            else:
+                ratio = job.get("aspect_ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE")
+                result, error = await worker.generate_image(prompt, model, ratio)
 
-            try:
-                if "video" in job_type:
-                    video_model = job.get("video_model") or model
-                    ratio = job.get("aspect_ratio", "ASPECT_RATIO_16_9")
-                    result, error = await worker.generate_video(prompt, video_model, ratio)
-                else:
-                    ratio = job.get("aspect_ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE")
-                    result, error = await worker.generate_image(prompt, model, ratio)
+            if result and not error:
+                # Success — reset counters
+                self._report_recaptcha_success(account_name)
+                self._consecutive_failures[slot_id] = 0
 
-                if result and not error:
-                    # reCAPTCHA succeeded — reset fail counter
-                    self._report_recaptcha_success(worker.account_name)
-
-                    # Download and save the generated media
-                    output_path, dl_error = await self._download_and_save(
-                        worker, job_id, result, queue_no=queue_no
-                    )
-                    if dl_error:
-                        last_error = dl_error
-                        self._log(f"[{worker.slot_id}] Download failed: {dl_error[:200]}")
-                        if attempt < max_retries:
-                            await asyncio.sleep(5)
-                            continue
-                    else:
-                        update_job_status(job_id, "completed", account=worker.account_name)
-                        self.qm.signals.job_updated.emit(job_id, "completed", worker.account_name, "")
-                        self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed! Saved: {output_path}")
-                        return
-
-                last_error = error or "Unknown error"
-                self._log(
-                    f"[{worker.slot_id}] Attempt {attempt + 1}/{max_retries + 1} "
-                    f"failed: {last_error[:200]}"
+                # Download and save
+                output_path, dl_error = await self._download_and_save(
+                    worker, job_id, result, queue_no=queue_no
                 )
+                if dl_error:
+                    # Download failed — treat as retryable error
+                    await self._handle_job_failure(
+                        slot_id, account_name, job_id, f"Download failed: {dl_error}"
+                    )
+                    return
 
-                # Detect reCAPTCHA failure
-                is_recaptcha_fail = "recaptcha" in last_error.lower() or "captcha" in last_error.lower()
-                if is_recaptcha_fail:
-                    self._report_recaptcha_fail(worker.account_name)
-                    # If restart is pending, stop retrying — job will be re-queued
-                    if worker.account_name in self._restart_pending:
-                        update_job_status(job_id, "pending", account="")
-                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
-                        self._log(f"[{worker.slot_id}] Job {job_id[:6]}... re-queued (browser restarting).")
-                        return
+                update_job_status(job_id, "completed", account=account_name)
+                self.qm.signals.job_updated.emit(job_id, "completed", account_name, "")
+                self._log(f"[{slot_id}] Job {job_id[:6]}... completed! Saved: {output_path}")
+                return
 
-                # Force Bearer refresh on 401
-                if "401" in last_error or "auth" in last_error.lower():
-                    self._log(f"[{worker.slot_id}] Auth failure — refreshing Bearer token...")
-                    worker._browser._bearer_token = None
+            # Generation failed
+            error = error or "Unknown error"
+            await self._handle_job_failure(slot_id, account_name, job_id, error)
 
-                if attempt < max_retries:
-                    await asyncio.sleep(10 * (attempt + 1))
+        except Exception as e:
+            await self._handle_job_failure(
+                slot_id, account_name, job_id, f"Exception: {str(e)[:300]}"
+            )
 
-            except Exception as e:
-                last_error = str(e)[:300]
-                self._log(f"[{worker.slot_id}] Attempt {attempt + 1} exception: {last_error}")
-                if attempt < max_retries:
-                    await asyncio.sleep(10)
+    async def _handle_job_failure(self, slot_id, account_name, job_id, error_msg):
+        """Handle job failure — same logic as per-slot mode in queue_manager."""
+        category = self.qm._classify_error(error_msg)
+        retryable = self.qm._is_retryable_error(error_msg)
+        max_retries = self.qm.max_auto_retries_per_job + (
+            1 if self.qm._is_high_priority_retry_error(error_msg) else 0
+        )
 
-        update_job_status(job_id, "failed", account=worker.account_name, error=last_error)
-        self.qm.signals.job_updated.emit(job_id, "failed", worker.account_name, last_error)
-        self._log(f"[{worker.slot_id}] Job {job_id[:6]}... FAILED: {last_error[:200]}")
+        self._log(
+            f"[{slot_id}] Failure: category={category}, retryable={'yes' if retryable else 'no'}."
+        )
+
+        # Account hold for auth/rate-limit errors (same as per-slot)
+        msg_lower = (error_msg or "").lower()
+        if category in ("auth_missing", "project_resolution_failed"):
+            self._put_account_on_hold(account_name, f"session expired ({category})", 300)
+        elif "session not signed in" in msg_lower or "not signed in" in msg_lower:
+            self._put_account_on_hold(account_name, "session not signed in", 300)
+        elif any(p in msg_lower for p in (
+            "rate limit", "429", "quota exceeded", "resource exhausted",
+            "too many requests", "quota_exceeded", "rate_limit",
+        )):
+            self._put_account_on_hold(account_name, "rate limited", 300)
+        elif "access denied" in msg_lower or "account suspended" in msg_lower:
+            self._put_account_on_hold(account_name, "access denied", 1800)
+
+        # Moderated — non-retryable, mark failed immediately
+        if category == "moderated":
+            self.qm.job_retry_counts.pop(job_id, None)
+            self.qm.job_retry_after.pop(job_id, None)
+            self._consecutive_failures[slot_id] = 0
+            normalized_error = str(error_msg or "").strip()
+            if normalized_error and not normalized_error.startswith("MODERATION:"):
+                normalized_error = f"MODERATION: {normalized_error}"
+            final_error = f"[moderated] {normalized_error or 'Content blocked by policy filter'}"
+            update_job_status(job_id, "failed", account=account_name, error=final_error)
+            self.qm.signals.job_updated.emit(job_id, "failed", account_name, final_error)
+            self._log(f"[{slot_id}] Prompt blocked by content filter. Marked as failed (no retry).")
+            return
+
+        # reCAPTCHA failure — streak-based slot cooldown
+        if "recaptcha" in msg_lower or "captcha" in msg_lower:
+            self._report_recaptcha_fail(account_name, slot_id)
+
+        # Force Bearer refresh on auth errors
+        if "401" in error_msg or "auth" in msg_lower:
+            self._log(f"[{slot_id}] Auth failure — refreshing Bearer token...")
+            try:
+                worker_browser = None
+                for w_list in self._workers.values():
+                    for w in w_list:
+                        if w.slot_id == slot_id:
+                            worker_browser = w._browser
+                            break
+                if worker_browser:
+                    worker_browser._bearer_token = None
+            except Exception:
+                pass
+
+        # Consecutive slot failures — disable slot temporarily
+        if self.qm._should_penalize_slot(error_msg):
+            self._consecutive_failures[slot_id] = self._consecutive_failures.get(slot_id, 0) + 1
+            max_consec = getattr(self.qm, 'max_consecutive_slot_failures', 2)
+            cooldown_secs = getattr(self.qm, 'slot_cooldown_seconds', 45)
+            if self._consecutive_failures[slot_id] >= max_consec:
+                self._slot_disabled_until[slot_id] = time.time() + cooldown_secs
+                self._consecutive_failures[slot_id] = 0
+                self._log(
+                    f"[{slot_id}] Slot disabled for {cooldown_secs}s after repeated failures."
+                )
+        else:
+            self._consecutive_failures[slot_id] = 0
+
+        # Smart retry — re-queue to pending (same as per-slot mode)
+        retry_count = self.qm.job_retry_counts.get(job_id, 0)
+        if max_retries > 0 and retryable:
+            if retry_count < max_retries:
+                retry_count += 1
+                self.qm.job_retry_counts[job_id] = retry_count
+                retry_delay = self.qm._get_retry_delay_seconds(error_msg, retry_count)
+                if retry_delay > 0:
+                    self.qm.job_retry_after[job_id] = time.time() + retry_delay
+                    retry_note = (
+                        f"Auto-retry scheduled ({retry_count}/{max_retries}) "
+                        f"after {retry_delay}s [{category}]: {error_msg}"
+                    )
+                else:
+                    self.qm.job_retry_after.pop(job_id, None)
+                    retry_note = (
+                        f"Auto-retry scheduled ({retry_count}/{max_retries}) "
+                        f"immediately [{category}]: {error_msg}"
+                    )
+                update_job_status(job_id, "pending", account="", error=retry_note)
+                self.qm.signals.job_updated.emit(job_id, "pending", "", retry_note)
+                self._log(f"[{slot_id}] {retry_note}")
+                return
+
+        # All retries exhausted — mark failed
+        self.qm.job_retry_counts.pop(job_id, None)
+        self.qm.job_retry_after.pop(job_id, None)
+        final_error = f"[{category}] {error_msg}"
+        update_job_status(job_id, "failed", account=account_name, error=final_error)
+        self.qm.signals.job_updated.emit(job_id, "failed", account_name, final_error)
+        self._log(f"[{slot_id}] Job {job_id[:6]}... FAILED: {error_msg[:200]}")
