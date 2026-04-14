@@ -987,6 +987,215 @@ class ExtensionModeManager:
                     return worker
         return None
 
+    async def _run_pipeline_job(self, worker: ExtensionWorker, job: dict):
+        """Execute a pipeline job: Step 1 = generate image, Step 2 = generate video from it."""
+        job_id = job["id"]
+        prompt = job.get("prompt", "")
+        model = job.get("model", "")
+        queue_no = job.get("output_index") or job.get("queue_no")
+        video_prompt = str(job.get("video_prompt") or "animate").strip() or "animate"
+        video_model = str(job.get("video_model") or "").strip()
+        video_sub_mode = str(job.get("video_sub_mode") or "ingredients").strip()
+        video_ratio = str(job.get("video_ratio") or job.get("aspect_ratio") or "").strip()
+        ratio = job.get("aspect_ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE")
+
+        # Parse ref_paths for image step
+        ref_paths = []
+        ref_paths_raw = job.get("ref_paths") or ""
+        if isinstance(ref_paths_raw, str) and ref_paths_raw.strip():
+            try:
+                parsed = json.loads(ref_paths_raw)
+                if isinstance(parsed, list):
+                    ref_paths = [str(p).strip() for p in parsed if str(p).strip()]
+            except (json.JSONDecodeError, TypeError):
+                ref_paths = [ref_paths_raw.strip()]
+        single_ref = str(job.get("ref_path") or "").strip()
+        if single_ref and single_ref not in ref_paths:
+            ref_paths.insert(0, single_ref)
+
+        sub_mode = _normalize_video_sub_mode(video_sub_mode=video_sub_mode)
+        if sub_mode not in ("ingredients", "frames_start"):
+            sub_mode = "ingredients"
+
+        self._log(f"[{worker.slot_id}] Pipeline: image({model}) -> video({sub_mode})")
+
+        try:
+            # ── Step 1: Generate image ──
+            self._log(f"[{worker.slot_id}] Pipeline Step 1: Generating image...")
+            img_result, img_error = await worker.generate_image(
+                prompt, model, ratio,
+                ref_paths=ref_paths if ref_paths else None,
+            )
+
+            if img_error or not img_result:
+                update_job_status(job_id, "failed", account=worker.account_email, error=img_error or "Image generation failed")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, img_error or "Image generation failed")
+                self._log(f"[{worker.slot_id}] Pipeline Step 1 FAILED: {(img_error or '')[:200]}")
+                return
+
+            # Extract media ID from generated image
+            media_list = img_result.get("media", []) if isinstance(img_result, dict) else []
+            generated_media_id = ""
+            for item in media_list:
+                if isinstance(item, dict):
+                    generated_media_id = item.get("name", "")
+                    if generated_media_id:
+                        break
+
+            if not generated_media_id:
+                workflows = img_result.get("workflows", []) if isinstance(img_result, dict) else []
+                if workflows and isinstance(workflows[0], dict):
+                    generated_media_id = workflows[0].get("metadata", {}).get("primaryMediaId", "")
+
+            if not generated_media_id:
+                update_job_status(job_id, "failed", account=worker.account_email, error="Pipeline: no media ID from image generation")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, "Pipeline: no media ID from image generation")
+                return
+
+            self._log(f"[{worker.slot_id}] Step 1 done: {generated_media_id[:20]}...")
+
+            # ── Step 2: Generate video from image ──
+            self._log(f"[{worker.slot_id}] Pipeline Step 2: Generating video ({sub_mode})...")
+
+            # Use the generated image media ID as reference or start image
+            # We pass it directly as a media ID (not file path) — need to build generate_video call manually
+            api_ratio = _resolve_video_ratio(video_ratio)
+            api_model = _resolve_video_model_for_sub_mode(sub_mode, video_model, video_model, video_ratio)
+            endpoint = VIDEO_ENDPOINTS.get(sub_mode, VIDEO_API_URL)
+            seed = random.randint(100000, 999999)
+            batch_id = str(uuid.uuid4())
+
+            # Get fresh token for video step
+            bridge_result = await worker._bridge.request_token(
+                worker.account_email, "VIDEO_GENERATION", timeout=30
+            )
+            if bridge_result.get("error"):
+                update_job_status(job_id, "failed", account=worker.account_email, error=f"Pipeline Step 2 bridge error: {bridge_result['error']}")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, f"Pipeline Step 2 bridge error: {bridge_result['error']}")
+                return
+
+            token = bridge_result.get("token")
+            access_token = bridge_result.get("access_token")
+            project_id = bridge_result.get("project_id") or worker._bridge.get_project_id(worker.account_email)
+
+            if not access_token:
+                update_job_status(job_id, "failed", account=worker.account_email, error="Pipeline Step 2: no access token")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, "Pipeline Step 2: no access token")
+                return
+
+            if not project_id:
+                project_id = await worker._resolve_project_id(access_token)
+
+            client_context = {
+                "projectId": project_id or "",
+                "tool": "PINHOLE",
+                "userPaygateTier": "PAYGATE_TIER_TWO",
+                "sessionId": f";{int(time.time() * 1000)}",
+            }
+            if token:
+                client_context["recaptchaContext"] = {
+                    "token": token,
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                }
+
+            request_obj = {
+                "aspectRatio": api_ratio,
+                "seed": seed,
+                "textInput": {
+                    "structuredPrompt": {"parts": [{"text": video_prompt}]},
+                },
+                "videoModelKey": api_model,
+                "metadata": {},
+            }
+
+            if sub_mode == "ingredients":
+                request_obj["referenceImages"] = [{
+                    "mediaId": generated_media_id,
+                    "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                }]
+            elif sub_mode == "frames_start":
+                request_obj["startImage"] = {
+                    "mediaId": generated_media_id,
+                    "cropCoordinates": {"top": 0, "left": 0, "bottom": 1, "right": 1},
+                }
+
+            body = {
+                "mediaGenerationContext": {"batchId": batch_id},
+                "clientContext": client_context,
+                "requests": [request_obj],
+                "useV2ModelConfig": True,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    endpoint,
+                    headers={
+                        "content-type": "text/plain;charset=UTF-8",
+                        "authorization": f"Bearer {access_token}",
+                    },
+                    data=json.dumps(body),
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    resp_text = await resp.text()
+                    if not resp.ok:
+                        err = _parse_api_error(resp.status, resp_text)
+                        update_job_status(job_id, "failed", account=worker.account_email, error=f"Pipeline Step 2: {err}")
+                        self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, f"Pipeline Step 2: {err}")
+                        return
+                    data = json.loads(resp_text)
+
+            # Extract video media_id
+            vid_media_list = data.get("media", []) if isinstance(data, dict) else []
+            vid_media_id = ""
+            if vid_media_list and isinstance(vid_media_list, list) and isinstance(vid_media_list[0], dict):
+                vid_media_id = vid_media_list[0].get("name", "")
+            if not vid_media_id:
+                vid_workflows = data.get("workflows", []) if isinstance(data, dict) else []
+                if vid_workflows and isinstance(vid_workflows[0], dict):
+                    vid_media_id = vid_workflows[0].get("metadata", {}).get("primaryMediaId", "")
+
+            if not vid_media_id:
+                update_job_status(job_id, "failed", account=worker.account_email, error="Pipeline Step 2: no video media ID")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, "Pipeline Step 2: no video media ID")
+                return
+
+            # Poll video
+            self._log(f"[{worker.slot_id}] Video submitted, polling: {vid_media_id[:20]}...")
+            poll_status, poll_error = await worker._poll_video_status(
+                access_token, vid_media_id, project_id,
+                poll_interval=5, max_polls=60,
+            )
+
+            if poll_status != "completed":
+                err = f"Pipeline video {poll_status}: {poll_error or 'unknown'}"
+                update_job_status(job_id, "failed", account=worker.account_email, error=err)
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, err)
+                return
+
+            # Download video
+            data["_video_media_id"] = vid_media_id
+            output_path, dl_error = await self._download_and_save(
+                worker, job_id, data, queue_no=queue_no
+            )
+
+            if dl_error:
+                update_job_status(job_id, "failed", account=worker.account_email, error=f"Pipeline download: {dl_error}")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, f"Pipeline download: {dl_error}")
+                return
+
+            update_job_status(job_id, "completed", account=worker.account_email)
+            self.qm.signals.job_updated.emit(job_id, "completed", worker.account_email, "")
+            self._log(f"[{worker.slot_id}] Pipeline job {job_id[:6]}... completed! ({output_path})")
+
+        except asyncio.CancelledError:
+            update_job_status(job_id, "pending", account="")
+            self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+        except Exception as e:
+            err = str(e)[:300]
+            update_job_status(job_id, "failed", account=worker.account_email, error=err)
+            self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, err)
+            self._log(f"[{worker.slot_id}] Pipeline FAILED: {err}")
+
     async def _run_job(self, worker: ExtensionWorker, job: dict):
         """Execute a single job with retries."""
         job_id = job["id"]
@@ -994,6 +1203,10 @@ class ExtensionModeManager:
         prompt = job.get("prompt", "")
         model = job.get("model", "")
         queue_no = job.get("output_index") or job.get("queue_no")
+
+        # Pipeline jobs have their own 2-step flow
+        if job_type == "pipeline":
+            return await self._run_pipeline_job(worker, job)
 
         self._log(f"[{worker.slot_id}] Job {job_id[:6]}...: {prompt[:40]}...")
 
