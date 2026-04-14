@@ -1285,9 +1285,17 @@ class HttpModeManager:
                         for t in self._active_tasks:
                             if not t.done():
                                 t.cancel()
+                        # Short timeout — don't wait forever
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*self._active_tasks, return_exceptions=True),
+                                timeout=3.0,
+                            )
+                        except asyncio.TimeoutError:
+                            self._log("[HTTP] Some tasks didn't cancel in 3s — continuing.")
                     else:
                         self._log(f"[HTTP] Waiting for {len(self._active_tasks)} active job(s)...")
-                    await asyncio.gather(*self._active_tasks, return_exceptions=True)
+                        await asyncio.gather(*self._active_tasks, return_exceptions=True)
 
             finally:
                 for w_list in self._workers.values():
@@ -1620,6 +1628,12 @@ class HttpModeManager:
             # Generation failed
             error = error or "Unknown error"
             await self._handle_job_failure(slot_id, account_name, job_id, error)
+
+        except asyncio.CancelledError:
+            # Task was cancelled by stop — re-queue job to pending
+            update_job_status(job_id, "pending", account="")
+            self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+            return
 
         except Exception as e:
             await self._handle_job_failure(

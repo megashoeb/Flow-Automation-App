@@ -895,8 +895,21 @@ class MultiTabManager:
 
                 # Wait for active tasks
                 if self._active_tasks:
-                    self._log(f"[MultiTab] Waiting for {len(self._active_tasks)} active job(s)...")
-                    await asyncio.gather(*self._active_tasks, return_exceptions=True)
+                    if self.qm.stop_requested or self.qm.force_stop_requested:
+                        self._log(f"[MultiTab] Cancelling {len(self._active_tasks)} active job(s)...")
+                        for t in self._active_tasks:
+                            if not t.done():
+                                t.cancel()
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*self._active_tasks, return_exceptions=True),
+                                timeout=3.0,
+                            )
+                        except asyncio.TimeoutError:
+                            self._log("[MultiTab] Some tasks didn't cancel in 3s — continuing.")
+                    else:
+                        self._log(f"[MultiTab] Waiting for {len(self._active_tasks)} active job(s)...")
+                        await asyncio.gather(*self._active_tasks, return_exceptions=True)
 
             finally:
                 for browser in self._browsers.values():

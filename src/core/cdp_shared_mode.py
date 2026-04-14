@@ -2370,8 +2370,21 @@ class CDPSharedManager:
                     pass
 
             if self._active_tasks:
-                self._log(f"[CDPShared] Waiting for {len(self._active_tasks)} active job(s)...")
-                await asyncio.gather(*self._active_tasks, return_exceptions=True)
+                if self.qm.stop_requested or self.qm.force_stop_requested:
+                    self._log(f"[CDPShared] Cancelling {len(self._active_tasks)} active job(s)...")
+                    for t in self._active_tasks:
+                        if not t.done():
+                            t.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*self._active_tasks, return_exceptions=True),
+                            timeout=3.0,
+                        )
+                    except asyncio.TimeoutError:
+                        self._log("[CDPShared] Some tasks didn't cancel in 3s — continuing.")
+                else:
+                    self._log(f"[CDPShared] Waiting for {len(self._active_tasks)} active job(s)...")
+                    await asyncio.gather(*self._active_tasks, return_exceptions=True)
 
         finally:
             for server in self._servers.values():

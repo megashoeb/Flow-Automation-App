@@ -9870,8 +9870,10 @@ class MainWindow(QMainWindow):
         if self.queue_manager and self.queue_manager.isRunning():
             self.queue_manager.stop()
             self._set_queue_controls_state("stopping")
-            self.append_log("[SYSTEM] Stop requested. Active jobs are being cancelled and queue state will reset.")
-            self._toast_info("Stop Requested", "Cancelling active jobs...")
+            self.append_log("[SYSTEM] Stop requested — running jobs reset to pending instantly.")
+            self._toast_info("Stopped", "Running jobs moved back to pending.")
+            # Immediately refresh queue table to show jobs back as pending
+            QTimer.singleShot(200, self.load_queue_table)
 
     def force_stop_and_clear_queue(self):
         if not self._fluent_confirm(

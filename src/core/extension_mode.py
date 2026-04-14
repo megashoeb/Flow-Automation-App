@@ -502,9 +502,17 @@ class ExtensionModeManager:
                     for t in self._active_tasks:
                         if not t.done():
                             t.cancel()
+                    # Short timeout — don't wait forever
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*self._active_tasks, return_exceptions=True),
+                            timeout=3.0,
+                        )
+                    except asyncio.TimeoutError:
+                        self._log("[ExtMode] Some tasks didn't cancel in 3s — continuing.")
                 else:
                     self._log(f"[ExtMode] Waiting for {len(self._active_tasks)} active job(s)...")
-                await asyncio.gather(*self._active_tasks, return_exceptions=True)
+                    await asyncio.gather(*self._active_tasks, return_exceptions=True)
 
         finally:
             await self._bridge.stop()
@@ -577,16 +585,36 @@ class ExtensionModeManager:
                 if "recaptcha" in last_error.lower() or "captcha" in last_error.lower():
                     self._bridge.send_command("clear_cookies", worker.account_email)
                     self._bridge.send_command("reload_tab", worker.account_email)
+                    # Check stop before sleeping
+                    if self.qm.stop_requested or self.qm.force_stop_requested:
+                        update_job_status(job_id, "pending", account="")
+                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                        return
                     await asyncio.sleep(5)
                     continue
 
                 if attempt < max_retries:
-                    await asyncio.sleep(10 * (attempt + 1))
+                    # Check stop before retry sleep
+                    if self.qm.stop_requested or self.qm.force_stop_requested:
+                        update_job_status(job_id, "pending", account="")
+                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                        return
+                    await asyncio.sleep(min(10 * (attempt + 1), 15))  # cap at 15s
+
+            except asyncio.CancelledError:
+                # Task was cancelled by stop — re-queue job
+                update_job_status(job_id, "pending", account="")
+                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                return
 
             except Exception as e:
                 last_error = str(e)[:300]
                 self._log(f"[{worker.slot_id}] Attempt {attempt + 1} exception: {last_error}")
                 if attempt < max_retries:
+                    if self.qm.stop_requested or self.qm.force_stop_requested:
+                        update_job_status(job_id, "pending", account="")
+                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                        return
                     await asyncio.sleep(10)
 
         update_job_status(job_id, "failed", account=worker.account_email, error=last_error)

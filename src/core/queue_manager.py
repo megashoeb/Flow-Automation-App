@@ -269,7 +269,21 @@ class AsyncQueueManager(QThread):
         self.stop_requested = True
         self.pause_requested = False
         self.is_running = False
-        self.signals.log_msg.emit("[SYSTEM] Stop requested. Cancelling active jobs and resetting queue state...")
+        self.signals.log_msg.emit("[SYSTEM] Stop requested — resetting jobs immediately...")
+
+        # ─── INSTANT reset: move all running jobs back to pending RIGHT NOW ───
+        # Don't wait for async task cancellation — update DB and UI immediately
+        try:
+            recovered = reset_running_jobs_to_pending()
+            if recovered:
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] ✓ Instantly reset {recovered} running job(s) back to pending."
+                )
+                self.signals.job_updated.emit("", "pending", "", "")  # trigger UI refresh
+        except Exception as e:
+            self.signals.log_msg.emit(f"[SYSTEM] Reset warning: {e}")
+
+        # Then cancel async tasks in background (cleanup)
         if self.loop and not self.loop.is_closed():
             try:
                 asyncio.run_coroutine_threadsafe(self._cancel_active_tasks_now(), self.loop)
@@ -281,7 +295,19 @@ class AsyncQueueManager(QThread):
         self.pause_requested = False
         self.force_stop_requested = True
         self.is_running = False
-        self.signals.log_msg.emit("[SYSTEM] FORCE STOP requested. Cancelling active jobs now...")
+        self.signals.log_msg.emit("[SYSTEM] FORCE STOP — resetting jobs immediately...")
+
+        # ─── INSTANT reset: move all running jobs back to pending RIGHT NOW ───
+        try:
+            recovered = reset_running_jobs_to_pending()
+            if recovered:
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] ✓ Instantly reset {recovered} running job(s) back to pending."
+                )
+                self.signals.job_updated.emit("", "pending", "", "")  # trigger UI refresh
+        except Exception as e:
+            self.signals.log_msg.emit(f"[SYSTEM] Reset warning: {e}")
+
         if self.loop and not self.loop.is_closed():
             try:
                 asyncio.run_coroutine_threadsafe(self._cancel_active_tasks_now(), self.loop)
@@ -303,14 +329,21 @@ class AsyncQueueManager(QThread):
         for task in snapshot:
             if not task.done():
                 task.cancel()
+        # Give tasks max 3s to respond to cancellation (was unlimited before)
         if snapshot:
-            await asyncio.gather(*snapshot, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*snapshot, return_exceptions=True),
+                    timeout=3.0,
+                )
+            except asyncio.TimeoutError:
+                self.signals.log_msg.emit("[SYSTEM] Some tasks didn't cancel in 3s — force-continuing cleanup.")
 
-        for slot in self.worker_slots:
+        for slot in (self.worker_slots or []):
             slot["is_busy"] = False
             if slot.get("is_initialized"):
                 try:
-                    await asyncio.wait_for(slot["engine"].cleanup(), timeout=8)
+                    await asyncio.wait_for(slot["engine"].cleanup(), timeout=3)
                 except Exception:
                     pass
                 finally:
@@ -318,11 +351,14 @@ class AsyncQueueManager(QThread):
         await self._cleanup_all_browsers()
 
     async def _cleanup_all_browsers(self):
+        # Use shorter timeouts when stop was requested (instant stop)
+        cleanup_timeout = 2 if (self.stop_requested or self.force_stop_requested) else 8
+
         for slot in list(self.worker_slots or []):
             try:
                 engine = slot.get("engine")
                 if engine is not None:
-                    await asyncio.wait_for(engine.cleanup(), timeout=8)
+                    await asyncio.wait_for(engine.cleanup(), timeout=cleanup_timeout)
             except Exception:
                 # Bug #9: Force close context if cleanup timed out
                 try:
@@ -336,14 +372,16 @@ class AsyncQueueManager(QThread):
                 slot["is_initialized"] = False
                 slot["is_busy"] = False
 
-        await asyncio.sleep(2)
+        # Shorter sleeps on stop — just enough for process kill
+        sleep_time = 0.5 if (self.stop_requested or self.force_stop_requested) else 2
+        await asyncio.sleep(sleep_time)
         killed = process_tracker.kill_all()
         self._cleanup_lock_files()
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)
         # Verify processes actually died (Bug #8 fix)
         still_alive = process_tracker.kill_all()
         if still_alive:
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
             process_tracker.kill_all()  # Third attempt
         if killed or still_alive:
             self.signals.log_msg.emit(
@@ -566,19 +604,29 @@ class AsyncQueueManager(QThread):
                     for task in self.active_tasks:
                         if not task.done():
                             task.cancel()
-                await asyncio.gather(*self.active_tasks, return_exceptions=True)
+                # Use timeout on gather so stop doesn't hang
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self.active_tasks, return_exceptions=True),
+                        timeout=5.0 if (self.stop_requested or self.force_stop_requested) else 60.0,
+                    )
+                except asyncio.TimeoutError:
+                    self.signals.log_msg.emit("[SYSTEM] Some tasks didn't finish in time — continuing cleanup.")
 
+            # Safety net: catch any stragglers that didn't get reset by stop()
             if self.stop_requested or self.force_stop_requested:
                 recovered = reset_running_jobs_to_pending()
                 if recovered:
                     self.signals.log_msg.emit(
-                        f"[SYSTEM] Reset {recovered} interrupted running job(s) back to pending."
+                        f"[SYSTEM] Reset {recovered} remaining running job(s) back to pending."
                     )
+                    self.signals.job_updated.emit("", "pending", "", "")
 
             for slot in worker_slots:
                 if slot["is_initialized"]:
                     try:
-                        await slot["engine"].cleanup()
+                        t = 2 if (self.stop_requested or self.force_stop_requested) else 8
+                        await asyncio.wait_for(slot["engine"].cleanup(), timeout=t)
                     except Exception as cleanup_error:
                         self.signals.log_msg.emit(f"[{slot['label']}] Cleanup warning: {cleanup_error}")
                     finally:
