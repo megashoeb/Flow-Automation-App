@@ -12,12 +12,14 @@ reCAPTCHA: Best possible (real Chrome, world: "MAIN", zero detection)
 """
 
 import asyncio
+import base64
 import json
+import mimetypes
 import os
 import random
 import time
 import uuid
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 try:
     import aiohttp
@@ -40,6 +42,10 @@ IMAGE_API_URL = "https://aisandbox-pa.googleapis.com/v1/projects/{project_id}/fl
 VIDEO_API_URL = "https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText"
 AUTH_SESSION_URL = "https://labs.google/fx/api/auth/session"
 PROJECT_CREATE_URL = "https://aisandbox-pa.googleapis.com/v1/projects"
+UPLOAD_IMAGE_URL = "https://aisandbox-pa.googleapis.com/v1/flow/uploadImage"
+VIDEO_REFERENCE_URL = "https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoReferenceImages"
+VIDEO_START_IMAGE_URL = "https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoStartImage"
+VIDEO_POLL_URL = "https://aisandbox-pa.googleapis.com/v1/video:batchCheckAsyncVideoGenerationStatus"
 
 
 def _parse_api_error(status_code: int, resp_text: str) -> str:
@@ -178,11 +184,85 @@ def _resolve_video_ratio(ratio_name):
     return "VIDEO_ASPECT_RATIO_LANDSCAPE"
 
 
+def _normalize_video_sub_mode(video_sub_mode="", ref_path=None, start_image_path=None, end_image_path=None):
+    """Determine video sub-mode from explicit value or infer from provided paths."""
+    raw = str(video_sub_mode or "").strip().lower()
+    valid_modes = {"text_to_video", "ingredients", "frames_start", "frames_start_end"}
+    if raw in valid_modes:
+        return raw
+    if end_image_path and start_image_path:
+        return "frames_start_end"
+    if start_image_path:
+        return "frames_start"
+    if ref_path:
+        return "ingredients"
+    return "text_to_video"
+
+
+def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", ratio=""):
+    """Pick the correct video model key based on sub-mode and quality tier."""
+    source = str(video_model or model or "").strip().lower()
+    # Determine quality tier
+    if "lite" in source:
+        tier = "lite"
+    elif "lower pri" in source or "relaxed" in source:
+        tier = "lower_pri"
+    elif "quality" in source:
+        tier = "quality"
+    else:
+        tier = "fast"
+
+    # Model key lookup table (matches bot_engine.py VIDEO_MODEL_KEYS)
+    model_keys = {
+        ("text_to_video", "fast"): "veo_3_1_t2v_fast_ultra",
+        ("text_to_video", "lite"): "veo_3_1_t2v_lite",
+        ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_ultra_relaxed",
+        ("text_to_video", "quality"): "veo_3_1_t2v",
+        ("ingredients", "fast"): "veo_3_1_r2v_fast_landscape_ultra",
+        ("ingredients", "lite"): "veo_3_1_r2v_fast_landscape_ultra",
+        ("ingredients", "lower_pri"): "veo_3_1_r2v_fast_landscape_ultra_relaxed",
+        ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
+        ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
+        ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
+        ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_ultra_fl",
+        ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_ultra_fl",
+        ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
+    }
+
+    key = model_keys.get((video_sub_mode, tier))
+    if key:
+        return key
+
+    # For reference with aspect-ratio-specific models
+    if video_sub_mode == "ingredients":
+        api_ratio = _resolve_video_ratio(ratio)
+        ratio_map = {
+            "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape_ultra",
+            "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait_ultra",
+            "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square_ultra",
+        }
+        return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape_ultra")
+
+    return "veo_3_1_t2v_fast_ultra"
+
+
+# Video endpoint lookup
+VIDEO_ENDPOINTS = {
+    "text_to_video": VIDEO_API_URL,
+    "ingredients": VIDEO_REFERENCE_URL,
+    "frames_start": VIDEO_START_IMAGE_URL,
+    "frames_start_end": "https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoStartAndEndImage",
+}
+
+
 class ExtensionWorker:
     """A lightweight worker that uses the bridge for tokens and makes direct API calls."""
 
     # Class-level lock per account: prevents 7 workers all trying to create project at once
     _project_locks: Dict[str, asyncio.Lock] = {}
+    # Class-level reference upload cache: (project_id, file_path) -> media_name
+    _reference_cache: Dict[tuple, str] = {}
+    _reference_cache_locks: Dict[tuple, asyncio.Lock] = {}
 
     def __init__(self, slot_id: str, account_email: str, bridge: ExtensionBridge, log_fn):
         self.slot_id = slot_id
@@ -192,7 +272,158 @@ class ExtensionWorker:
         self.is_busy = False
         self.jobs_completed = 0
 
-    async def generate_image(self, prompt, model, ratio, references=None):
+    async def _upload_reference_image(self, access_token, project_id, file_path):
+        """Upload a single reference image via aiohttp, return media name."""
+        if not file_path or not os.path.exists(file_path):
+            raise RuntimeError(f"Reference file not found: {file_path}")
+
+        with open(file_path, "rb") as f:
+            image_bytes_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        file_name = os.path.basename(file_path)
+        mime_type, _ = mimetypes.guess_type(file_path)
+        mime_type = mime_type or "image/jpeg"
+
+        body = {
+            "clientContext": {
+                "projectId": project_id,
+                "tool": "PINHOLE",
+                "sessionId": f";{int(time.time() * 1000)}",
+            },
+            "fileName": file_name,
+            "mimeType": mime_type,
+            "imageBytes": image_bytes_b64,
+            "isHidden": False,
+            "isUserUploaded": True,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                UPLOAD_IMAGE_URL,
+                headers={
+                    "content-type": "text/plain;charset=UTF-8",
+                    "authorization": f"Bearer {access_token}",
+                },
+                data=json.dumps(body),
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                resp_text = await resp.text()
+                if not resp.ok:
+                    raise RuntimeError(f"Upload failed: {_parse_api_error(resp.status, resp_text)}")
+
+                try:
+                    data = json.loads(resp_text)
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"Upload response not JSON: {resp_text[:200]}")
+
+                media_name = (
+                    data.get("name")
+                    or data.get("mediaName")
+                    or (data.get("media", {}).get("name") if isinstance(data.get("media"), dict) else "")
+                    or (data["media"][0].get("name", "") if isinstance(data.get("media"), list) and data["media"] else "")
+                )
+                if not media_name:
+                    raise RuntimeError(f"Upload response missing media name: {resp_text[:200]}")
+
+                self._log(f"[{self.slot_id}] Uploaded reference: {file_name} -> {media_name}")
+                return media_name
+
+    async def _upload_and_cache_reference(self, access_token, project_id, file_path):
+        """Upload reference image with cache + lock to avoid duplicate uploads."""
+        cache_key = (project_id, os.path.abspath(file_path))
+
+        # Fast path: already cached
+        cached = ExtensionWorker._reference_cache.get(cache_key)
+        if cached:
+            self._log(f"[{self.slot_id}] Reference cached: {os.path.basename(file_path)}")
+            return cached
+
+        # Get or create lock for this specific file+project
+        if cache_key not in ExtensionWorker._reference_cache_locks:
+            ExtensionWorker._reference_cache_locks[cache_key] = asyncio.Lock()
+        lock = ExtensionWorker._reference_cache_locks[cache_key]
+
+        async with lock:
+            # Re-check after acquiring lock
+            cached = ExtensionWorker._reference_cache.get(cache_key)
+            if cached:
+                return cached
+
+            media_name = await self._upload_reference_image(access_token, project_id, file_path)
+            ExtensionWorker._reference_cache[cache_key] = media_name
+            return media_name
+
+    async def _upload_references(self, access_token, project_id, ref_paths):
+        """Upload multiple reference images, return list of media IDs."""
+        media_ids = []
+        for path in ref_paths:
+            path = str(path).strip()
+            if not path:
+                continue
+            media_name = await self._upload_and_cache_reference(access_token, project_id, path)
+            media_ids.append(media_name)
+        return media_ids
+
+    async def _poll_video_status(self, access_token, media_id, project_id, poll_interval=5, max_polls=60):
+        """Poll video generation status until complete or failed."""
+        for poll_num in range(1, max_polls + 1):
+            await asyncio.sleep(poll_interval)
+
+            poll_body = {
+                "media": [{"name": media_id, "projectId": project_id}],
+            }
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        VIDEO_POLL_URL,
+                        headers={
+                            "content-type": "text/plain;charset=UTF-8",
+                            "authorization": f"Bearer {access_token}",
+                        },
+                        data=json.dumps(poll_body),
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        resp_text = await resp.text()
+                        if not resp.ok:
+                            if poll_num % 3 == 0:
+                                self._log(f"[{self.slot_id}] Poll {poll_num} HTTP {resp.status}")
+                            continue
+
+                        data = json.loads(resp_text)
+                        media_list = data.get("media", [])
+                        if not media_list:
+                            continue
+
+                        media_item = media_list[0] if isinstance(media_list, list) else {}
+                        media_status = (
+                            media_item.get("mediaMetadata", {}).get("mediaStatus", {})
+                        )
+                        status = media_status.get("mediaGenerationStatus", "UNKNOWN")
+
+                        if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+                            self._log(f"[{self.slot_id}] Video complete (poll {poll_num})")
+                            return "completed", None
+
+                        if status == "MEDIA_GENERATION_STATUS_FAILED":
+                            reason = (
+                                media_status.get("failureReason")
+                                or media_status.get("moderationResult")
+                                or media_status.get("errorMessage")
+                                or "server returned FAILED"
+                            )
+                            return "failed", str(reason)
+
+                        if poll_num % 3 == 0:
+                            self._log(f"[{self.slot_id}] Video generating... (poll {poll_num})")
+
+            except Exception as e:
+                if poll_num % 3 == 0:
+                    self._log(f"[{self.slot_id}] Poll {poll_num} error: {str(e)[:100]}")
+
+        return "timeout", f"Video timed out after {max_polls * poll_interval}s"
+
+    async def generate_image(self, prompt, model, ratio, references=None, ref_paths=None):
         """Generate image via direct API call (token from extension)."""
         self.is_busy = True
         try:
@@ -226,6 +457,15 @@ class ExtensionWorker:
             if not project_id:
                 return None, "📁 No project ID available — open a project in labs.google/fx/tools/flow"
 
+            # Upload reference images if file paths provided
+            media_ids = list(references or [])
+            if ref_paths:
+                try:
+                    uploaded = await self._upload_references(access_token, project_id, ref_paths)
+                    media_ids.extend(uploaded)
+                except Exception as e:
+                    return None, f"Reference upload failed: {str(e)[:200]}"
+
             # Build request body
             client_context = {
                 "projectId": project_id,
@@ -250,8 +490,8 @@ class ExtensionWorker:
                     "seed": seed,
                     "imageInputs": (
                         [{"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": ref_id}
-                         for ref_id in references]
-                        if references else []
+                         for ref_id in media_ids]
+                        if media_ids else []
                     ),
                 }],
             }
@@ -286,16 +526,29 @@ class ExtensionWorker:
         finally:
             self.is_busy = False
 
-    async def generate_video(self, prompt, model, ratio):
-        """Generate video via direct API call."""
+    async def generate_video(
+        self, prompt, model, ratio,
+        video_sub_mode="text_to_video",
+        ref_path=None, start_image_path=None, end_image_path=None,
+    ):
+        """Generate video via direct API call. Supports text-to-video, reference, and image-to-video."""
         self.is_busy = True
         try:
-            api_model = _resolve_video_model(model)
+            # Determine sub-mode from explicit param or inferred from paths
+            sub_mode = _normalize_video_sub_mode(
+                video_sub_mode=video_sub_mode,
+                ref_path=ref_path,
+                start_image_path=start_image_path,
+                end_image_path=end_image_path,
+            )
+
             api_ratio = _resolve_video_ratio(ratio)
+            api_model = _resolve_video_model_for_sub_mode(sub_mode, model, model, ratio)
+            endpoint = VIDEO_ENDPOINTS.get(sub_mode, VIDEO_API_URL)
             seed = random.randint(100000, 999999)
             batch_id = str(uuid.uuid4())
 
-            self._log(f"[{self.slot_id}] Video: {api_model}, {api_ratio}")
+            self._log(f"[{self.slot_id}] Video: {sub_mode}, {api_model}, {api_ratio}")
 
             # Get token + auth from extension
             bridge_result = await self._bridge.request_token(
@@ -316,9 +569,33 @@ class ExtensionWorker:
             if not project_id:
                 project_id = await self._resolve_project_id(access_token)
 
+            if not project_id:
+                return None, "📁 No project ID available — open a project in labs.google/fx/tools/flow"
+
+            # Upload reference/start/end images if file paths provided
+            ref_media_id = None
+            start_media_id = None
+            end_media_id = None
+
+            try:
+                if ref_path and sub_mode == "ingredients":
+                    ref_media_id = await self._upload_and_cache_reference(
+                        access_token, project_id, ref_path
+                    )
+                if start_image_path and sub_mode in ("frames_start", "frames_start_end"):
+                    start_media_id = await self._upload_and_cache_reference(
+                        access_token, project_id, start_image_path
+                    )
+                if end_image_path and sub_mode == "frames_start_end":
+                    end_media_id = await self._upload_and_cache_reference(
+                        access_token, project_id, end_image_path
+                    )
+            except Exception as e:
+                return None, f"Image upload failed: {str(e)[:200]}"
+
             # Build request body
             client_context = {
-                "projectId": project_id or "",
+                "projectId": project_id,
                 "tool": "PINHOLE",
                 "userPaygateTier": "PAYGATE_TIER_TWO",
                 "sessionId": f";{int(time.time() * 1000)}",
@@ -329,25 +606,44 @@ class ExtensionWorker:
                     "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
                 }
 
+            request_obj = {
+                "aspectRatio": api_ratio,
+                "seed": seed,
+                "textInput": {
+                    "structuredPrompt": {"parts": [{"text": prompt}]},
+                },
+                "videoModelKey": api_model,
+                "metadata": {},
+            }
+
+            # Add reference/start/end image fields based on sub-mode
+            if sub_mode == "ingredients" and ref_media_id:
+                request_obj["referenceImages"] = [{
+                    "mediaId": ref_media_id,
+                    "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                }]
+            if sub_mode in ("frames_start", "frames_start_end") and start_media_id:
+                request_obj["startImage"] = {
+                    "mediaId": start_media_id,
+                    "cropCoordinates": {"top": 0, "left": 0, "bottom": 1, "right": 1},
+                }
+            if sub_mode == "frames_start_end" and end_media_id:
+                request_obj["endImage"] = {
+                    "mediaId": end_media_id,
+                    "cropCoordinates": {"top": 0, "left": 0, "bottom": 1, "right": 1},
+                }
+
             body = {
                 "mediaGenerationContext": {"batchId": batch_id},
                 "clientContext": client_context,
-                "requests": [{
-                    "clientContext": client_context,
-                    "aspectRatio": api_ratio,
-                    "seed": seed,
-                    "textInput": {
-                        "structuredPrompt": {"parts": [{"text": prompt}]},
-                    },
-                    "videoModelKey": api_model,
-                    "metadata": {},
-                }],
+                "requests": [request_obj],
                 "useV2ModelConfig": True,
             }
 
+            # Submit video generation request
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    VIDEO_API_URL,
+                    endpoint,
                     headers={
                         "content-type": "text/plain;charset=UTF-8",
                         "authorization": f"Bearer {access_token}",
@@ -365,8 +661,34 @@ class ExtensionWorker:
                     except json.JSONDecodeError:
                         return None, f"Invalid JSON: {resp_text[:200]}"
 
-            self.jobs_completed += 1
-            return data, None
+            # Extract media_id for polling
+            media_list = data.get("media", []) if isinstance(data, dict) else []
+            workflows = data.get("workflows", []) if isinstance(data, dict) else []
+            media_id = ""
+            if media_list and isinstance(media_list, list):
+                media_id = media_list[0].get("name", "") if isinstance(media_list[0], dict) else ""
+            if not media_id and workflows and isinstance(workflows, list):
+                media_id = workflows[0].get("metadata", {}).get("primaryMediaId", "") if isinstance(workflows[0], dict) else ""
+
+            if not media_id:
+                # No media_id means immediate response (unlikely for video) or error
+                self.jobs_completed += 1
+                return data, None
+
+            # Poll until video is complete
+            self._log(f"[{self.slot_id}] Video submitted, polling: {media_id[:30]}...")
+            poll_status, poll_error = await self._poll_video_status(
+                access_token, media_id, project_id,
+                poll_interval=5, max_polls=60,
+            )
+
+            if poll_status == "completed":
+                # Return data with media_id so _download_and_save can build the redirect URL
+                data["_video_media_id"] = media_id
+                self.jobs_completed += 1
+                return data, None
+            else:
+                return None, f"Video {poll_status}: {poll_error or 'unknown'}"
 
         except Exception as e:
             return None, f"Exception: {str(e)[:300]}"
@@ -688,12 +1010,50 @@ class ExtensionModeManager:
                 if "video" in job_type:
                     video_model = job.get("video_model") or model
                     ratio = job.get("aspect_ratio", "VIDEO_ASPECT_RATIO_LANDSCAPE")
-                    result, error = await worker.generate_video(prompt, video_model, ratio)
+                    # Extract video-specific fields from job
+                    video_sub_mode = str(job.get("video_sub_mode") or "").strip() or "text_to_video"
+                    ref_path = str(job.get("ref_path") or "").strip() or None
+                    start_image_path = str(job.get("start_image_path") or "").strip() or None
+                    end_image_path = str(job.get("end_image_path") or "").strip() or None
+                    # ref_paths may also contain the reference for video
+                    if not ref_path:
+                        ref_paths_raw = job.get("ref_paths") or ""
+                        if isinstance(ref_paths_raw, str) and ref_paths_raw.strip():
+                            try:
+                                parsed = json.loads(ref_paths_raw)
+                                if isinstance(parsed, list) and parsed:
+                                    ref_path = str(parsed[0]).strip()
+                            except (json.JSONDecodeError, TypeError):
+                                ref_path = ref_paths_raw.strip()
+
+                    result, error = await worker.generate_video(
+                        prompt, video_model, ratio,
+                        video_sub_mode=video_sub_mode,
+                        ref_path=ref_path,
+                        start_image_path=start_image_path,
+                        end_image_path=end_image_path,
+                    )
                 else:
                     ratio = job.get("aspect_ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE")
+                    # Parse ref_paths from job (JSON list or single path)
+                    ref_paths = []
+                    ref_paths_raw = job.get("ref_paths") or ""
+                    if isinstance(ref_paths_raw, str) and ref_paths_raw.strip():
+                        try:
+                            parsed = json.loads(ref_paths_raw)
+                            if isinstance(parsed, list):
+                                ref_paths = [str(p).strip() for p in parsed if str(p).strip()]
+                        except (json.JSONDecodeError, TypeError):
+                            ref_paths = [ref_paths_raw.strip()]
+                    # Also check single ref_path
+                    single_ref = str(job.get("ref_path") or "").strip()
+                    if single_ref and single_ref not in ref_paths:
+                        ref_paths.insert(0, single_ref)
+
                     result, error = await worker.generate_image(
                         prompt, model, ratio,
                         references=job.get("reference_media_ids"),
+                        ref_paths=ref_paths if ref_paths else None,
                     )
 
                 if result and not error:
@@ -806,6 +1166,15 @@ class ExtensionModeManager:
                         f"https://labs.google/fx/api/trpc/backbone.redirect?"
                         f"input=%7B%22name%22%3A%22{primary_id}%22%7D"
                     )
+
+        # For video: use _video_media_id set after polling
+        if not fife_url:
+            video_media_id = api_data.get("_video_media_id", "") if isinstance(api_data, dict) else ""
+            if video_media_id:
+                fife_url = (
+                    f"https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?"
+                    f"name={video_media_id}"
+                )
 
         if not fife_url:
             return None, "No downloadable media in API response"
