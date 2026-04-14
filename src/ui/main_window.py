@@ -1684,6 +1684,7 @@ class SidebarNav(QFrame):
 class MainWindow(QMainWindow):
     warmup_progress_signal = Signal(str, int, str)
     warmup_complete_signal = Signal(str, bool, str)
+    _ext_accounts_signal = Signal(object)  # carries dict or None from bg thread
 
     def __init__(self):
         super().__init__()
@@ -3934,7 +3935,71 @@ class MainWindow(QMainWindow):
         download_layout.addWidget(self.download_percent)
         self.download_widget.setVisible(False)
         layout.addWidget(self.download_widget)
-        
+
+        # ── Extension Accounts (Live from Chrome) ─────────────────
+        self.ext_accounts_card = QFrame()
+        self.ext_accounts_card.setObjectName("extAccountsCard")
+        self.ext_accounts_card.setStyleSheet("""
+            QFrame#extAccountsCard {
+                background: #0F172A;
+                border: 1px solid #1E293B;
+                border-radius: 10px;
+                padding: 0;
+            }
+        """)
+        ext_card_layout = QVBoxLayout(self.ext_accounts_card)
+        ext_card_layout.setContentsMargins(16, 12, 16, 12)
+        ext_card_layout.setSpacing(8)
+
+        # Header row
+        ext_header = QHBoxLayout()
+        ext_header.setSpacing(8)
+        self.ext_status_dot = QLabel("●")
+        self.ext_status_dot.setStyleSheet("color: #EF4444; font-size: 10px;")
+        self.ext_status_dot.setFixedWidth(14)
+        ext_title = QLabel("Chrome Extension Accounts")
+        ext_title.setStyleSheet("color: #F1F5F9; font-size: 13px; font-weight: 700;")
+        self.ext_status_label = QLabel("Extension not connected")
+        self.ext_status_label.setStyleSheet("color: #64748B; font-size: 11px;")
+        self.btn_ext_refresh = QPushButton("⟳")
+        self.btn_ext_refresh.setFixedSize(28, 28)
+        self.btn_ext_refresh.setToolTip("Refresh extension accounts")
+        self.btn_ext_refresh.setStyleSheet("""
+            QPushButton {
+                background: #1E293B; border: 1px solid #334155;
+                border-radius: 6px; color: #94A3B8; font-size: 14px;
+            }
+            QPushButton:hover { background: #334155; color: #F1F5F9; }
+        """)
+        self.btn_ext_refresh.clicked.connect(self._refresh_extension_accounts)
+        ext_header.addWidget(self.ext_status_dot)
+        ext_header.addWidget(ext_title)
+        ext_header.addStretch()
+        ext_header.addWidget(self.ext_status_label)
+        ext_header.addWidget(self.btn_ext_refresh)
+        ext_card_layout.addLayout(ext_header)
+
+        # Account list container
+        self.ext_accounts_list = QVBoxLayout()
+        self.ext_accounts_list.setSpacing(4)
+        self.ext_no_accounts_label = QLabel("No accounts detected. Open labs.google in Chrome and log in.")
+        self.ext_no_accounts_label.setStyleSheet("color: #475569; font-size: 12px; padding: 4px 0;")
+        self.ext_accounts_list.addWidget(self.ext_no_accounts_label)
+        ext_card_layout.addLayout(self.ext_accounts_list)
+
+        layout.addWidget(self.ext_accounts_card)
+
+        # Connect signal for thread-safe UI updates
+        self._ext_accounts_signal.connect(self._apply_ext_accounts)
+
+        # Timer to auto-refresh extension accounts every 5 seconds
+        self._ext_accounts_timer = QTimer(self)
+        self._ext_accounts_timer.setInterval(5000)
+        self._ext_accounts_timer.timeout.connect(self._refresh_extension_accounts)
+        self._ext_accounts_timer.start()
+        # Initial fetch after 1 second
+        QTimer.singleShot(1000, self._refresh_extension_accounts)
+
         self.acc_table = QTableWidget(0, 10)
         self.acc_table.setHorizontalHeaderLabels([
             "ID",
@@ -6986,6 +7051,130 @@ class MainWindow(QMainWindow):
 
     def _on_account_runtime_tick(self):
         self._refresh_account_runtime_cells()
+
+    # ── Extension Accounts Live Refresh ───────────────────────────
+    def _refresh_extension_accounts(self):
+        """Query bridge server in background thread, then update UI via signal."""
+        if not hasattr(self, "ext_accounts_card"):
+            return
+        # Avoid stacking requests
+        if getattr(self, "_ext_fetch_running", False):
+            return
+        self._ext_fetch_running = True
+
+        import threading
+
+        def _fetch():
+            import urllib.request
+            try:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:18924/status",
+                    headers={"Accept": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=1) as resp:
+                    import json as _json
+                    result = _json.loads(resp.read().decode())
+            except Exception:
+                result = None
+            # Emit signal — thread-safe, delivers to main thread event loop
+            try:
+                self._ext_accounts_signal.emit(result)
+            except RuntimeError:
+                pass  # widget destroyed
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _apply_ext_accounts(self, data):
+        """Update extension accounts UI (called on main thread)."""
+        self._ext_fetch_running = False
+        if not hasattr(self, "ext_accounts_card"):
+            return
+
+        if data is None:
+            # Bridge not running
+            self.ext_status_dot.setStyleSheet("color: #EF4444; font-size: 10px;")
+            self.ext_status_label.setText("Bridge not running")
+            self._clear_ext_account_rows()
+            self.ext_no_accounts_label.setVisible(True)
+            self.ext_no_accounts_label.setText(
+                "Start generation in Chrome Extension mode to connect."
+            )
+            return
+
+        ext_connected = data.get("extension_connected", False)
+        accounts = data.get("connected_accounts", [])  # list of email strings
+
+        # Update status
+        if ext_connected:
+            self.ext_status_dot.setStyleSheet("color: #22C55E; font-size: 10px;")
+            self.ext_status_label.setText(
+                f"Connected · {len(accounts)} account{'s' if len(accounts) != 1 else ''}"
+            )
+        else:
+            self.ext_status_dot.setStyleSheet("color: #F59E0B; font-size: 10px;")
+            self.ext_status_label.setText("Bridge running · Extension not connected")
+
+        # Clear old account rows
+        self._clear_ext_account_rows()
+
+        if not accounts:
+            self.ext_no_accounts_label.setVisible(True)
+            if ext_connected:
+                self.ext_no_accounts_label.setText(
+                    "No accounts detected. Open labs.google in Chrome and log in."
+                )
+            else:
+                self.ext_no_accounts_label.setText(
+                    "Install the Chrome Extension and open labs.google to detect accounts."
+                )
+            return
+
+        self.ext_no_accounts_label.setVisible(False)
+
+        for email in accounts:
+            row = QFrame()
+            row.setObjectName("extAccountRow")
+            row.setStyleSheet("""
+                QFrame#extAccountRow {
+                    background: #1E293B;
+                    border: 1px solid #334155;
+                    border-radius: 6px;
+                    padding: 0;
+                }
+            """)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(12, 6, 12, 6)
+            row_layout.setSpacing(8)
+
+            dot = QLabel("●")
+            dot.setStyleSheet("color: #22C55E; font-size: 9px;")
+            dot.setFixedWidth(12)
+            row_layout.addWidget(dot)
+
+            email_lbl = QLabel(str(email))
+            email_lbl.setStyleSheet(
+                "color: #F1F5F9; font-size: 13px; font-weight: 600;"
+            )
+            row_layout.addWidget(email_lbl)
+
+            row_layout.addStretch()
+
+            badge = QLabel("Extension")
+            badge.setStyleSheet("""
+                color: #A78BFA; font-size: 10px; font-weight: 700;
+                background: #2E1065; border: 1px solid #7C3AED;
+                border-radius: 4px; padding: 2px 8px;
+            """)
+            row_layout.addWidget(badge)
+
+            self.ext_accounts_list.addWidget(row)
+
+    def _clear_ext_account_rows(self):
+        """Remove all dynamically added extension account row widgets."""
+        while self.ext_accounts_list.count() > 1:  # keep ext_no_accounts_label
+            item = self.ext_accounts_list.takeAt(1)
+            if item and item.widget():
+                item.widget().deleteLater()
 
     def _on_tab_changed(self, index):
         if self.tabs.widget(index) is self.tab_accounts and not self._account_status_auto_check_done:
