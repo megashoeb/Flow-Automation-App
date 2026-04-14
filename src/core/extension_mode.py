@@ -647,6 +647,8 @@ class ExtensionWorker:
                     headers={
                         "content-type": "text/plain;charset=UTF-8",
                         "authorization": f"Bearer {access_token}",
+                        "origin": "https://labs.google",
+                        "referer": "https://labs.google/",
                     },
                     data=json.dumps(body),
                     timeout=aiohttp.ClientTimeout(total=120),
@@ -654,6 +656,7 @@ class ExtensionWorker:
                     resp_text = await resp.text()
 
                     if not resp.ok:
+                        self._log(f"[{self.slot_id}] Video API {resp.status}: {resp_text[:300]}")
                         return None, _parse_api_error(resp.status, resp_text)
 
                     try:
@@ -1132,6 +1135,8 @@ class ExtensionModeManager:
                     headers={
                         "content-type": "text/plain;charset=UTF-8",
                         "authorization": f"Bearer {access_token}",
+                        "origin": "https://labs.google",
+                        "referer": "https://labs.google/",
                     },
                     data=json.dumps(body),
                     timeout=aiohttp.ClientTimeout(total=120),
