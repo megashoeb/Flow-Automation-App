@@ -181,6 +181,9 @@ def _resolve_video_ratio(ratio_name):
 class ExtensionWorker:
     """A lightweight worker that uses the bridge for tokens and makes direct API calls."""
 
+    # Class-level lock per account: prevents 7 workers all trying to create project at once
+    _project_locks: Dict[str, asyncio.Lock] = {}
+
     def __init__(self, slot_id: str, account_email: str, bridge: ExtensionBridge, log_fn):
         self.slot_id = slot_id
         self.account_email = account_email
@@ -216,14 +219,12 @@ class ExtensionWorker:
             if not access_token:
                 return None, "No access token from extension"
 
-            # If no project ID, try to create one
+            # If no project ID, resolve with lock (so only 1 worker creates per account)
             if not project_id:
-                project_id = await self._create_project(access_token)
-                if project_id:
-                    self._bridge.set_project_id(self.account_email, project_id)
+                project_id = await self._resolve_project_id(access_token)
 
             if not project_id:
-                return None, "No project ID available"
+                return None, "📁 No project ID available — open a project in labs.google/fx/tools/flow"
 
             # Build request body
             client_context = {
@@ -311,6 +312,10 @@ class ExtensionWorker:
             if not access_token:
                 return None, "No access token from extension"
 
+            # If no project ID, resolve with lock
+            if not project_id:
+                project_id = await self._resolve_project_id(access_token)
+
             # Build request body
             client_context = {
                 "projectId": project_id or "",
@@ -368,33 +373,82 @@ class ExtensionWorker:
         finally:
             self.is_busy = False
 
+    async def _resolve_project_id(self, access_token) -> Optional[str]:
+        """Resolve project ID with per-account lock — only one worker fetches at a time."""
+        # Check cache again (another worker may have resolved it while we waited)
+        cached = self._bridge.get_project_id(self.account_email)
+        if cached:
+            return cached
+
+        # Get or create lock for this account
+        if self.account_email not in ExtensionWorker._project_locks:
+            ExtensionWorker._project_locks[self.account_email] = asyncio.Lock()
+
+        lock = ExtensionWorker._project_locks[self.account_email]
+
+        async with lock:
+            # Double-check cache after acquiring lock
+            cached = self._bridge.get_project_id(self.account_email)
+            if cached:
+                return cached
+
+            self._log(f"[{self.slot_id}] Resolving project ID for {self.account_email}...")
+            project_id = await self._create_project(access_token)
+            if project_id:
+                self._bridge.set_project_id(self.account_email, project_id)
+                self._log(f"[{self.slot_id}] ✓ Project ID resolved: {project_id}")
+            else:
+                self._log(f"[{self.slot_id}] ✗ Could not resolve project ID")
+            return project_id
+
     async def _create_project(self, access_token):
-        """Create a new Labs project via API."""
+        """Get or create a Labs project via multiple API fallbacks."""
+        headers = {"authorization": f"Bearer {access_token}"}
+
+        # ── Method 1: List projects via aisandbox API ──
         try:
             async with aiohttp.ClientSession() as session:
-                # Navigate to Labs page to get a project
                 async with session.get(
-                    "https://labs.google/fx/api/trpc/backbone.listFlows",
-                    headers={"authorization": f"Bearer {access_token}"},
-                    timeout=aiohttp.ClientTimeout(total=30),
+                    "https://aisandbox-pa.googleapis.com/v1/projects",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.ok:
                         data = await resp.json()
-                        # Try to extract an existing project ID
+                        projects = data.get("projects", data.get("project", []))
+                        if isinstance(projects, list) and projects:
+                            import re as _re
+                            pname = projects[0].get("name", "") or projects[0].get("projectId", "")
+                            m = _re.search(r"([a-z0-9-]{16,})", pname, _re.IGNORECASE)
+                            if m:
+                                pid = m.group(1)
+                                self._log(f"[{self.slot_id}] Project from API: {pid}")
+                                return pid
+        except Exception as e:
+            self._log(f"[{self.slot_id}] Projects API error: {str(e)[:80]}")
+
+        # ── Method 2: listFlows via trpc ──
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://labs.google/fx/api/trpc/backbone.listFlows",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.ok:
+                        data = await resp.json()
                         flows = data.get("result", {}).get("data", {}).get("flows", [])
                         if flows:
                             pid = flows[0].get("name", "")
                             if pid:
-                                self._log(f"[{self.slot_id}] Using existing project: {pid}")
+                                self._log(f"[{self.slot_id}] Project from listFlows: {pid}")
                                 return pid
         except Exception:
             pass
 
-        # Ask extension to click "New project"
+        # ── Method 3: Ask extension to click "New project" ──
         self._bridge.send_command("new_project", self.account_email)
         await asyncio.sleep(5)
-
-        # Check if extension reported project ID
         return self._bridge.get_project_id(self.account_email)
 
 

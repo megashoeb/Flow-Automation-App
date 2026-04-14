@@ -147,7 +147,7 @@ async function mainWorldExecute(action) {
       return result;
     }
 
-    // ─── 2. Project ID (from URL) ───
+    // ─── 2. Project ID (from URL → DOM → API fallback) ───
     try {
       const urlMatch = window.location.href.match(/\/project\/([a-z0-9-]{16,})/i);
       if (urlMatch) {
@@ -159,6 +159,26 @@ async function mainWorldExecute(action) {
           const m = (link.href || "").match(/\/project\/([a-z0-9-]{16,})/i);
           if (m) { result.project_id = m[1]; break; }
         }
+      }
+      // API fallback: fetch projects list if still no project_id
+      if (!result.project_id && result.access_token) {
+        try {
+          const projResp = await fetch(
+            "https://aisandbox-pa.googleapis.com/v1/projects",
+            { method: "GET", credentials: "include",
+              headers: { "authorization": "Bearer " + result.access_token } }
+          );
+          if (projResp.ok) {
+            const projData = await projResp.json().catch(() => null);
+            // Response: { projects: [{ name: "projects/abc-123", ... }] }
+            const projects = projData && (projData.projects || projData.project || []);
+            if (Array.isArray(projects) && projects.length > 0) {
+              const pName = projects[0].name || projects[0].projectId || "";
+              const pMatch = pName.match(/([a-z0-9-]{16,})/i);
+              if (pMatch) result.project_id = pMatch[1];
+            }
+          }
+        } catch {}
       }
     } catch {}
 
