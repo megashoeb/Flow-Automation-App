@@ -437,7 +437,7 @@ class ExtensionWorker:
 
             # Get token + auth from extension via bridge
             bridge_result = await self._bridge.request_token(
-                self.account_email, "IMAGE_GENERATION", timeout=30
+                self.account_email, "IMAGE_GENERATION", timeout=60
             )
 
             if bridge_result.get("error"):
@@ -552,7 +552,7 @@ class ExtensionWorker:
 
             # Get token + auth from extension
             bridge_result = await self._bridge.request_token(
-                self.account_email, "VIDEO_GENERATION", timeout=30
+                self.account_email, "VIDEO_GENERATION", timeout=60
             )
 
             if bridge_result.get("error"):
@@ -1067,7 +1067,7 @@ class ExtensionModeManager:
 
             # Get fresh token for video step
             bridge_result = await worker._bridge.request_token(
-                worker.account_email, "VIDEO_GENERATION", timeout=30
+                worker.account_email, "VIDEO_GENERATION", timeout=60
             )
             if bridge_result.get("error"):
                 update_job_status(job_id, "failed", account=worker.account_email, error=f"Pipeline Step 2 bridge error: {bridge_result['error']}")

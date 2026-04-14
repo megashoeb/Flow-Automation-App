@@ -608,7 +608,8 @@ def get_all_jobs():
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, prompt, job_type, model, video_model, queue_no, status, assigned_account, error_message, output_count, video_output_count, "
-        "output_path, output_index, is_retry, retry_source, progress_step, progress_poll_count "
+        "output_path, output_index, is_retry, retry_source, progress_step, progress_poll_count, "
+        "aspect_ratio, video_sub_mode, ref_path, ref_paths, start_image_path, video_prompt "
         "FROM jobs ORDER BY queue_no ASC, created_at ASC"
     )
     jobs = cursor.fetchall()
@@ -632,6 +633,12 @@ def get_all_jobs():
             "retry_source": j[14],
             "progress_step": j[15],
             "progress_poll_count": int(j[16] or 0),
+            "aspect_ratio": j[17],
+            "video_sub_mode": j[18],
+            "ref_path": j[19],
+            "ref_paths": j[20],
+            "start_image_path": j[21],
+            "video_prompt": j[22],
         }
         for j in jobs
     ]
