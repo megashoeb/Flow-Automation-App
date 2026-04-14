@@ -50,6 +50,52 @@ from src.db.db_manager import (
 DATA_DIR = str(get_sessions_dir())
 
 
+def _parse_api_error_string(error_str: str) -> str:
+    """Parse JS-side 'HTTP {status}: {body}' error into a clear message."""
+    import re as _re
+    m = _re.match(r"HTTP\s+(\d+):\s*(.*)", error_str, _re.DOTALL)
+    if not m:
+        return error_str  # not an HTTP error, return as-is
+
+    status = int(m.group(1))
+    body = m.group(2).strip()
+    text_lower = body.lower()
+
+    if status == 403:
+        if "recaptcha" in text_lower:
+            return "⛔ reCAPTCHA Score Too Low — Google rejected the token (score below threshold). Tab may need reload."
+        if "quota" in text_lower or "rate" in text_lower:
+            return "⛔ Rate Limited (403) — Account quota exceeded or too many requests."
+        return f"⛔ Forbidden (403) — {body[:150] or 'Google rejected the request.'}"
+
+    if status == 401:
+        return "🔑 Access Token Expired (401) — Session expired, need fresh auth."
+
+    if status == 400:
+        if "recaptcha" in text_lower:
+            return "⚠️ reCAPTCHA Token Expired/Invalid (400) — Token was stale or malformed."
+        if any(k in text_lower for k in ("expired", "token_expired", "invalid_token")):
+            return "🔑 Access Token Expired (400) — Auth session needs refresh."
+        if any(k in text_lower for k in ("project", "project_id", "project not found")):
+            return "📁 Invalid Project ID (400) — Project not found or was deleted."
+        if any(k in text_lower for k in (
+            "safety", "blocked", "policy", "filter", "harmful",
+            "inappropriate", "violat", "content_filter", "responsible_ai",
+        )):
+            return "🚫 Prompt Blocked by Content Filter (400) — Google's safety filter rejected this prompt."
+        if any(k in text_lower for k in ("invalid", "malformed", "parse", "field")):
+            return f"❌ Malformed Request (400) — {body[:150]}"
+        return f"⚠️ Bad Request (400) — {body[:200] or 'Unknown cause.'}"
+
+    if status == 429:
+        return "🕐 Rate Limited (429) — Too many requests. Account needs cooldown."
+
+    if status >= 500:
+        return f"🔧 Google Server Error ({status}) — Temporary issue, will retry."
+
+    return error_str
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Model / aspect ratio resolvers — maps display names to API enum values
 # ═══════════════════════════════════════════════════════════════════════════
@@ -928,7 +974,7 @@ class BrowserFetchWorker:
             if not result:
                 return None, "No response from browser evaluate"
             if result.get("error"):
-                return None, result["error"]
+                return None, _parse_api_error_string(result["error"])
             if result.get("success"):
                 self.jobs_completed += 1
                 return result["data"], None
@@ -1076,7 +1122,7 @@ class BrowserFetchWorker:
             if not result:
                 return None, "No response from browser evaluate"
             if result.get("error"):
-                return None, result["error"]
+                return None, _parse_api_error_string(result["error"])
             if result.get("success"):
                 self.jobs_completed += 1
                 return result["data"], None

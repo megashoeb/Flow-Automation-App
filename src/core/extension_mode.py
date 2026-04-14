@@ -42,6 +42,73 @@ AUTH_SESSION_URL = "https://labs.google/fx/api/auth/session"
 PROJECT_CREATE_URL = "https://aisandbox-pa.googleapis.com/v1/projects"
 
 
+def _parse_api_error(status_code: int, resp_text: str) -> str:
+    """Parse Google Labs API error response into a clear, human-readable message."""
+    text_lower = (resp_text or "").lower()
+
+    # Try to extract structured error message from JSON
+    detail = ""
+    try:
+        err_json = json.loads(resp_text)
+        if isinstance(err_json, dict):
+            err_obj = err_json.get("error", err_json)
+            detail = (
+                err_obj.get("message", "")
+                or err_obj.get("details", "")
+                or err_obj.get("status", "")
+            )
+            if isinstance(detail, list) and detail:
+                detail = str(detail[0])
+            detail = str(detail).strip()
+    except (json.JSONDecodeError, TypeError, KeyError):
+        detail = resp_text[:200].strip()
+
+    detail_lower = detail.lower() if detail else text_lower
+
+    # ── 403 Errors ──
+    if status_code == 403:
+        if "recaptcha" in text_lower:
+            return "⛔ reCAPTCHA Score Too Low — Google rejected the token (score below threshold). Tab may need reload."
+        if "quota" in text_lower or "rate" in text_lower:
+            return "⛔ Rate Limited (403) — Account quota exceeded or too many requests."
+        if "permission" in text_lower or "forbidden" in text_lower:
+            return f"⛔ Access Denied (403) — Account doesn't have permission. {detail[:100]}"
+        return f"⛔ Forbidden (403) — {detail[:150] or 'Google rejected the request.'}"
+
+    # ── 401 Errors ──
+    if status_code == 401:
+        return "🔑 Access Token Expired (401) — Session expired, need fresh auth from extension."
+
+    # ── 400 Errors (most common, multiple causes) ──
+    if status_code == 400:
+        if "recaptcha" in text_lower:
+            return "⚠️ reCAPTCHA Token Expired/Invalid (400) — Token was stale or malformed by the time API received it."
+        if any(k in text_lower for k in ("expired", "token_expired", "invalid_token")):
+            return "🔑 Access Token Expired (400) — Auth session needs refresh."
+        if any(k in text_lower for k in ("project", "project_id", "project not found")):
+            return "📁 Invalid Project ID (400) — Project not found or was deleted. Will auto-create on retry."
+        if any(k in text_lower for k in (
+            "safety", "blocked", "policy", "filter", "harmful",
+            "inappropriate", "violat", "content_filter", "responsible_ai",
+        )):
+            return f"🚫 Prompt Blocked by Content Filter (400) — Google's safety filter rejected this prompt."
+        if any(k in text_lower for k in ("invalid", "malformed", "parse", "field")):
+            return f"❌ Malformed Request (400) — {detail[:150]}"
+        # Generic 400 with detail
+        return f"⚠️ Bad Request (400) — {detail[:200] or 'Unknown cause.'}"
+
+    # ── 429 Rate Limit ──
+    if status_code == 429:
+        return "🕐 Rate Limited (429) — Too many requests. Account needs cooldown."
+
+    # ── 500+ Server Errors ──
+    if status_code >= 500:
+        return f"🔧 Google Server Error ({status_code}) — Temporary issue, will retry."
+
+    # ── Fallback ──
+    return f"HTTP {status_code}: {detail[:200] or resp_text[:200]}"
+
+
 def _resolve_image_model(model_name):
     """Map UI model name to API model identifier."""
     lower = str(model_name or "").strip().lower()
@@ -203,7 +270,7 @@ class ExtensionWorker:
                     resp_text = await resp.text()
 
                     if not resp.ok:
-                        return None, f"HTTP {resp.status}: {resp_text[:300]}"
+                        return None, _parse_api_error(resp.status, resp_text)
 
                     try:
                         data = json.loads(resp_text)
@@ -286,7 +353,7 @@ class ExtensionWorker:
                     resp_text = await resp.text()
 
                     if not resp.ok:
-                        return None, f"HTTP {resp.status}: {resp_text[:300]}"
+                        return None, _parse_api_error(resp.status, resp_text)
 
                     try:
                         data = json.loads(resp_text)
