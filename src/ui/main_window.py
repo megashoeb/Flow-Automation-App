@@ -1487,6 +1487,9 @@ class SidebarNav(QFrame):
         self.lbl_title = QLabel("G-Labs\nAutomation")
         self.lbl_title.setObjectName("sidebarTitle")
         title_layout.addWidget(self.lbl_title)
+        self.lbl_byline = QLabel("by MegaShoeb")
+        self.lbl_byline.setObjectName("sidebarByline")
+        title_layout.addWidget(self.lbl_byline)
         root.addWidget(title_wrap)
 
         # ── Fluent NavigationInterface ────────────────────────────
@@ -3295,7 +3298,6 @@ class MainWindow(QMainWindow):
         ], current_data="Veo 3.1 - Fast")
         self.t2v_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
-            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.t2v_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
@@ -3343,7 +3345,6 @@ class MainWindow(QMainWindow):
         ], current_data="Veo 3.1 - Fast")
         self.ref_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
-            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.ref_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
@@ -3408,7 +3409,6 @@ class MainWindow(QMainWindow):
         ], current_data="Veo 3.1 - Fast")
         self.frm_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
-            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.frm_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
@@ -3540,7 +3540,6 @@ class MainWindow(QMainWindow):
 
         self.pipe_cmb_vid_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
-            ("Square (1:1)", "Square (1:1)"),
             ("Portrait (9:16)", "Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
 
@@ -5092,8 +5091,17 @@ class MainWindow(QMainWindow):
                 color: #F8FAFC;
                 font-size: 19px;
                 font-weight: 800;
-                padding: 4px 4px 14px 4px;
+                padding: 4px 4px 2px 4px;
                 background: transparent;
+            }
+            QLabel#sidebarByline {
+                color: #64748B;
+                font-size: 10px;
+                font-weight: 500;
+                font-style: italic;
+                padding: 0px 4px 14px 6px;
+                background: transparent;
+                letter-spacing: 1px;
             }
             QFrame#sidebarDivider, QFrame#sidebarShellDivider {
                 background: #1E293B;

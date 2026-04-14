@@ -183,6 +183,17 @@ def _ensure_db_schema(conn):
         )
     ''')
 
+    # Persistent cache for uploaded reference images (survives app restart)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ref_media_cache (
+            project_id TEXT,
+            file_path TEXT,
+            media_id TEXT,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (project_id, file_path)
+        )
+    ''')
+
     for key, value in DEFAULT_APP_SETTINGS.items():
         cursor.execute(
             "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
@@ -1074,6 +1085,46 @@ def clear_account_flags(account_name):
             (str(account_name or "").strip(),),
         )
     )
+
+# ── Reference media upload cache ──────────────────────────────────────────
+
+def get_cached_media_id(project_id, file_path):
+    """Look up a previously uploaded reference image media_id."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT media_id FROM ref_media_cache WHERE project_id = ? AND file_path = ?",
+            (str(project_id or ""), str(file_path or "")),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def set_cached_media_id(project_id, file_path, media_id):
+    """Store an uploaded reference image media_id in persistent cache."""
+    _run_write(
+        lambda conn: conn.execute(
+            "INSERT OR REPLACE INTO ref_media_cache (project_id, file_path, media_id) VALUES (?, ?, ?)",
+            (str(project_id or ""), str(file_path or ""), str(media_id or "")),
+        )
+    )
+
+
+def clear_ref_media_cache(project_id=None):
+    """Clear reference media cache. If project_id given, only that project."""
+    if project_id:
+        _run_write(
+            lambda conn: conn.execute(
+                "DELETE FROM ref_media_cache WHERE project_id = ?",
+                (str(project_id),),
+            )
+        )
+    else:
+        _run_write(lambda conn: conn.execute("DELETE FROM ref_media_cache"))
+
 
 # Initialize on import
 ensure_db()

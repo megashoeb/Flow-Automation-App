@@ -35,6 +35,8 @@ from src.db.db_manager import (
     get_output_directory,
     update_job_status,
     update_job_runtime_state,
+    get_cached_media_id,
+    set_cached_media_id,
 )
 
 # Google Labs API endpoints
@@ -154,17 +156,17 @@ def _resolve_video_model(model, video_model=""):
     """Map UI video quality name to API video model key."""
     source = str(video_model or model or "").strip().lower()
     if not source:
-        return "veo_3_1_t2v_fast_ultra"
+        return "veo_3_1_t2v_fast"
     if "lite" in source:
         return "veo_3_1_t2v_lite"
     if "lower pri" in source or "relaxed" in source:
-        return "veo_3_1_t2v_fast_ultra_relaxed"
+        return "veo_3_1_t2v_fast_relaxed"
     if "quality" in source:
         return "veo_3_1_t2v"
     # Pass through already-resolved keys (contain underscores)
     if "_" in source:
         return source
-    return "veo_3_1_t2v_fast_ultra"
+    return "veo_3_1_t2v_fast"
 
 
 def _resolve_video_ratio(ratio_name):
@@ -212,21 +214,21 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
     else:
         tier = "fast"
 
-    # Model key lookup table (matches bot_engine.py VIDEO_MODEL_KEYS)
+    # Model key lookup table — non-ultra keys work for all account tiers
     model_keys = {
-        ("text_to_video", "fast"): "veo_3_1_t2v_fast_ultra",
+        ("text_to_video", "fast"): "veo_3_1_t2v_fast",
         ("text_to_video", "lite"): "veo_3_1_t2v_lite",
-        ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_ultra_relaxed",
+        ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_relaxed",
         ("text_to_video", "quality"): "veo_3_1_t2v",
-        ("ingredients", "fast"): "veo_3_1_r2v_fast_landscape_ultra",
-        ("ingredients", "lite"): "veo_3_1_r2v_fast_landscape_ultra",
-        ("ingredients", "lower_pri"): "veo_3_1_r2v_fast_landscape_ultra_relaxed",
-        ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
-        ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
-        ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
-        ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_ultra_fl",
-        ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_ultra_fl",
-        ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
+        ("ingredients", "fast"): "veo_3_1_r2v_fast_landscape",
+        ("ingredients", "lite"): "veo_3_1_r2v_fast_landscape",
+        ("ingredients", "lower_pri"): "veo_3_1_r2v_fast_landscape_relaxed",
+        ("frames_start", "fast"): "veo_3_1_i2v_s_fast",
+        ("frames_start", "lite"): "veo_3_1_i2v_s_fast",
+        ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
+        ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_fl",
+        ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_fl",
+        ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_relaxed",
     }
 
     key = model_keys.get((video_sub_mode, tier))
@@ -237,13 +239,13 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
     if video_sub_mode == "ingredients":
         api_ratio = _resolve_video_ratio(ratio)
         ratio_map = {
-            "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape_ultra",
-            "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait_ultra",
-            "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square_ultra",
+            "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape",
+            "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait",
+            "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square",
         }
-        return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape_ultra")
+        return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape")
 
-    return "veo_3_1_t2v_fast_ultra"
+    return "veo_3_1_t2v_fast"
 
 
 # Video endpoint lookup
@@ -270,6 +272,7 @@ class ExtensionWorker:
         self._bridge = bridge
         self._log = log_fn
         self.is_busy = False
+        self.last_access_token = None  # cached for download auth
         self.jobs_completed = 0
 
     async def _upload_reference_image(self, access_token, project_id, file_path):
@@ -329,14 +332,26 @@ class ExtensionWorker:
                 return media_name
 
     async def _upload_and_cache_reference(self, access_token, project_id, file_path):
-        """Upload reference image with cache + lock to avoid duplicate uploads."""
-        cache_key = (project_id, os.path.abspath(file_path))
+        """Upload reference image with 2-level cache (memory + DB) to avoid duplicate uploads.
 
-        # Fast path: already cached
+        Memory cache is fast but lost on restart.
+        DB cache persists across restarts — no re-upload needed after app restart.
+        """
+        abs_path = os.path.abspath(file_path)
+        cache_key = (project_id, abs_path)
+
+        # Level 1: memory cache (fast path)
         cached = ExtensionWorker._reference_cache.get(cache_key)
         if cached:
             self._log(f"[{self.slot_id}] Reference cached: {os.path.basename(file_path)}")
             return cached
+
+        # Level 2: DB cache (survives restart)
+        db_cached = get_cached_media_id(project_id, abs_path)
+        if db_cached:
+            ExtensionWorker._reference_cache[cache_key] = db_cached
+            self._log(f"[{self.slot_id}] Reference restored from DB: {os.path.basename(file_path)}")
+            return db_cached
 
         # Get or create lock for this specific file+project
         if cache_key not in ExtensionWorker._reference_cache_locks:
@@ -344,13 +359,15 @@ class ExtensionWorker:
         lock = ExtensionWorker._reference_cache_locks[cache_key]
 
         async with lock:
-            # Re-check after acquiring lock
+            # Re-check after acquiring lock (another worker may have uploaded)
             cached = ExtensionWorker._reference_cache.get(cache_key)
             if cached:
                 return cached
 
             media_name = await self._upload_reference_image(access_token, project_id, file_path)
+            # Store in both caches
             ExtensionWorker._reference_cache[cache_key] = media_name
+            set_cached_media_id(project_id, abs_path, media_name)
             return media_name
 
     async def _upload_references(self, access_token, project_id, ref_paths):
@@ -364,8 +381,26 @@ class ExtensionWorker:
             media_ids.append(media_name)
         return media_ids
 
+    # Moderation / safety keywords — non-retryable failures
+    _MODERATION_KEYWORDS = (
+        "PROMINENT_PERSON", "SAFETY_FILTER", "CONTENT_POLICY", "MODERATION",
+        "BLOCKED", "HARMFUL", "SEXUALLY_EXPLICIT", "VIOLENCE", "HATE_SPEECH",
+        "DANGEROUS", "TOXIC", "CHILD_SAFETY", "FILTER_FAILED",
+        "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED",
+        "PUBLIC_ERROR_SAFETY_FILTER_FAILED",
+        "PUBLIC_ERROR_CONTENT_POLICY",
+    )
+
+    @staticmethod
+    def _is_moderation_failure(detail: str) -> bool:
+        upper = str(detail or "").upper()
+        return any(kw in upper for kw in ExtensionWorker._MODERATION_KEYWORDS)
+
     async def _poll_video_status(self, access_token, media_id, project_id, poll_interval=5, max_polls=60):
-        """Poll video generation status until complete or failed."""
+        """Poll video generation status until complete or failed.
+
+        Returns (status, error) where status is 'completed', 'failed', 'moderation', or 'timeout'.
+        """
         for poll_num in range(1, max_polls + 1):
             await asyncio.sleep(poll_interval)
 
@@ -391,28 +426,54 @@ class ExtensionWorker:
                             continue
 
                         data = json.loads(resp_text)
+
+                        # Track remaining credits
+                        remaining_credits = data.get("remainingCredits")
+                        if remaining_credits is not None and poll_num <= 1:
+                            try:
+                                self._log(f"[CREDITS] Remaining: {int(remaining_credits)}")
+                            except Exception:
+                                pass
+
                         media_list = data.get("media", [])
                         if not media_list:
                             continue
 
                         media_item = media_list[0] if isinstance(media_list, list) else {}
-                        media_status = (
-                            media_item.get("mediaMetadata", {}).get("mediaStatus", {})
-                        )
+                        media_metadata = media_item.get("mediaMetadata", {})
+                        media_status = media_metadata.get("mediaStatus", {})
                         status = media_status.get("mediaGenerationStatus", "UNKNOWN")
 
+                        # Safety filter info
+                        safety_filter = media_metadata.get("safetyFilterResult", "")
+
                         if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+                            if remaining_credits is not None:
+                                try:
+                                    self._log(f"[CREDITS] Remaining: {int(remaining_credits)}")
+                                except Exception:
+                                    pass
+                            item_name = media_item.get("name", "") if isinstance(media_item, dict) else ""
+                            wf_id = media_item.get("workflowId", "") if isinstance(media_item, dict) else ""
                             self._log(f"[{self.slot_id}] Video complete (poll {poll_num})")
-                            return "completed", None
+                            self._log(f"[{self.slot_id}] media name={item_name}, workflowId={wf_id}")
+                            # Return media_item for download URL extraction
+                            return "completed", media_item
 
                         if status == "MEDIA_GENERATION_STATUS_FAILED":
-                            reason = (
+                            reason = str(
                                 media_status.get("failureReason")
                                 or media_status.get("moderationResult")
                                 or media_status.get("errorMessage")
+                                or safety_filter
                                 or "server returned FAILED"
                             )
-                            return "failed", str(reason)
+                            is_moderation = self._is_moderation_failure(reason)
+                            label = "Content blocked" if is_moderation else "Server error"
+                            self._log(f"[{self.slot_id}] Video FAILED. {label}: {reason}")
+                            if safety_filter and safety_filter not in reason:
+                                self._log(f"[{self.slot_id}] Safety filter: {safety_filter}")
+                            return ("moderation" if is_moderation else "failed"), reason
 
                         if poll_num % 3 == 0:
                             self._log(f"[{self.slot_id}] Video generating... (poll {poll_num})")
@@ -422,6 +483,83 @@ class ExtensionWorker:
                     self._log(f"[{self.slot_id}] Poll {poll_num} error: {str(e)[:100]}")
 
         return "timeout", f"Video timed out after {max_polls * poll_interval}s"
+
+    async def _request_video_upscale(self, access_token, project_id, media_id,
+                                      workflow_id, resolution, aspect_ratio):
+        """Submit video upscale request. Returns (new_media_id, error)."""
+        UPSCALE_URL = "https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoUpsampleVideo"
+        res_config = {
+            "1080p": ("VIDEO_RESOLUTION_1080P", "veo_3_1_upsampler_1080p"),
+            "4k": ("VIDEO_RESOLUTION_4K", "veo_3_1_upsampler_4k"),
+        }
+        res_enum, model_key = res_config.get(resolution, (None, None))
+        if not res_enum:
+            return None, f"Unsupported upscale resolution: {resolution}"
+
+        # Get fresh token for upscale request
+        bridge_result = await self._bridge.request_token(
+            self.account_email, "VIDEO_GENERATION", timeout=60
+        )
+        if bridge_result.get("error"):
+            return None, f"Bridge error: {bridge_result['error']}"
+        token = bridge_result.get("token")
+        access_token = bridge_result.get("access_token") or access_token
+
+        batch_id = str(uuid.uuid4())
+        seed = random.randint(100000, 999999)
+
+        client_context = {
+            "projectId": project_id,
+            "tool": "PINHOLE",
+            "userPaygateTier": "PAYGATE_TIER_ONE",
+            "sessionId": f";{int(time.time() * 1000)}",
+        }
+        if token:
+            client_context["recaptchaContext"] = {
+                "token": token,
+                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+            }
+
+        body = {
+            "mediaGenerationContext": {"batchId": batch_id},
+            "clientContext": client_context,
+            "requests": [{
+                "resolution": res_enum,
+                "aspectRatio": aspect_ratio,
+                "seed": seed,
+                "videoModelKey": model_key,
+                "metadata": {"workflowId": workflow_id},
+                "videoInput": {"mediaId": media_id},
+            }],
+            "useV2ModelConfig": True,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    UPSCALE_URL,
+                    headers={
+                        "content-type": "text/plain;charset=UTF-8",
+                        "authorization": f"Bearer {access_token}",
+                        "origin": "https://labs.google",
+                        "referer": "https://labs.google/",
+                    },
+                    data=json.dumps(body),
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    resp_text = await resp.text()
+                    if not resp.ok:
+                        return None, f"Upscale API {resp.status}: {resp_text[:200]}"
+                    data = json.loads(resp_text)
+
+            media_list = data.get("media", []) if isinstance(data, dict) else []
+            if media_list and isinstance(media_list[0], dict):
+                new_id = media_list[0].get("name", "")
+                if new_id:
+                    return new_id, None
+            return None, "Upscale response missing media id"
+        except Exception as e:
+            return None, f"Upscale error: {str(e)[:200]}"
 
     async def generate_image(self, prompt, model, ratio, references=None, ref_paths=None):
         """Generate image via direct API call (token from extension)."""
@@ -446,6 +584,7 @@ class ExtensionWorker:
             token = bridge_result.get("token")
             access_token = bridge_result.get("access_token")
             project_id = bridge_result.get("project_id") or self._bridge.get_project_id(self.account_email)
+            self.last_access_token = access_token  # cache for download
 
             if not access_token:
                 return None, "No access token from extension"
@@ -455,7 +594,7 @@ class ExtensionWorker:
                 project_id = await self._resolve_project_id(access_token)
 
             if not project_id:
-                return None, "📁 No project ID available — open a project in labs.google/fx/tools/flow"
+                return None, "No project ID available — open a project in labs.google/fx/tools/flow"
 
             # Upload reference images if file paths provided
             media_ids = list(references or [])
@@ -530,6 +669,7 @@ class ExtensionWorker:
         self, prompt, model, ratio,
         video_sub_mode="text_to_video",
         ref_path=None, start_image_path=None, end_image_path=None,
+        upscale=None,
     ):
         """Generate video via direct API call. Supports text-to-video, reference, and image-to-video."""
         self.is_busy = True
@@ -561,6 +701,7 @@ class ExtensionWorker:
             token = bridge_result.get("token")
             access_token = bridge_result.get("access_token")
             project_id = bridge_result.get("project_id") or self._bridge.get_project_id(self.account_email)
+            self.last_access_token = access_token  # cache for download
 
             if not access_token:
                 return None, "No access token from extension"
@@ -597,7 +738,7 @@ class ExtensionWorker:
             client_context = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
-                "userPaygateTier": "PAYGATE_TIER_TWO",
+                "userPaygateTier": "PAYGATE_TIER_ONE",
                 "sessionId": f";{int(time.time() * 1000)}",
             }
             if token:
@@ -667,9 +808,14 @@ class ExtensionWorker:
             # Extract media_id for polling
             media_list = data.get("media", []) if isinstance(data, dict) else []
             workflows = data.get("workflows", []) if isinstance(data, dict) else []
+            operations = data.get("operations", []) if isinstance(data, dict) else []
+
             media_id = ""
             if media_list and isinstance(media_list, list):
                 media_id = media_list[0].get("name", "") if isinstance(media_list[0], dict) else ""
+            if not media_id and operations and isinstance(operations, list):
+                op = operations[0] if isinstance(operations[0], dict) else {}
+                media_id = op.get("operation", {}).get("name", "")
             if not media_id and workflows and isinstance(workflows, list):
                 media_id = workflows[0].get("metadata", {}).get("primaryMediaId", "") if isinstance(workflows[0], dict) else ""
 
@@ -678,20 +824,93 @@ class ExtensionWorker:
                 self.jobs_completed += 1
                 return data, None
 
-            # Poll until video is complete
+            # Poll until base video is complete (720p)
+            upscale_target = str(upscale or "none").strip().lower()
+            if upscale_target in ("", "none"):
+                upscale_target = "none"
             self._log(f"[{self.slot_id}] Video submitted, polling: {media_id[:30]}...")
-            poll_status, poll_error = await self._poll_video_status(
+            poll_status, poll_data = await self._poll_video_status(
                 access_token, media_id, project_id,
                 poll_interval=5, max_polls=60,
             )
 
             if poll_status == "completed":
-                # Return data with media_id so _download_and_save can build the redirect URL
-                data["_video_media_id"] = media_id
+                # poll_data is the media_item dict on success
+                final_name = media_id
+                workflow_id = ""
+                if isinstance(poll_data, dict):
+                    final_name = poll_data.get("name", media_id) or media_id
+                    workflow_id = poll_data.get("workflowId", "")
+                    data["_poll_media_item"] = poll_data
+
+                self._log(f"[{self.slot_id}] Base video ready (720p)")
+
+                # ── Upscale if requested (1080p or 4K) ──
+                if upscale_target in ("1080p", "4k") and project_id:
+                    self._log(f"[{self.slot_id}] Upscaling to {upscale_target}...")
+                    up_media_id, up_error = await self._request_video_upscale(
+                        access_token, project_id, final_name,
+                        workflow_id, upscale_target, api_ratio,
+                    )
+                    if up_error:
+                        self._log(f"[{self.slot_id}] Upscale request failed: {up_error[:120]}")
+                        # Fall back to 720p — still usable
+                    elif up_media_id:
+                        # Poll upscaled video
+                        up_max = 120 if upscale_target == "4k" else 60
+                        up_status, up_data = await self._poll_video_status(
+                            access_token, up_media_id, project_id,
+                            poll_interval=5, max_polls=up_max,
+                        )
+                        if up_status == "completed":
+                            final_name = up_media_id
+                            if isinstance(up_data, dict):
+                                workflow_id = up_data.get("workflowId", workflow_id)
+                            self._log(f"[{self.slot_id}] Upscale complete ({upscale_target})")
+                        else:
+                            self._log(f"[{self.slot_id}] Upscale poll {up_status} — using 720p fallback")
+
+                # Finalize workflow — PATCH primaryMediaId (required before download URL works)
+                if workflow_id and project_id:
+                    try:
+                        patch_url = f"https://aisandbox-pa.googleapis.com/v1/flowWorkflows/{workflow_id}"
+                        patch_body = {
+                            "workflow": {
+                                "name": workflow_id,
+                                "projectId": project_id,
+                                "metadata": {"primaryMediaId": final_name},
+                            },
+                            "updateMask": "metadata.primaryMediaId",
+                        }
+                        async with aiohttp.ClientSession() as s:
+                            async with s.patch(
+                                patch_url,
+                                headers={
+                                    "content-type": "text/plain;charset=UTF-8",
+                                    "authorization": f"Bearer {access_token}",
+                                    "origin": "https://labs.google",
+                                    "referer": "https://labs.google/",
+                                },
+                                data=json.dumps(patch_body),
+                                timeout=aiohttp.ClientTimeout(total=15),
+                            ) as patch_resp:
+                                if patch_resp.ok:
+                                    self._log(f"[{self.slot_id}] Workflow finalized")
+                                else:
+                                    self._log(f"[{self.slot_id}] Workflow PATCH {patch_resp.status} (non-fatal)")
+                    except Exception as e:
+                        self._log(f"[{self.slot_id}] Workflow PATCH error (non-fatal): {str(e)[:80]}")
+
+                    # Brief pause after finalize — let redirect service register
+                    await asyncio.sleep(2)
+
+                data["_video_media_id"] = final_name
                 self.jobs_completed += 1
                 return data, None
+            elif poll_status == "moderation":
+                return None, f"MODERATION: {poll_data or 'content blocked'}"
             else:
-                return None, f"Video {poll_status}: {poll_error or 'unknown'}"
+                return None, f"Video {poll_status}: {poll_data or 'unknown'}"
 
         except Exception as e:
             return None, f"Exception: {str(e)[:300]}"
@@ -1092,7 +1311,7 @@ class ExtensionModeManager:
             client_context = {
                 "projectId": project_id or "",
                 "tool": "PINHOLE",
-                "userPaygateTier": "PAYGATE_TIER_TWO",
+                "userPaygateTier": "PAYGATE_TIER_ONE",
                 "sessionId": f";{int(time.time() * 1000)}",
             }
             if token:
@@ -1166,21 +1385,27 @@ class ExtensionModeManager:
 
             # Poll video
             self._log(f"[{worker.slot_id}] Video submitted, polling: {vid_media_id[:20]}...")
-            poll_status, poll_error = await worker._poll_video_status(
+            poll_status, poll_data = await worker._poll_video_status(
                 access_token, vid_media_id, project_id,
                 poll_interval=5, max_polls=60,
             )
 
             if poll_status != "completed":
-                err = f"Pipeline video {poll_status}: {poll_error or 'unknown'}"
+                err = f"Pipeline video {poll_status}: {poll_data or 'unknown'}"
                 update_job_status(job_id, "failed", account=worker.account_email, error=err)
                 self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, err)
                 return
 
+            # Use media name from poll response
+            if isinstance(poll_data, dict):
+                vid_media_id = poll_data.get("name", vid_media_id) or vid_media_id
+                data["_poll_media_item"] = poll_data
+
             # Download video
             data["_video_media_id"] = vid_media_id
             output_path, dl_error = await self._download_and_save(
-                worker, job_id, data, queue_no=queue_no
+                worker, job_id, data, queue_no=queue_no,
+                access_token=worker.last_access_token,
             )
 
             if dl_error:
@@ -1227,7 +1452,7 @@ class ExtensionModeManager:
             try:
                 if "video" in job_type:
                     video_model = job.get("video_model") or model
-                    ratio = job.get("aspect_ratio", "VIDEO_ASPECT_RATIO_LANDSCAPE")
+                    ratio = job.get("video_ratio") or job.get("aspect_ratio") or "VIDEO_ASPECT_RATIO_LANDSCAPE"
                     # Extract video-specific fields from job
                     video_sub_mode = str(job.get("video_sub_mode") or "").strip() or "text_to_video"
                     ref_path = str(job.get("ref_path") or "").strip() or None
@@ -1250,6 +1475,7 @@ class ExtensionModeManager:
                         ref_path=ref_path,
                         start_image_path=start_image_path,
                         end_image_path=end_image_path,
+                        upscale=job.get("video_upscale"),
                     )
                 else:
                     ratio = job.get("aspect_ratio", "IMAGE_ASPECT_RATIO_LANDSCAPE")
@@ -1277,7 +1503,8 @@ class ExtensionModeManager:
                 if result and not error:
                     # Download and save
                     output_path, dl_error = await self._download_and_save(
-                        worker, job_id, result, queue_no=queue_no
+                        worker, job_id, result, queue_no=queue_no,
+                        access_token=worker.last_access_token,
                     )
                     if dl_error:
                         last_error = dl_error
@@ -1318,6 +1545,11 @@ class ExtensionModeManager:
                     await asyncio.sleep(5)
                     continue
 
+                # Moderation / content blocked — don't retry, same prompt won't pass
+                if last_error.startswith("MODERATION:"):
+                    self._log(f"[{worker.slot_id}] Content blocked by moderation — not retrying.")
+                    break
+
                 # 400 "invalid argument" — same prompt won't fix on retry, fail after 2 attempts
                 if "400" in last_error and attempt >= 1:
                     self._log(f"[{worker.slot_id}] Same 400 error twice — skipping prompt.")
@@ -1351,112 +1583,173 @@ class ExtensionModeManager:
         self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, last_error)
         self._log(f"[{worker.slot_id}] Job {job_id[:6]}... FAILED: {last_error[:200]}")
 
-    async def _download_and_save(self, worker, job_id, api_data, queue_no=None):
+    async def _download_and_save(self, worker, job_id, api_data, queue_no=None, access_token=None):
         """Download generated media via direct HTTP and save to output directory."""
-        # Extract media URL from API response
-        media_list = api_data.get("media", []) if isinstance(api_data, dict) else []
         fife_url = None
-        media_name = None
+        is_video = False
 
-        for item in media_list:
-            url = (item.get("image", {}).get("generatedImage", {}).get("fifeUrl", "")
-                   if isinstance(item, dict) else "")
-            name = item.get("name", "") if isinstance(item, dict) else ""
-            if url:
-                fife_url = url
-                media_name = name
-                break
-            if name and not fife_url:
-                media_name = name
-
-        if not fife_url and media_name:
+        # ── VIDEO: check _video_media_id FIRST (set by generate_video after polling) ──
+        video_media_id = api_data.get("_video_media_id", "") if isinstance(api_data, dict) else ""
+        if video_media_id:
             fife_url = (
-                f"https://labs.google/fx/api/trpc/backbone.redirect?"
-                f"input=%7B%22name%22%3A%22{media_name}%22%7D"
+                f"https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?"
+                f"name={video_media_id}"
             )
+            is_video = True
 
+        # ── IMAGE: extract fifeUrl or build backbone.redirect URL ──
         if not fife_url:
-            workflows = api_data.get("workflows", []) if isinstance(api_data, dict) else []
-            if workflows:
-                primary_id = workflows[0].get("metadata", {}).get("primaryMediaId", "")
-                if primary_id:
-                    fife_url = (
-                        f"https://labs.google/fx/api/trpc/backbone.redirect?"
-                        f"input=%7B%22name%22%3A%22{primary_id}%22%7D"
-                    )
+            media_list = api_data.get("media", []) if isinstance(api_data, dict) else []
+            media_name = None
+            for item in media_list:
+                url = (item.get("image", {}).get("generatedImage", {}).get("fifeUrl", "")
+                       if isinstance(item, dict) else "")
+                name = item.get("name", "") if isinstance(item, dict) else ""
+                if url:
+                    fife_url = url
+                    break
+                if name and not fife_url:
+                    media_name = name
 
-        # For video: use _video_media_id set after polling
-        if not fife_url:
-            video_media_id = api_data.get("_video_media_id", "") if isinstance(api_data, dict) else ""
-            if video_media_id:
+            if not fife_url and media_name:
                 fife_url = (
-                    f"https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?"
-                    f"name={video_media_id}"
+                    f"https://labs.google/fx/api/trpc/backbone.redirect?"
+                    f"input=%7B%22name%22%3A%22{media_name}%22%7D"
                 )
 
         if not fife_url:
             return None, "No downloadable media in API response"
 
-        # Download via aiohttp (direct HTTP — no browser needed)
+        dl_headers = {
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "referer": "https://labs.google/",
+        }
+
+        # ── VIDEO: direct HTTP with browser cookies (fast) ──
+        if is_video:
+            try:
+                # Get browser cookies via extension
+                cookie_result = await worker._bridge.request_token(
+                    worker.account_email, "GET_COOKIES", timeout=10.0,
+                )
+                cookie_str = cookie_result.get("cookies", "")
+                if cookie_str:
+                    dl_headers["cookie"] = cookie_str
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            fife_url,
+                            headers=dl_headers,
+                            timeout=aiohttp.ClientTimeout(total=120),
+                            allow_redirects=True,
+                        ) as resp:
+                            if resp.ok:
+                                content_type = str(resp.headers.get("content-type", "")).lower()
+                                data = await resp.read()
+                                if data:
+                                    return await self._save_media(job_id, data, content_type, queue_no, slot_id=worker.slot_id)
+
+                # Fallback: bridge webRequest method
+                self._log(f"[{worker.slot_id}] Direct download failed, using bridge fallback...")
+                bridge_result = await worker._bridge.request_token(
+                    worker.account_email,
+                    f"DOWNLOAD_MEDIA:{fife_url}",
+                    timeout=60.0,
+                )
+                err = bridge_result.get("error", "")
+                if err:
+                    return None, f"Bridge download error: {err}"
+
+                cdn_url = bridge_result.get("cdn_url", "")
+                if cdn_url:
+                    dl_headers.pop("cookie", None)
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            cdn_url,
+                            headers=dl_headers,
+                            timeout=aiohttp.ClientTimeout(total=120),
+                            allow_redirects=True,
+                        ) as resp:
+                            if not resp.ok:
+                                return None, f"CDN download HTTP {resp.status}"
+                            content_type = str(resp.headers.get("content-type", "")).lower()
+                            data = await resp.read()
+                            if not data:
+                                return None, "Downloaded empty file from CDN"
+                    return await self._save_media(job_id, data, content_type, queue_no, slot_id=worker.slot_id)
+
+                return None, "No download URL available"
+            except Exception as e:
+                return None, f"Download error: {str(e)[:200]}"
+
+        # ── IMAGE: direct aiohttp download (no cookies needed) ──
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     fife_url,
-                    timeout=aiohttp.ClientTimeout(total=90),
+                    headers=dl_headers,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                    allow_redirects=True,
                 ) as resp:
                     if not resp.ok:
                         return None, f"Download HTTP {resp.status}"
 
                     content_type = str(resp.headers.get("content-type", "")).lower()
-                    ext_map = {
-                        "image/png": ".png",
-                        "image/jpeg": ".jpg",
-                        "image/webp": ".webp",
-                        "video/mp4": ".mp4",
-                        "video/webm": ".webm",
-                    }
-                    ext = ".jpg"
-                    for mime, candidate_ext in ext_map.items():
-                        if mime in content_type:
-                            ext = candidate_ext
-                            break
-
                     data = await resp.read()
                     if not data:
                         return None, "Downloaded empty file"
 
-            # Build output path
-            output_dir = get_output_directory()
-            os.makedirs(output_dir, exist_ok=True)
-
-            normalized_qno = None
-            try:
-                val = int(queue_no)
-                if val > 0:
-                    normalized_qno = val
-            except Exception:
-                pass
-
-            if normalized_qno is not None:
-                filename = f"{normalized_qno}{ext}"
-            else:
-                safe_job = (job_id or "job").replace("-", "")[:8]
-                ts = int(time.time() * 1000)
-                nonce = random.randint(1000, 9999)
-                filename = f"{safe_job}_{ts}_{nonce}_generation{ext}"
-
-            output_path = os.path.join(output_dir, filename)
-
-            with open(output_path, "wb") as f:
-                f.write(data)
-
-            try:
-                update_job_runtime_state(job_id, output_path=output_path)
-            except Exception:
-                pass
-
-            self._log(f"[{worker.slot_id}] Saved: {filename} ({len(data)} bytes)")
-            return output_path, None
+            return await self._save_media(job_id, data, content_type, queue_no, slot_id=worker.slot_id)
 
         except Exception as e:
             return None, f"Download error: {str(e)[:200]}"
+
+    async def _save_media(self, job_id, data, content_type, queue_no=None, slot_id="ext"):
+        """Save downloaded media bytes to output directory. Returns (path, error)."""
+        ext_map = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+            "video/mp4": ".mp4",
+            "video/webm": ".webm",
+        }
+        content_type = str(content_type or "").lower()
+        ext = ".jpg"
+        for mime, candidate_ext in ext_map.items():
+            if mime in content_type:
+                ext = candidate_ext
+                break
+        # Fallback: sniff from data magic bytes
+        if ext == ".jpg" and data[:4] in (b'\x00\x00\x00\x18', b'\x00\x00\x00\x1c', b'\x00\x00\x00 '):
+            ext = ".mp4"
+
+        output_dir = get_output_directory()
+        os.makedirs(output_dir, exist_ok=True)
+
+        normalized_qno = None
+        try:
+            val = int(queue_no)
+            if val > 0:
+                normalized_qno = val
+        except Exception:
+            pass
+
+        if normalized_qno is not None:
+            filename = f"{normalized_qno}{ext}"
+        else:
+            safe_job = (job_id or "job").replace("-", "")[:8]
+            ts = int(time.time() * 1000)
+            nonce = random.randint(1000, 9999)
+            filename = f"{safe_job}_{ts}_{nonce}_generation{ext}"
+
+        output_path = os.path.join(output_dir, filename)
+
+        with open(output_path, "wb") as f:
+            f.write(data)
+
+        try:
+            update_job_runtime_state(job_id, output_path=output_path)
+        except Exception:
+            pass
+
+        self._log(f"[{slot_id}] Saved: {filename} ({len(data)} bytes)")
+        return output_path, None

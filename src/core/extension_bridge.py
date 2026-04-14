@@ -276,22 +276,38 @@ class ExtensionBridge:
         self._dispatched_to.pop(request_id, None)
 
         if req and req.get("future") and not req["future"].done():
-            result = {
-                "token": data.get("token"),
-                "access_token": data.get("access_token"),
-                "email": data.get("email"),
-                "project_id": data.get("project_id"),
-                "error": data.get("error"),
-            }
+            # For special actions, pass through relevant fields
+            action = req.get("action", "")
+            if action.startswith("DOWNLOAD_MEDIA:"):
+                result = {
+                    "cdn_url": data.get("cdn_url"),
+                    "base64_data": data.get("base64_data"),
+                    "content_type": data.get("content_type"),
+                    "size": data.get("size"),
+                    "error": data.get("error"),
+                }
+            elif action == "GET_COOKIES":
+                result = {
+                    "cookies": data.get("cookies"),
+                    "error": data.get("error"),
+                }
+            else:
+                result = {
+                    "token": data.get("token"),
+                    "access_token": data.get("access_token"),
+                    "email": data.get("email"),
+                    "project_id": data.get("project_id"),
+                    "error": data.get("error"),
+                }
 
-            # Cache project ID if received
-            email = data.get("email", "")
-            pid = data.get("project_id")
-            if email and pid:
-                self._project_ids[email] = pid
+                # Cache project ID if received
+                email = data.get("email", "")
+                pid = data.get("project_id")
+                if email and pid:
+                    self._project_ids[email] = pid
 
-            if data.get("token"):
-                self._tokens_received += 1
+                if data.get("token"):
+                    self._tokens_received += 1
 
             req["future"].set_result(result)
 

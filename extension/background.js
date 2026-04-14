@@ -83,6 +83,77 @@ async function pollBridge() {
 async function handleWork(work) {
   const { request_id, account, action } = work;
 
+  // ─── GET_COOKIES: return all cookies for labs.google (including .google.com parent) ───
+  if (action === "GET_COOKIES") {
+    try {
+      const cookies = await chrome.cookies.getAll({ url: "https://labs.google/" });
+      const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+      await submitResult(request_id, { cookies: cookieStr });
+    } catch (e) {
+      await submitResult(request_id, { error: e.message || "cookies_error" });
+    }
+    return;
+  }
+
+  // ─── DOWNLOAD_MEDIA: resolve redirect URL via webRequest + MAIN world fetch (fallback) ───
+  if (action && action.startsWith("DOWNLOAD_MEDIA:")) {
+    const mediaUrl = action.slice("DOWNLOAD_MEDIA:".length);
+    const allLabsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+    const tabId = allLabsTabs.length > 0 ? allLabsTabs[0].id : null;
+    if (!tabId) {
+      await submitResult(request_id, { error: "no_labs_tab_for_download" });
+      return;
+    }
+    try {
+      // 1. Set up webRequest listener to capture the 307 redirect at network level
+      //    (fires BEFORE CORS, so we get the Location even though JS fetch will fail)
+      const redirectPromise = new Promise((resolve) => {
+        let resolved = false;
+        const listener = (details) => {
+          if (!resolved && details.url.includes("getMediaUrlRedirect")) {
+            resolved = true;
+            chrome.webRequest.onBeforeRedirect.removeListener(listener);
+            resolve(details.redirectUrl || null);
+          }
+        };
+        chrome.webRequest.onBeforeRedirect.addListener(
+          listener,
+          { urls: ["https://labs.google/fx/api/trpc/media.getMediaUrlRedirect*"] }
+        );
+        // Timeout fallback
+        setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            chrome.webRequest.onBeforeRedirect.removeListener(listener);
+            resolve(null);
+          }
+        }, 15000);
+      });
+
+      // 2. Fire the request from MAIN world (has page cookies, same-origin)
+      //    We don't care about the fetch result — webRequest captures the redirect
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: (url) => {
+          fetch(url, { credentials: "include", redirect: "follow" }).catch(() => {});
+        },
+        args: [mediaUrl],
+      });
+
+      // 3. Wait for the redirect URL from webRequest listener
+      const cdnUrl = await redirectPromise;
+      if (cdnUrl) {
+        await submitResult(request_id, { cdn_url: cdnUrl });
+      } else {
+        await submitResult(request_id, { error: "no_redirect_captured" });
+      }
+    } catch (e) {
+      await submitResult(request_id, { error: e.message || "download_resolve_error" });
+    }
+    return;
+  }
+
   // Check if any Labs tab exists at all (before reCAPTCHA validation)
   const allLabsTabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
 
@@ -134,6 +205,67 @@ async function handleWork(work) {
     await submitResult(request_id, result);
   } catch (e) {
     await submitResult(request_id, { error: e.message || "script_error" });
+  }
+}
+
+/**
+ * Resolve a media redirect URL using the page's cookies.
+ * Fetches the URL with credentials, follows redirect, returns the final CDN URL.
+ * Runs in world: "MAIN" so it has the page's cookies.
+ */
+async function resolveMediaUrl(mediaUrl) {
+  try {
+    // Use redirect: "manual" to capture the 307 Location header
+    // (redirect: "follow" fails because GCS is cross-origin)
+    const resp = await fetch(mediaUrl, {
+      method: "GET",
+      credentials: "include",
+      redirect: "manual",
+    });
+    // 307 redirect — extract Location from the opaque-redirect response
+    if (resp.type === "opaqueredirect" || resp.status === 0) {
+      // Can't read Location from opaque redirect in fetch API.
+      // Fall back to XMLHttpRequest which CAN read redirect headers.
+      return await new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("GET", mediaUrl, true);
+        xhr.withCredentials = true;
+        // Prevent following redirect so we can read Location
+        xhr.onreadystatechange = function () {
+          if (xhr.readyState === 2) {  // HEADERS_RECEIVED
+            const loc = xhr.getResponseHeader("Location");
+            if (loc) {
+              xhr.abort();
+              resolve({ cdn_url: loc });
+              return;
+            }
+          }
+          if (xhr.readyState === 4) {
+            if (xhr.status >= 200 && xhr.status < 400) {
+              // Got actual data (no redirect)
+              resolve({ cdn_url: xhr.responseURL || mediaUrl });
+            } else {
+              resolve({ error: `xhr_failed_${xhr.status}` });
+            }
+          }
+        };
+        xhr.onerror = () => resolve({ error: "xhr_network_error" });
+        xhr.send();
+      });
+    }
+    if (resp.status >= 300 && resp.status < 400) {
+      const loc = resp.headers.get("Location");
+      if (loc) return { cdn_url: loc };
+    }
+    if (resp.ok) {
+      // resp.url contains the final URL after redirects
+      if (resp.url && resp.url !== mediaUrl) {
+        return { cdn_url: resp.url };
+      }
+    }
+    return { error: `fetch_failed_${resp.status}` };
+  } catch (e) {
+    return { error: e.message || "resolve_fetch_error" };
   }
 }
 

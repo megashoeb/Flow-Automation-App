@@ -6,10 +6,12 @@
   "permissions": [
     "tabs",
     "scripting",
-    "cookies"
+    "cookies",
+    "webRequest"
   ],
   "host_permissions": [
     "https://labs.google/*",
+    "https://storage.googleapis.com/*",
     "http://127.0.0.1:18924/*"
   ],
   "background": {
