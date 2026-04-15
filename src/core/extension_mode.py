@@ -1429,7 +1429,6 @@ class ExtensionModeManager:
             update_job_status(job_id, "completed", account=worker.account_email)
             self.qm.signals.job_updated.emit(job_id, "completed", worker.account_email, "")
             self.qm._record_throttle_success(worker.account_email)
-            self.qm.account_recaptcha_streak.pop(worker.account_email, None)
             self._log(f"[{worker.slot_id}] Pipeline job {job_id[:6]}... completed! ({output_path})")
 
         except asyncio.CancelledError:
@@ -1556,7 +1555,6 @@ class ExtensionModeManager:
                         update_job_status(job_id, "completed", account=worker.account_email)
                         self.qm.signals.job_updated.emit(job_id, "completed", worker.account_email, "")
                         self.qm._record_throttle_success(worker.account_email)
-                        self.qm.account_recaptcha_streak.pop(worker.account_email, None)
                         self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed! ({output_path})")
                         return
 
@@ -1586,19 +1584,8 @@ class ExtensionModeManager:
                     self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                     return
 
-                # reCAPTCHA score/token failure → report to qm, hold account if persistent
+                # reCAPTCHA score/token failure → reload tab and retry
                 if "recaptcha" in err_lower or "captcha" in err_lower:
-                    account_held = self.qm._report_recaptcha_from_extension(worker.account_email)
-                    if account_held:
-                        # Account is now on hold — re-queue job for other accounts
-                        self._log(
-                            f"[{worker.slot_id}] reCAPTCHA persistent on account — "
-                            f"re-queuing job for other accounts."
-                        )
-                        update_job_status(job_id, "pending", account="")
-                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
-                        return
-                    # Not yet at threshold — reload tab and retry on this slot
                     self._bridge.send_command("reload_tab", worker.account_email)
                     if self.qm.stop_requested or self.qm.force_stop_requested:
                         update_job_status(job_id, "pending", account="")

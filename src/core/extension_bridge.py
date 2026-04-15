@@ -19,7 +19,8 @@ import asyncio
 import json
 import time
 import logging
-from typing import Optional, Dict, Any, Callable
+from collections import deque
+from typing import Optional, Dict, Any, Callable, List
 from aiohttp import web
 
 log = logging.getLogger(__name__)
@@ -53,6 +54,14 @@ class ExtensionBridge:
         # Track which request was last dispatched to which extension
         # request_id -> frozenset(ext_accounts) that currently has the work
         self._dispatched_to: Dict[str, frozenset] = {}
+
+        # ─── Token Pool (pre-fetched reCAPTCHA tokens) ───
+        # Keeps N tokens per account ready so 15 parallel slots don't
+        # all wait in line for serial extension token generation.
+        self._token_pool: Dict[str, deque] = {}       # account -> deque of {token, access_token, project_id, ts}
+        self._prefetch_accounts: Dict[str, str] = {}  # prefetch_request_id -> account
+        self.TOKEN_POOL_TARGET = 5   # target pre-fetched tokens per account
+        self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
 
         # Stats
         self._tokens_received = 0
@@ -95,6 +104,8 @@ class ExtensionBridge:
                 fut.set_result({"error": "bridge_stopped"})
         self._pending_requests.clear()
         self._dispatched_to.clear()
+        self._token_pool.clear()
+        self._prefetch_accounts.clear()
 
         if self._site:
             await self._site.stop()
@@ -109,6 +120,7 @@ class ExtensionBridge:
     async def request_token(self, account: str, action: str, timeout: float = 30.0) -> Dict[str, Any]:
         """
         Request a reCAPTCHA token from the Chrome Extension.
+        Checks the pre-fetched token pool first for instant response.
 
         Args:
             account: Email of the account to use
@@ -118,6 +130,27 @@ class ExtensionBridge:
         Returns:
             dict with keys: token, access_token, project_id, error
         """
+        # ─── Check token pool first ───
+        pool = self._token_pool.get(account)
+        if pool:
+            now = time.time()
+            while pool:
+                cached = pool.popleft()
+                age = now - cached["ts"]
+                if age < self.TOKEN_MAX_AGE:
+                    self._log(
+                        f"[Bridge] Pool hit for {account} "
+                        f"(age {age:.0f}s, {len(pool)} left in pool)"
+                    )
+                    return {
+                        "token": cached["token"],
+                        "access_token": cached["access_token"],
+                        "project_id": cached["project_id"],
+                        "error": None,
+                    }
+                # Token too old, discard and check next
+
+        # ─── No cached token — fall through to live request ───
         self._request_counter += 1
         request_id = f"req_{self._request_counter}_{int(time.time())}"
 
@@ -226,6 +259,28 @@ class ExtensionBridge:
                     self._dispatched_to[req_id] = ext_key
                     break
 
+        # ─── Token Pool Pre-fetch ───
+        # If no real work pending, pre-fetch tokens to keep the pool topped up.
+        # This ensures 15 parallel slots can grab cached tokens instantly.
+        if response_data["work"] is None:
+            now = time.time()
+            for account in ext_accounts:
+                pool = self._token_pool.get(account, deque())
+                # Count valid (non-expired) tokens in pool
+                valid_count = sum(1 for t in pool if (now - t["ts"]) < self.TOKEN_MAX_AGE)
+                # Count prefetch requests already in flight for this account
+                in_flight = sum(1 for a in self._prefetch_accounts.values() if a == account)
+                if valid_count + in_flight < self.TOKEN_POOL_TARGET:
+                    self._request_counter += 1
+                    prefetch_id = f"prefetch_{self._request_counter}_{int(time.time())}"
+                    self._prefetch_accounts[prefetch_id] = account
+                    response_data["work"] = {
+                        "request_id": prefetch_id,
+                        "account": account,
+                        "action": "IMAGE_GENERATION",
+                    }
+                    break
+
         # Check for pending commands
         if self._pending_commands:
             response_data["command"] = self._pending_commands.pop(0)
@@ -241,6 +296,25 @@ class ExtensionBridge:
 
         request_id = data.get("request_id", "")
         error = data.get("error", "")
+
+        # ─── Handle pre-fetch results (token pool) ───
+        if request_id.startswith("prefetch_"):
+            account = self._prefetch_accounts.pop(request_id, "")
+            if data.get("token") and account and not error:
+                pool = self._token_pool.setdefault(account, deque())
+                pool.append({
+                    "token": data["token"],
+                    "access_token": data.get("access_token"),
+                    "project_id": data.get("project_id"),
+                    "ts": time.time(),
+                })
+                # Also cache project ID
+                pid = data.get("project_id")
+                if account and pid:
+                    self._project_ids[account] = pid
+                self._tokens_received += 1
+                self._log(f"[Bridge] Pool: cached token for {account} (pool size: {len(pool)})")
+            return web.json_response({"ok": True}, headers={"Access-Control-Allow-Origin": "*"})
 
         # ─── Re-route on no_labs_tab errors ───
         # If extension couldn't find the tab for this account, don't fail the
