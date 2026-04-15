@@ -127,14 +127,14 @@ class AsyncQueueManager(QThread):
         self.max_auto_retries_per_job = max(0, min(5, retry_count_value))
         self.auto_retry_base_delay_seconds = max(5, min(300, retry_base_delay_value))
         self.same_account_stagger_seconds = max(
-            0.0, min(60.0, get_float_setting("same_account_stagger_seconds", 1.0))
+            0.0, min(60.0, get_float_setting("same_account_stagger_seconds", 3.0))
         )
         self.global_stagger_min_seconds = max(
-            0.0, min(60.0, get_float_setting("global_stagger_min_seconds", 0.3))
+            0.0, min(60.0, get_float_setting("global_stagger_min_seconds", 0.5))
         )
         self.global_stagger_max_seconds = max(
             self.global_stagger_min_seconds,
-            min(120.0, get_float_setting("global_stagger_max_seconds", 0.6)),
+            min(120.0, get_float_setting("global_stagger_max_seconds", 1.5)),
         )
         self.max_no_account_attempts = max(
             3, min(120, get_int_setting("max_no_account_attempts", 20))
@@ -942,9 +942,8 @@ class AsyncQueueManager(QThread):
             idx = 1
         if idx <= 1:
             return 0.0
-        if idx == 2:
-            return 2.0
-        return 2.0 + ((idx - 2) * 3.0)
+        # Gradual ramp: slot2=4s, slot3=8s, slot4=12s, ... slot8=28s
+        return idx * 4.0
 
     def _unlock_additional_slots_after_success(self, slot):
         account_name = slot["account_name"]
