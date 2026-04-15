@@ -60,7 +60,7 @@ class ExtensionBridge:
         # all wait in line for serial extension token generation.
         self._token_pool: Dict[str, deque] = {}       # account -> deque of {token, access_token, project_id, ts}
         self._prefetch_accounts: Dict[str, str] = {}  # prefetch_request_id -> account
-        self.TOKEN_POOL_TARGET = 5   # target pre-fetched tokens per account
+        self.TOKEN_POOL_TARGET = 10  # target pre-fetched tokens per account
         self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
 
         # Stats
