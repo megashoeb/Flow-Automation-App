@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1280, initial-scale=1">
+<title>Video Generation - Layout Mockup</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0F172A; color: #E2E8F0; font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
+
+  .page { display: flex; height: 100vh; }
+
+  /* Sidebar */
+  .sidebar { width: 160px; background: #0B1120; display: flex; flex-direction: column; border-right: 1px solid #1E293B; flex-shrink: 0; }
+  .sidebar-title { padding: 18px 16px 2px; font-size: 18px; font-weight: 800; color: #F8FAFC; line-height: 1.15; }
+  .sidebar-byline { padding: 0 16px 14px; font-size: 10px; color: #64748B; font-style: italic; letter-spacing: 1px; }
+  .sidebar-nav { flex: 1; padding: 8px 0; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 18px; color: #94A3B8; font-size: 13px; cursor: pointer; border-left: 3px solid transparent; }
+  .nav-item:hover { background: #1E293B; color: #E2E8F0; }
+  .nav-item.active { color: #60A5FA; border-left-color: #60A5FA; background: rgba(96,165,250,0.08); }
+  .nav-icon { width: 18px; text-align: center; font-size: 14px; }
+  .sidebar-stats { padding: 12px 16px; border-top: 1px solid #1E293B; }
+  .sidebar-stats h4 { font-size: 10px; color: #64748B; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; font-size: 12px; }
+  .stat-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .stat-dot.pending { background: #F59E0B; }
+  .stat-dot.running { background: #3B82F6; }
+  .stat-dot.done { background: #22C55E; }
+  .stat-dot.failed { background: #EF4444; }
+
+  /* Main content */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Top bar */
+  .topbar { display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: #0F172A; border-bottom: 1px solid #1E293B; flex-shrink: 0; }
+  .topbar-badge { background: #1E293B; padding: 5px 14px; border-radius: 6px; font-size: 12px; color: #94A3B8; }
+  .topbar-badge b { color: #E2E8F0; }
+  .topbar-spacer { flex: 1; }
+  .btn-start { background: #2563EB; color: white; border: none; padding: 8px 20px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+  .btn-pause { background: #1E293B; color: #94A3B8; border: 1px solid #334155; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  .btn-stop { background: #DC2626; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+
+  /* Progress bar */
+  .progress-wrap { padding: 6px 20px; flex-shrink: 0; }
+  .progress-bar { height: 6px; background: #1E293B; border-radius: 3px; overflow: hidden; }
+  .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2563EB, #60A5FA); border-radius: 3px; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 0; padding: 0 20px; border-bottom: 1px solid #1E293B; flex-shrink: 0; }
+  .tab { padding: 10px 20px; font-size: 13px; color: #64748B; cursor: pointer; border-bottom: 2px solid transparent; font-weight: 500; }
+  .tab:hover { color: #94A3B8; }
+  .tab.active { color: #60A5FA; border-bottom-color: #60A5FA; }
+
+  /* Content area — 2 columns */
+  .content { flex: 1; display: flex; gap: 16px; padding: 16px 20px; overflow: hidden; }
+
+  /* Left: Settings + Prompt + Queue button */
+  .left-panel { flex: 1; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
+
+  /* Settings grid */
+  .settings-section { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex-shrink: 0; }
+  .settings-section h3 { font-size: 12px; color: #60A5FA; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; font-weight: 600; }
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px 14px; }
+  .setting-item { display: flex; flex-direction: column; gap: 3px; }
+  .setting-label { font-size: 11px; color: #64748B; font-weight: 500; }
+  .setting-select { background: #0F172A; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; color: #E2E8F0; font-size: 12px; appearance: none; cursor: pointer; }
+
+  /* Prompt + Images area */
+  .prompt-section { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex: 1; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .prompt-section h3 { font-size: 12px; color: #60A5FA; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; flex-shrink: 0; }
+  .prompt-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
+  .prompt-textarea { flex: 1; background: #0F172A; border: 1px solid #334155; border-radius: 8px; padding: 10px; color: #E2E8F0; font-size: 13px; resize: none; font-family: inherit; }
+  .prompt-textarea::placeholder { color: #475569; }
+
+  /* Image upload area */
+  .image-upload-area { width: 180px; background: #0F172A; border: 2px dashed #334155; border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; cursor: pointer; flex-shrink: 0; }
+  .image-upload-area:hover { border-color: #60A5FA; background: rgba(96,165,250,0.05); }
+  .upload-icon { font-size: 28px; color: #475569; }
+  .upload-text { font-size: 11px; color: #64748B; text-align: center; line-height: 1.3; }
+  .upload-text b { color: #60A5FA; }
+
+  /* Add to queue button */
+  .add-queue-btn { background: linear-gradient(135deg, #2563EB, #3B82F6); color: white; border: none; padding: 12px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .add-queue-btn:hover { background: linear-gradient(135deg, #1D4ED8, #2563EB); }
+
+  /* Right: Logs + Task Queue */
+  .right-panel { width: 380px; display: flex; flex-direction: column; gap: 12px; flex-shrink: 0; }
+
+  /* Task Queue mini */
+  .task-queue { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .task-queue h3 { font-size: 12px; color: #60A5FA; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+  .queue-clear-btns { display: flex; gap: 6px; }
+  .queue-clear-btns button { background: transparent; border: 1px solid #334155; color: #94A3B8; padding: 3px 10px; border-radius: 4px; font-size: 10px; cursor: pointer; }
+  .queue-table { flex: 1; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { text-align: left; color: #64748B; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid #334155; position: sticky; top: 0; background: #1E293B; }
+  td { padding: 6px 8px; border-bottom: 1px solid rgba(51,65,85,0.4); color: #CBD5E1; }
+  tr:hover td { background: rgba(96,165,250,0.05); }
+  .status-done { color: #22C55E; font-weight: 600; font-size: 10px; }
+  .status-running { color: #3B82F6; font-weight: 600; font-size: 10px; }
+  .status-pending { color: #F59E0B; font-weight: 600; font-size: 10px; }
+
+  /* Logs box */
+  .logs-box { background: #0B1120; border: 1px solid #1E293B; border-radius: 10px; height: 200px; display: flex; flex-direction: column; flex-shrink: 0; }
+  .logs-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; border-bottom: 1px solid #1E293B; flex-shrink: 0; }
+  .logs-header h3 { font-size: 12px; color: #94A3B8; font-weight: 600; }
+  .logs-header button { background: transparent; border: 1px solid #334155; color: #64748B; padding: 2px 10px; border-radius: 4px; font-size: 10px; cursor: pointer; }
+  .logs-content { flex: 1; padding: 8px 14px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; color: #64748B; line-height: 1.6; }
+  .log-line { white-space: nowrap; }
+  .log-line .green { color: #22C55E; }
+  .log-line .blue { color: #60A5FA; }
+  .log-line .yellow { color: #F59E0B; }
+
+  /* Tab content areas (hidden by default) */
+  .tab-content { display: none; flex: 1; flex-direction: column; gap: 12px; overflow: hidden; }
+  .tab-content.active { display: flex; }
+
+  /* Frame images row */
+  .frame-images { display: flex; gap: 12px; flex-shrink: 0; }
+  .frame-img-box { flex: 1; background: #0F172A; border: 2px dashed #334155; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; cursor: pointer; min-height: 80px; }
+  .frame-img-box:hover { border-color: #60A5FA; }
+  .frame-label { font-size: 11px; color: #64748B; font-weight: 500; }
+
+  /* Reference thumbnail grid */
+  .ref-uploaded-section { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex-shrink: 0; }
+  .ref-thumb-grid { display: flex; gap: 8px; flex-wrap: wrap; max-height: 150px; overflow-y: auto; padding: 4px 2px; }
+  .ref-thumb-card { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; background: #0F172A; border: 1px solid #334155; border-radius: 8px; padding: 6px; width: 80px; }
+  .ref-thumb-card:hover { border-color: #60A5FA; }
+  .ref-thumb-img { width: 64px; height: 48px; border-radius: 4px; background-size: cover; background-position: center; }
+  .ref-thumb-name { font-size: 9px; color: #94A3B8; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+  .ref-thumb-remove { position: absolute; top: 2px; right: 2px; background: rgba(239,68,68,0.8); border: none; color: white; width: 16px; height: 16px; border-radius: 50%; font-size: 9px; cursor: pointer; display: none; line-height: 16px; padding: 0; }
+  .ref-thumb-card:hover .ref-thumb-remove { display: block; }
+  .ref-action-btn { background: transparent; border: 1px solid #334155; color: #94A3B8; padding: 4px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .ref-action-btn:hover { border-color: #60A5FA; color: #60A5FA; }
+  .ref-action-btn.danger { color: #EF4444; border-color: #7F1D1D; }
+  .ref-action-btn.danger:hover { border-color: #EF4444; }
+
+  /* Frame tab uploaded image preview */
+  .frame-img-preview { width: 100%; height: 60px; border-radius: 4px; object-fit: cover; background-size: cover; background-position: center; margin-bottom: 4px; }
+
+  /* Mode toggle (Single / Bulk) */
+  .mode-toggle { display: flex; gap: 0; border-radius: 6px; overflow: hidden; border: 1px solid #334155; flex-shrink: 0; }
+  .mode-btn { padding: 6px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border: none; background: #0F172A; color: #64748B; transition: all 0.15s; }
+  .mode-btn.active { background: #2563EB; color: white; }
+  .mode-btn:hover:not(.active) { background: #1E293B; color: #94A3B8; }
+
+  /* Bulk panel */
+  .bulk-panel { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex-shrink: 0; }
+  .bulk-panel h3 { font-size: 12px; color: #60A5FA; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; margin-bottom: 10px; }
+  .bulk-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .bulk-btn { background: #0F172A; border: 1px solid #334155; color: #94A3B8; padding: 5px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 5px; }
+  .bulk-btn:hover { border-color: #60A5FA; color: #60A5FA; }
+  .bulk-btn .btn-icon { font-size: 13px; }
+  .bulk-sort { background: #0F172A; border: 1px solid #334155; border-radius: 6px; padding: 5px 10px; color: #E2E8F0; font-size: 12px; appearance: none; cursor: pointer; }
+  .bulk-missing { background: #0F172A; border: 1px solid #334155; border-radius: 6px; padding: 5px 10px; color: #E2E8F0; font-size: 12px; appearance: none; cursor: pointer; }
+  .bulk-image-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .bulk-image-table th { text-align: left; color: #64748B; font-weight: 500; padding: 5px 8px; border-bottom: 1px solid #334155; }
+  .bulk-image-table td { padding: 4px 8px; border-bottom: 1px solid rgba(51,65,85,0.4); color: #CBD5E1; vertical-align: middle; }
+  .bulk-thumb { width: 36px; height: 28px; border-radius: 3px; background-size: cover; background-position: center; display: inline-block; vertical-align: middle; }
+  .bulk-filename { font-size: 11px; color: #94A3B8; }
+  .bulk-prompt-status { font-size: 10px; padding: 2px 8px; border-radius: 10px; }
+  .bulk-prompt-status.found { background: rgba(34,197,94,0.15); color: #22C55E; }
+  .bulk-prompt-status.missing { background: rgba(245,158,11,0.15); color: #F59E0B; }
+  .bulk-count-badge { background: #0F172A; padding: 3px 10px; border-radius: 12px; font-size: 11px; color: #94A3B8; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-title">G-Labs<br>Automation</div>
+    <div class="sidebar-byline">by MegaShoeb</div>
+    <div class="sidebar-nav">
+      <div class="nav-item"><span class="nav-icon">🖼</span> Image Generation</div>
+      <div class="nav-item active"><span class="nav-icon">🎬</span> Video Generation</div>
+      <div class="nav-item"><span class="nav-icon">👥</span> Account Manager</div>
+      <div class="nav-item"><span class="nav-icon">▶</span> Live Generation</div>
+      <div class="nav-item"><span class="nav-icon">↩</span> Failed Jobs</div>
+      <div class="nav-item"><span class="nav-icon">⚙</span> Settings</div>
+    </div>
+    <div class="sidebar-stats">
+      <h4>Queue Stats</h4>
+      <div class="stat-row"><span><span class="stat-dot pending"></span>Pending</span> <b>3</b></div>
+      <div class="stat-row"><span><span class="stat-dot running"></span>Running</span> <b style="color:#3B82F6">1</b></div>
+      <div class="stat-row"><span><span class="stat-dot done"></span>Done</span> <b style="color:#22C55E">5</b></div>
+      <div class="stat-row"><span><span class="stat-dot failed"></span>Failed</span> <b style="color:#EF4444">0</b></div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <!-- Top bar -->
+    <div class="topbar">
+      <div class="topbar-badge">Mode: <b>Video</b></div>
+      <div class="topbar-badge">Parallel: <b>9/account</b></div>
+      <div class="topbar-badge">Queue: <b>STOPPED</b></div>
+      <div class="topbar-badge">Session: 5 videos generated</div>
+      <div class="topbar-spacer"></div>
+      <button class="btn-start">▶ Start Automation</button>
+      <button class="btn-pause">Pause</button>
+      <button class="btn-stop">Stop</button>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill" style="width: 60%"></div></div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('t2v', this)">Text → Video</div>
+      <div class="tab" onclick="switchTab('ref', this)">Video + Ref</div>
+      <div class="tab" onclick="switchTab('frame', this)">Video + Frame</div>
+      <div class="tab" onclick="switchTab('pipeline', this)">Image → Video</div>
+    </div>
+
+    <!-- Content -->
+    <div class="content">
+      <!-- Left Panel -->
+      <div class="left-panel">
+
+        <!-- ═══ TAB: Text → Video ═══ -->
+        <div class="tab-content active" id="tab-t2v">
+          <div class="settings-section">
+            <h3>Text → Video Settings</h3>
+            <div class="settings-grid">
+              <div class="setting-item">
+                <span class="setting-label">Quality</span>
+                <select class="setting-select"><option>Veo 3.1 - Fast</option><option>Veo 3.1 - Lite</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Ratio</span>
+                <select class="setting-select"><option>Landscape (16:9)</option><option>Portrait (9:16)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Outputs</span>
+                <select class="setting-select"><option>x1</option><option>x2</option><option>x3</option><option>x4</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Upscale</span>
+                <select class="setting-select"><option>720p</option><option>1080p (Free)</option><option>4K (+50)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Parallel</span>
+                <select class="setting-select"><option>9 slot(s)/account</option></select>
+              </div>
+            </div>
+          </div>
+
+          <div class="prompt-section">
+            <h3>Prompts</h3>
+            <div class="prompt-row">
+              <textarea class="prompt-textarea" placeholder="Paste prompts here, one per line...&#10;&#10;e.g. a cinematic drone shot over a mountain range at golden hour&#10;slow motion waves crashing on a beach at sunset&#10;a cyberpunk city street at night with neon reflections"></textarea>
+            </div>
+          </div>
+
+          <button class="add-queue-btn">＋ Add to Queue</button>
+        </div>
+
+        <!-- ═══ TAB: Video + Ref ═══ -->
+        <div class="tab-content" id="tab-ref">
+          <div class="settings-section">
+            <h3>Video + Reference Settings</h3>
+            <div class="settings-grid">
+              <div class="setting-item">
+                <span class="setting-label">Quality</span>
+                <select class="setting-select"><option>Veo 3.1 - Fast</option><option>Veo 3.1 - Lite</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Ratio</span>
+                <select class="setting-select"><option>Landscape (16:9)</option><option>Portrait (9:16)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Outputs</span>
+                <select class="setting-select"><option>x1</option><option>x2</option><option>x3</option><option>x4</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Upscale</span>
+                <select class="setting-select"><option>720p</option><option>1080p (Free)</option><option>4K (+50)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Parallel</span>
+                <select class="setting-select"><option>9 slot(s)/account</option></select>
+              </div>
+            </div>
+          </div>
+
+          <!-- Reference images uploaded (with thumbnails) -->
+          <div class="ref-uploaded-section">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+              <h3 style="font-size:12px; color:#60A5FA; text-transform:uppercase; letter-spacing:1px; font-weight:600;">Reference Images <span style="color:#64748B; font-weight:400;">(18 images, sorted A-Z)</span></h3>
+              <div style="display:flex; gap:6px;">
+                <button class="ref-action-btn">+ Add More</button>
+                <button class="ref-action-btn danger">Clear All</button>
+              </div>
+            </div>
+            <div class="ref-thumb-grid">
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #1a3a5c, #2d5a87);"></div>
+                <div class="ref-thumb-name">beach_sunset.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d1a3a, #5a2d6b);"></div>
+                <div class="ref-thumb-name">castle_ruins.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #1a3a2d, #2d6b4a);"></div>
+                <div class="ref-thumb-name">city_night.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #3a2d1a, #6b5a2d);"></div>
+                <div class="ref-thumb-name">desert_dunes.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #1a2d3a, #2d4a6b);"></div>
+                <div class="ref-thumb-name">forest_path.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #3a1a2d, #6b2d4a);"></div>
+                <div class="ref-thumb-name">galaxy_nebula.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d3a1a, #4a6b2d);"></div>
+                <div class="ref-thumb-name">harbor_boats.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #1a1a3a, #2d2d6b);"></div>
+                <div class="ref-thumb-name">ice_cave.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #3a3a1a, #6b6b2d);"></div>
+                <div class="ref-thumb-name">jungle_river.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d1a1a, #6b3a3a);"></div>
+                <div class="ref-thumb-name">knight_armor.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #1a3a3a, #2d6b6b);"></div>
+                <div class="ref-thumb-name">lighthouse_fog.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #3a2d2d, #6b4a4a);"></div>
+                <div class="ref-thumb-name">mountain_view.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #1a2d1a, #2d6b2d);"></div>
+                <div class="ref-thumb-name">neon_alley.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d2d3a, #4a4a6b);"></div>
+                <div class="ref-thumb-name">ocean_wave.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #3a1a1a, #6b2d2d);"></div>
+                <div class="ref-thumb-name">palace_gate.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #1a1a2d, #2d2d4a);"></div>
+                <div class="ref-thumb-name">rain_street.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d3a2d, #4a6b4a);"></div>
+                <div class="ref-thumb-name">samurai_dusk.jpg</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+              <div class="ref-thumb-card">
+                <div class="ref-thumb-img" style="background: linear-gradient(135deg, #3a2d3a, #6b4a6b);"></div>
+                <div class="ref-thumb-name">temple_mist.png</div>
+                <button class="ref-thumb-remove">✕</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="prompt-section">
+            <h3>Prompts</h3>
+            <div class="prompt-row">
+              <textarea class="prompt-textarea" placeholder="Paste prompts here, one per line...&#10;&#10;e.g. action scene with dramatic lighting&#10;cinematic slow-motion explosion"></textarea>
+            </div>
+          </div>
+
+          <button class="add-queue-btn">＋ Add to Queue</button>
+        </div>
+
+        <!-- ═══ TAB: Video + Frame ═══ -->
+        <div class="tab-content" id="tab-frame">
+          <div class="settings-section">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+              <h3 style="font-size:12px; color:#60A5FA; text-transform:uppercase; letter-spacing:1px; font-weight:600; margin:0;">Video + Frame Settings</h3>
+              <div class="mode-toggle">
+                <button class="mode-btn" onclick="switchFrameMode('single')">Single</button>
+                <button class="mode-btn active" onclick="switchFrameMode('bulk')">Bulk</button>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <div class="setting-item">
+                <span class="setting-label">Frame Mode</span>
+                <select class="setting-select"><option>Start Only</option><option>Start + End</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Quality</span>
+                <select class="setting-select"><option>Veo 3.1 - Fast</option><option>Veo 3.1 - Lite</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Ratio</span>
+                <select class="setting-select"><option>Landscape (16:9)</option><option>Portrait (9:16)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Outputs</span>
+                <select class="setting-select"><option>x1</option><option>x2</option><option>x3</option><option>x4</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Upscale</span>
+                <select class="setting-select"><option>720p</option><option>1080p (Free)</option><option>4K (+50)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Parallel</span>
+                <select class="setting-select"><option>9 slot(s)/account</option></select>
+              </div>
+            </div>
+          </div>
+
+          <!-- SINGLE MODE (hidden when bulk active) -->
+          <div id="frame-single-mode" style="display:none; flex-direction:column; gap:12px;">
+            <div class="frame-images">
+              <div class="frame-img-box" style="border-style: solid; border-color: #22C55E;">
+                <div class="frame-img-preview" style="background: linear-gradient(135deg, #1a3a5c, #2d5a87);"></div>
+                <div class="frame-label" style="color: #22C55E;">Start Image</div>
+                <div class="ref-thumb-name">warrior_cliff.jpg</div>
+                <div style="display:flex; gap:6px; margin-top:2px;">
+                  <button class="ref-action-btn" style="padding:2px 8px; font-size:10px;">Change</button>
+                  <button class="ref-action-btn danger" style="padding:2px 8px; font-size:10px;">Clear</button>
+                </div>
+              </div>
+              <div class="frame-img-box" style="border-style: solid; border-color: #F59E0B;">
+                <div class="frame-img-preview" style="background: linear-gradient(135deg, #3a2d1a, #6b5a2d);"></div>
+                <div class="frame-label" style="color: #F59E0B;">End Image</div>
+                <div class="ref-thumb-name">warrior_valley.jpg</div>
+                <div style="display:flex; gap:6px; margin-top:2px;">
+                  <button class="ref-action-btn" style="padding:2px 8px; font-size:10px;">Change</button>
+                  <button class="ref-action-btn danger" style="padding:2px 8px; font-size:10px;">Clear</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="prompt-section">
+              <h3>Prompt</h3>
+              <div class="prompt-row">
+                <textarea class="prompt-textarea" placeholder="Paste prompts here, one per line..."></textarea>
+              </div>
+            </div>
+          </div>
+
+          <!-- BULK MODE (shown by default) -->
+          <div id="frame-bulk-mode" style="display:flex; flex-direction:column; gap:12px;">
+            <div class="bulk-panel">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <h3 style="margin:0;">Bulk Images <span class="bulk-count-badge">6 images loaded</span></h3>
+              </div>
+              <div class="bulk-toolbar">
+                <button class="bulk-btn"><span class="btn-icon">📁</span> Browse Folder</button>
+                <button class="bulk-btn"><span class="btn-icon">🖼</span> Browse Images</button>
+                <div style="display:flex; align-items:center; gap:4px;">
+                  <span style="font-size:11px; color:#64748B;">Sort:</span>
+                  <select class="bulk-sort"><option>A-Z</option><option>Z-A</option><option>Time (Old→New)</option><option>Time (New→Old)</option></select>
+                </div>
+                <div style="display:flex; align-items:center; gap:4px;">
+                  <span style="font-size:11px; color:#64748B;">Missing Prompt:</span>
+                  <select class="bulk-missing"><option>Use filename</option><option>Skip image</option><option>Use default</option></select>
+                </div>
+                <button class="ref-action-btn danger" style="margin-left:auto;">Clear All</button>
+              </div>
+              <div style="max-height: 140px; overflow-y: auto; border: 1px solid #334155; border-radius: 6px;">
+                <table class="bulk-image-table">
+                  <thead><tr><th style="width:44px;"></th><th>Filename</th><th>Prompt</th><th style="width:70px;">Status</th></tr></thead>
+                  <tbody>
+                    <tr>
+                      <td><div class="bulk-thumb" style="background: linear-gradient(135deg, #1a3a5c, #2d5a87);"></div></td>
+                      <td class="bulk-filename">beach_sunset.jpg</td>
+                      <td style="color:#CBD5E1; font-size:11px;">waves crashing on golden beach at sunset</td>
+                      <td><span class="bulk-prompt-status found">Found</span></td>
+                    </tr>
+                    <tr>
+                      <td><div class="bulk-thumb" style="background: linear-gradient(135deg, #2d1a3a, #5a2d6b);"></div></td>
+                      <td class="bulk-filename">city_night.png</td>
+                      <td style="color:#CBD5E1; font-size:11px;">neon lights flickering in rainy cyberpunk city</td>
+                      <td><span class="bulk-prompt-status found">Found</span></td>
+                    </tr>
+                    <tr>
+                      <td><div class="bulk-thumb" style="background: linear-gradient(135deg, #1a3a2d, #2d6b4a);"></div></td>
+                      <td class="bulk-filename">forest_path.jpg</td>
+                      <td style="color:#CBD5E1; font-size:11px;">morning fog drifting through ancient forest</td>
+                      <td><span class="bulk-prompt-status found">Found</span></td>
+                    </tr>
+                    <tr>
+                      <td><div class="bulk-thumb" style="background: linear-gradient(135deg, #3a2d1a, #6b5a2d);"></div></td>
+                      <td class="bulk-filename">mountain_view.jpg</td>
+                      <td style="color:#64748B; font-style:italic; font-size:11px;">(will use filename)</td>
+                      <td><span class="bulk-prompt-status missing">Missing</span></td>
+                    </tr>
+                    <tr>
+                      <td><div class="bulk-thumb" style="background: linear-gradient(135deg, #1a2d3a, #2d4a6b);"></div></td>
+                      <td class="bulk-filename">ocean_wave.png</td>
+                      <td style="color:#CBD5E1; font-size:11px;">huge wave curling with surfer silhouette</td>
+                      <td><span class="bulk-prompt-status found">Found</span></td>
+                    </tr>
+                    <tr>
+                      <td><div class="bulk-thumb" style="background: linear-gradient(135deg, #3a1a2d, #6b2d4a);"></div></td>
+                      <td class="bulk-filename">volcano_night.jpg</td>
+                      <td style="color:#CBD5E1; font-size:11px;">lava flowing down volcano under starry sky</td>
+                      <td><span class="bulk-prompt-status found">Found</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="prompt-section" style="flex: 1;">
+              <h3>Prompts <span style="color:#64748B; font-weight:400; font-size:10px;">(one per line, paired with images by order)</span></h3>
+              <div class="prompt-row">
+                <textarea class="prompt-textarea" placeholder="Paste prompts here, one per line — paired with images by sort order...&#10;&#10;waves crashing on golden beach at sunset&#10;neon lights flickering in rainy cyberpunk city&#10;morning fog drifting through ancient forest">waves crashing on golden beach at sunset
+neon lights flickering in rainy cyberpunk city
+morning fog drifting through ancient forest
+
+huge wave curling with surfer silhouette
+lava flowing down volcano under starry sky</textarea>
+              </div>
+            </div>
+          </div>
+
+          <button class="add-queue-btn">＋ Add to Queue</button>
+        </div>
+
+        <!-- ═══ TAB: Image → Video (Pipeline) ═══ -->
+        <div class="tab-content" id="tab-pipeline">
+          <div class="settings-section">
+            <h3>Step 1 — Image Generation</h3>
+            <div class="settings-grid">
+              <div class="setting-item">
+                <span class="setting-label">Image Model</span>
+                <select class="setting-select"><option>Imagen 4</option><option>Nano Banana Pro</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Image Ratio</span>
+                <select class="setting-select"><option>Landscape (16:9)</option><option>Standard (4:3)</option><option>Portrait (9:16)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">References</span>
+                <select class="setting-select"><option>None</option><option>+ Add Ref</option></select>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <h3>Step 2 — Video Generation</h3>
+            <div class="settings-grid">
+              <div class="setting-item">
+                <span class="setting-label">Video Mode</span>
+                <select class="setting-select"><option>Ingredients (Reference)</option><option>Frames - Start</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Quality</span>
+                <select class="setting-select"><option>Veo 3.1 - Fast</option><option>Veo 3.1 - Lite</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Video Ratio</span>
+                <select class="setting-select"><option>Landscape (16:9)</option><option>Portrait (9:16)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Upscale</span>
+                <select class="setting-select"><option>720p</option><option>1080p (Free)</option><option>4K (+50)</option></select>
+              </div>
+              <div class="setting-item">
+                <span class="setting-label">Parallel</span>
+                <select class="setting-select"><option>9 slot(s)/account</option></select>
+              </div>
+            </div>
+          </div>
+
+          <div class="prompt-section">
+            <h3>Prompts — Image (left) &amp; Video (right)</h3>
+            <div class="prompt-row">
+              <div style="flex:1; display:flex; flex-direction:column; gap:4px;">
+                <span class="setting-label" style="font-size:11px; color:#60A5FA;">Image Prompts (one per line)</span>
+                <textarea class="prompt-textarea" placeholder="a warrior standing on cliff edge&#10;neon cyberpunk city at night&#10;underwater coral reef scene"></textarea>
+              </div>
+              <div style="flex:1; display:flex; flex-direction:column; gap:4px;">
+                <span class="setting-label" style="font-size:11px; color:#A78BFA;">Video Prompts (matching each line)</span>
+                <textarea class="prompt-textarea" placeholder="camera slowly zooms in, wind blowing&#10;cars driving, rain falling, cinematic&#10;fish swimming, bubbles rising slowly" style="border-color:#4C1D95;"></textarea>
+              </div>
+            </div>
+            <div style="font-size:10px; color:#475569; margin-top:2px;">Line 1 image prompt → Line 1 video prompt. Empty video line = default "animate"</div>
+          </div>
+
+          <button class="add-queue-btn">＋ Add to Queue</button>
+        </div>
+
+      </div>
+
+      <!-- Right Panel -->
+      <div class="right-panel">
+        <!-- Task Queue -->
+        <div class="task-queue">
+          <h3>
+            Task Queue
+            <div class="queue-clear-btns">
+              <button>🗑 Clear Queue</button>
+              <button>✓ Clear Done</button>
+            </div>
+          </h3>
+          <div class="queue-table">
+            <table>
+              <thead><tr><th>#</th><th>Prompt</th><th>Type</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>action scene...</td><td>Video</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>2</td><td>cinematic drone...</td><td>Video</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>3</td><td>sunset timelapse...</td><td>Video</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>4</td><td>car chase scene...</td><td>Video</td><td><span class="status-running">RUNNING</span></td></tr>
+                <tr><td>5</td><td>underwater reef...</td><td>Video</td><td><span class="status-pending">PENDING</span></td></tr>
+                <tr><td>6</td><td>neon city night...</td><td>Video</td><td><span class="status-pending">PENDING</span></td></tr>
+                <tr><td>7</td><td>snow mountain...</td><td>Video</td><td><span class="status-pending">PENDING</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Logs -->
+        <div class="logs-box">
+          <div class="logs-header">
+            <h3>Live Logs</h3>
+            <button>Clear</button>
+          </div>
+          <div class="logs-content">
+            <div class="log-line"><span class="blue">[ExtMode]</span> Extension connected!</div>
+            <div class="log-line"><span class="blue">[Bridge]</span> 1 account(s): mega...@gmail.com</div>
+            <div class="log-line"><span class="green">[e1]</span> Job 948350...: action scene</div>
+            <div class="log-line"><span class="yellow">[e1]</span> Video generating... (poll 3)</div>
+            <div class="log-line"><span class="green">[CREDITS]</span> Remaining: 280</div>
+            <div class="log-line"><span class="green">[e1]</span> Video complete (poll 5)</div>
+            <div class="log-line"><span class="green">[e1]</span> Saved: 1.mp4 (5.0 MB)</div>
+            <div class="log-line"><span class="green">[e1]</span> Job completed!</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div>
+
+<script>
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  if(el) el.classList.add('active');
+  else if(event && event.target) event.target.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+}
+function switchFrameMode(mode) {
+  var btns = document.querySelectorAll('#tab-frame .mode-btn');
+  btns.forEach(function(b){ b.classList.remove('active'); });
+  if(mode === 'single') btns[0].classList.add('active');
+  else btns[1].classList.add('active');
+  document.getElementById('frame-single-mode').style.display = mode === 'single' ? 'flex' : 'none';
+  document.getElementById('frame-bulk-mode').style.display = mode === 'bulk' ? 'flex' : 'none';
+}
+</script>
+</body>
+</html>

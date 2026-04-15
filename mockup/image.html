@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1280, initial-scale=1">
+<title>Image Generation - Layout Mockup</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0F172A; color: #E2E8F0; font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
+
+  .page { display: flex; height: 100vh; }
+
+  /* Sidebar */
+  .sidebar { width: 160px; background: #0B1120; display: flex; flex-direction: column; border-right: 1px solid #1E293B; flex-shrink: 0; }
+  .sidebar-title { padding: 18px 16px 2px; font-size: 18px; font-weight: 800; color: #F8FAFC; line-height: 1.15; }
+  .sidebar-byline { padding: 0 16px 14px; font-size: 10px; color: #64748B; font-style: italic; letter-spacing: 1px; }
+  .sidebar-nav { flex: 1; padding: 8px 0; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 18px; color: #94A3B8; font-size: 13px; cursor: pointer; border-left: 3px solid transparent; }
+  .nav-item:hover { background: #1E293B; color: #E2E8F0; }
+  .nav-item.active { color: #60A5FA; border-left-color: #60A5FA; background: rgba(96,165,250,0.08); }
+  .nav-icon { width: 18px; text-align: center; font-size: 14px; }
+  .sidebar-stats { padding: 12px 16px; border-top: 1px solid #1E293B; }
+  .sidebar-stats h4 { font-size: 10px; color: #64748B; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; font-size: 12px; }
+  .stat-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .stat-dot.pending { background: #F59E0B; }
+  .stat-dot.running { background: #3B82F6; }
+  .stat-dot.done { background: #22C55E; }
+  .stat-dot.failed { background: #EF4444; }
+
+  /* Main content */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Top bar */
+  .topbar { display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: #0F172A; border-bottom: 1px solid #1E293B; flex-shrink: 0; }
+  .topbar-badge { background: #1E293B; padding: 5px 14px; border-radius: 6px; font-size: 12px; color: #94A3B8; }
+  .topbar-badge b { color: #E2E8F0; }
+  .topbar-spacer { flex: 1; }
+  .btn-start { background: #2563EB; color: white; border: none; padding: 8px 20px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+  .btn-pause { background: #1E293B; color: #94A3B8; border: 1px solid #334155; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  .btn-stop { background: #DC2626; color: white; border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+
+  /* Progress bar */
+  .progress-wrap { padding: 6px 20px; flex-shrink: 0; }
+  .progress-bar { height: 6px; background: #1E293B; border-radius: 3px; overflow: hidden; }
+  .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #22C55E, #4ADE80); border-radius: 3px; }
+
+  /* Content area — 2 columns */
+  .content { flex: 1; display: flex; gap: 16px; padding: 16px 20px; overflow: hidden; }
+
+  /* Left: Settings + Prompt */
+  .left-panel { flex: 1; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
+
+  /* Settings grid */
+  .settings-section { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex-shrink: 0; }
+  .settings-section h3 { font-size: 12px; color: #22C55E; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; font-weight: 600; }
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px 14px; }
+  .setting-item { display: flex; flex-direction: column; gap: 3px; }
+  .setting-label { font-size: 11px; color: #64748B; font-weight: 500; }
+  .setting-select { background: #0F172A; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; color: #E2E8F0; font-size: 12px; appearance: none; cursor: pointer; }
+
+  /* Prompt + Images area */
+  .prompt-section { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex: 1; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .prompt-section h3 { font-size: 12px; color: #22C55E; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; flex-shrink: 0; }
+  .prompt-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
+  .prompt-textarea { flex: 1; background: #0F172A; border: 1px solid #334155; border-radius: 8px; padding: 10px; color: #E2E8F0; font-size: 13px; resize: none; font-family: inherit; }
+  .prompt-textarea::placeholder { color: #475569; }
+
+  /* Add to queue button */
+  .add-queue-btn { background: linear-gradient(135deg, #16A34A, #22C55E); color: white; border: none; padding: 12px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; flex-shrink: 0; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .add-queue-btn:hover { background: linear-gradient(135deg, #15803D, #16A34A); }
+
+  /* Right: Logs + Task Queue */
+  .right-panel { width: 380px; display: flex; flex-direction: column; gap: 12px; flex-shrink: 0; }
+
+  /* Task Queue */
+  .task-queue { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .task-queue h3 { font-size: 12px; color: #22C55E; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+  .queue-clear-btns { display: flex; gap: 6px; }
+  .queue-clear-btns button { background: transparent; border: 1px solid #334155; color: #94A3B8; padding: 3px 10px; border-radius: 4px; font-size: 10px; cursor: pointer; }
+  .queue-table { flex: 1; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { text-align: left; color: #64748B; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid #334155; position: sticky; top: 0; background: #1E293B; }
+  td { padding: 6px 8px; border-bottom: 1px solid rgba(51,65,85,0.4); color: #CBD5E1; }
+  tr:hover td { background: rgba(34,197,94,0.05); }
+  .status-done { color: #22C55E; font-weight: 600; font-size: 10px; }
+  .status-running { color: #3B82F6; font-weight: 600; font-size: 10px; }
+  .status-pending { color: #F59E0B; font-weight: 600; font-size: 10px; }
+
+  /* Logs box */
+  .logs-box { background: #0B1120; border: 1px solid #1E293B; border-radius: 10px; height: 200px; display: flex; flex-direction: column; flex-shrink: 0; }
+  .logs-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; border-bottom: 1px solid #1E293B; flex-shrink: 0; }
+  .logs-header h3 { font-size: 12px; color: #94A3B8; font-weight: 600; }
+  .logs-header button { background: transparent; border: 1px solid #334155; color: #64748B; padding: 2px 10px; border-radius: 4px; font-size: 10px; cursor: pointer; }
+  .logs-content { flex: 1; padding: 8px 14px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; color: #64748B; line-height: 1.6; }
+  .log-line { white-space: nowrap; }
+  .log-line .green { color: #22C55E; }
+  .log-line .blue { color: #60A5FA; }
+  .log-line .yellow { color: #F59E0B; }
+
+  /* Reference thumbnail grid */
+  .ref-uploaded-section { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex-shrink: 0; }
+  .ref-thumb-grid { display: flex; gap: 8px; flex-wrap: wrap; max-height: 150px; overflow-y: auto; padding: 4px 2px; }
+  .ref-thumb-card { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; background: #0F172A; border: 1px solid #334155; border-radius: 8px; padding: 6px; width: 80px; }
+  .ref-thumb-card:hover { border-color: #22C55E; }
+  .ref-thumb-img { width: 64px; height: 48px; border-radius: 4px; background-size: cover; background-position: center; }
+  .ref-thumb-name { font-size: 9px; color: #94A3B8; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+  .ref-thumb-remove { position: absolute; top: 2px; right: 2px; background: rgba(239,68,68,0.8); border: none; color: white; width: 16px; height: 16px; border-radius: 50%; font-size: 9px; cursor: pointer; display: none; line-height: 16px; padding: 0; }
+  .ref-thumb-card:hover .ref-thumb-remove { display: block; }
+  .ref-action-btn { background: transparent; border: 1px solid #334155; color: #94A3B8; padding: 4px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .ref-action-btn:hover { border-color: #22C55E; color: #22C55E; }
+  .ref-action-btn.danger { color: #EF4444; border-color: #7F1D1D; }
+  .ref-action-btn.danger:hover { border-color: #EF4444; }
+
+  /* Image preview grid (generated outputs) */
+  .output-preview-section { background: #1E293B; border-radius: 10px; padding: 14px 16px; flex-shrink: 0; }
+  .output-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .output-thumb { width: 100%; aspect-ratio: 16/9; border-radius: 6px; background-size: cover; background-position: center; border: 1px solid #334155; cursor: pointer; position: relative; }
+  .output-thumb:hover { border-color: #22C55E; }
+  .output-thumb .dl-btn { position: absolute; bottom: 4px; right: 4px; background: rgba(0,0,0,0.7); border: none; color: white; padding: 2px 6px; border-radius: 3px; font-size: 9px; cursor: pointer; display: none; }
+  .output-thumb:hover .dl-btn { display: block; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-title">G-Labs<br>Automation</div>
+    <div class="sidebar-byline">by MegaShoeb</div>
+    <div class="sidebar-nav">
+      <div class="nav-item active"><span class="nav-icon">🖼</span> Image Generation</div>
+      <div class="nav-item"><span class="nav-icon">🎬</span> Video Generation</div>
+      <div class="nav-item"><span class="nav-icon">👥</span> Account Manager</div>
+      <div class="nav-item"><span class="nav-icon">▶</span> Live Generation</div>
+      <div class="nav-item"><span class="nav-icon">↩</span> Failed Jobs</div>
+      <div class="nav-item"><span class="nav-icon">⚙</span> Settings</div>
+    </div>
+    <div class="sidebar-stats">
+      <h4>Queue Stats</h4>
+      <div class="stat-row"><span><span class="stat-dot pending"></span>Pending</span> <b>8</b></div>
+      <div class="stat-row"><span><span class="stat-dot running"></span>Running</span> <b style="color:#3B82F6">4</b></div>
+      <div class="stat-row"><span><span class="stat-dot done"></span>Done</span> <b style="color:#22C55E">23</b></div>
+      <div class="stat-row"><span><span class="stat-dot failed"></span>Failed</span> <b style="color:#EF4444">1</b></div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <!-- Top bar -->
+    <div class="topbar">
+      <div class="topbar-badge">Mode: <b>Image</b></div>
+      <div class="topbar-badge">Parallel: <b>9/account</b></div>
+      <div class="topbar-badge">Queue: <b>RUNNING</b></div>
+      <div class="topbar-badge">Session: 23 images generated</div>
+      <div class="topbar-spacer"></div>
+      <button class="btn-start" style="background:#1E293B; color:#64748B; border:1px solid #334155;">▶ Running...</button>
+      <button class="btn-pause">Pause</button>
+      <button class="btn-stop">Stop</button>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-wrap">
+      <div class="progress-bar"><div class="progress-fill" style="width: 72%"></div></div>
+    </div>
+
+    <!-- Content -->
+    <div class="content">
+      <!-- Left Panel -->
+      <div class="left-panel">
+
+        <!-- Settings -->
+        <div class="settings-section">
+          <h3>Image Generation Settings</h3>
+          <div class="settings-grid">
+            <div class="setting-item">
+              <span class="setting-label">Model</span>
+              <select class="setting-select">
+                <option>Imagen 4</option>
+                <option>Nano Banana Pro</option>
+                <option selected>Nano Banana 2</option>
+              </select>
+            </div>
+            <div class="setting-item">
+              <span class="setting-label">Ratio</span>
+              <select class="setting-select">
+                <option selected>Landscape (16:9)</option>
+                <option>Standard (4:3)</option>
+                <option>Square (1:1)</option>
+                <option>Portrait (3:4)</option>
+                <option>Tall Portrait (9:16)</option>
+              </select>
+            </div>
+            <div class="setting-item">
+              <span class="setting-label">Outputs</span>
+              <select class="setting-select">
+                <option>x1</option>
+                <option>x2</option>
+                <option>x3</option>
+                <option selected>x4</option>
+              </select>
+            </div>
+            <div class="setting-item">
+              <span class="setting-label">Parallel</span>
+              <select class="setting-select"><option>9 slot(s)/account</option></select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Reference Images (with thumbnails) -->
+        <div class="ref-uploaded-section">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <h3 style="font-size:12px; color:#22C55E; text-transform:uppercase; letter-spacing:1px; font-weight:600;">Reference Images <span style="color:#64748B; font-weight:400;">(6 images, sorted A-Z)</span></h3>
+            <div style="display:flex; gap:6px;">
+              <button class="ref-action-btn">+ Add More</button>
+              <button class="ref-action-btn danger">Clear All</button>
+            </div>
+          </div>
+          <div class="ref-thumb-grid">
+            <div class="ref-thumb-card">
+              <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d5a87, #1a3a5c);"></div>
+              <div class="ref-thumb-name">anime_girl.png</div>
+              <button class="ref-thumb-remove">✕</button>
+            </div>
+            <div class="ref-thumb-card">
+              <div class="ref-thumb-img" style="background: linear-gradient(135deg, #5a2d6b, #2d1a3a);"></div>
+              <div class="ref-thumb-name">character_ref.jpg</div>
+              <button class="ref-thumb-remove">✕</button>
+            </div>
+            <div class="ref-thumb-card">
+              <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d6b4a, #1a3a2d);"></div>
+              <div class="ref-thumb-name">dragon_art.png</div>
+              <button class="ref-thumb-remove">✕</button>
+            </div>
+            <div class="ref-thumb-card">
+              <div class="ref-thumb-img" style="background: linear-gradient(135deg, #6b5a2d, #3a2d1a);"></div>
+              <div class="ref-thumb-name">landscape_01.jpg</div>
+              <button class="ref-thumb-remove">✕</button>
+            </div>
+            <div class="ref-thumb-card">
+              <div class="ref-thumb-img" style="background: linear-gradient(135deg, #2d4a6b, #1a2d3a);"></div>
+              <div class="ref-thumb-name">mech_robot.png</div>
+              <button class="ref-thumb-remove">✕</button>
+            </div>
+            <div class="ref-thumb-card">
+              <div class="ref-thumb-img" style="background: linear-gradient(135deg, #6b2d4a, #3a1a2d);"></div>
+              <div class="ref-thumb-name">style_ref.jpg</div>
+              <button class="ref-thumb-remove">✕</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Prompts -->
+        <div class="prompt-section">
+          <h3>Prompts</h3>
+          <div class="prompt-row">
+            <textarea class="prompt-textarea" placeholder="Paste prompts here, one per line...&#10;&#10;e.g. a majestic dragon soaring over mountains at sunset&#10;cyberpunk city street with neon signs and rain reflections&#10;portrait of a warrior queen in golden armor, oil painting style"></textarea>
+          </div>
+        </div>
+
+        <button class="add-queue-btn">＋ Add to Queue</button>
+
+      </div>
+
+      <!-- Right Panel -->
+      <div class="right-panel">
+        <!-- Task Queue -->
+        <div class="task-queue">
+          <h3>
+            Task Queue
+            <div class="queue-clear-btns">
+              <button>🗑 Clear Queue</button>
+              <button>✓ Clear Done</button>
+            </div>
+          </h3>
+          <div class="queue-table">
+            <table>
+              <thead><tr><th>#</th><th>Prompt</th><th>Model</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>dragon soaring over...</td><td>Imagen4</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>2</td><td>cyberpunk city neon...</td><td>Imagen4</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>3</td><td>warrior queen golden...</td><td>Imagen4</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>4</td><td>enchanted forest...</td><td>NanoPro</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>5</td><td>space station orbit...</td><td>Imagen4</td><td><span class="status-done">DONE</span></td></tr>
+                <tr><td>6</td><td>underwater temple...</td><td>NanoPro</td><td><span class="status-running">RUNNING</span></td></tr>
+                <tr><td>7</td><td>samurai in cherry...</td><td>Imagen4</td><td><span class="status-running">RUNNING</span></td></tr>
+                <tr><td>8</td><td>steampunk airship...</td><td>Imagen4</td><td><span class="status-running">RUNNING</span></td></tr>
+                <tr><td>9</td><td>crystal cavern glow...</td><td>NanoPro</td><td><span class="status-running">RUNNING</span></td></tr>
+                <tr><td>10</td><td>phoenix rising from...</td><td>Imagen4</td><td><span class="status-pending">PENDING</span></td></tr>
+                <tr><td>11</td><td>ancient library with...</td><td>Imagen4</td><td><span class="status-pending">PENDING</span></td></tr>
+                <tr><td>12</td><td>floating islands in...</td><td>NanoPro</td><td><span class="status-pending">PENDING</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Logs -->
+        <div class="logs-box">
+          <div class="logs-header">
+            <h3>Live Logs</h3>
+            <button>Clear</button>
+          </div>
+          <div class="logs-content">
+            <div class="log-line"><span class="blue">[ExtMode]</span> Extension connected!</div>
+            <div class="log-line"><span class="blue">[Bridge]</span> 2 account(s) active</div>
+            <div class="log-line"><span class="green">[e1]</span> Job 834120...: dragon soaring over</div>
+            <div class="log-line"><span class="green">[e1]</span> Image generated (4 outputs)</div>
+            <div class="log-line"><span class="green">[e1]</span> Saved: dragon_001.png (2.1 MB)</div>
+            <div class="log-line"><span class="green">[e2]</span> Job 834121...: cyberpunk city neon</div>
+            <div class="log-line"><span class="yellow">[e2]</span> Generating... (poll 2)</div>
+            <div class="log-line"><span class="green">[e2]</span> Image generated (4 outputs)</div>
+            <div class="log-line"><span class="green">[CREDITS]</span> Remaining: 450</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

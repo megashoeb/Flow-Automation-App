@@ -3,7 +3,7 @@ from PySide6.QtGui import QColor
 
 
 class QueueTableModel(QAbstractTableModel):
-    HEADERS = ["No.", "Prompt", "Type", "Model", "Account", "Status", "Progress"]
+    HEADERS = ["#", "Prompt", "Type", "Status"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -33,66 +33,77 @@ class QueueTableModel(QAbstractTableModel):
         status = str(job.get("status") or "").strip().lower()
 
         if role == Qt.DisplayRole:
-            if col == 0:
-                # For retried jobs, show the ORIGINAL output_index (preserved
-                # across retry) instead of the new negative queue_no that was
-                # used to push the job to the top of the queue. This matches
-                # bot_engine's file-naming logic (which reads output_index
-                # first, falling back to queue_no).
+            if col == 0:  # #
                 if job.get("is_retry"):
                     display_no = job.get("output_index") or job.get("queue_no")
                 else:
                     display_no = job.get("queue_no")
                 return str(display_no or index.row() + 1)
-            if col == 1:
+            if col == 1:  # Prompt
                 prompt = str(job.get("prompt") or "")
-                return (prompt[:80] + "...") if len(prompt) > 80 else prompt
-            if col == 2:
+                return (prompt[:60] + "...") if len(prompt) > 60 else prompt
+            if col == 2:  # Type
                 return str(job.get("job_type_display") or "")
-            if col == 3:
-                return str(job.get("model_display") or "")
-            if col == 4:
-                return str(job.get("account") or "")
-            if col == 5:
-                return status.upper()
-            if col == 6:
-                return str(job.get("progress") or "")
+            if col == 3:  # Status — short labels
+                return {
+                    "pending": "PENDING",
+                    "running": "RUN",
+                    "completed": "DONE",
+                    "failed": "FAIL",
+                    "moderated": "MOD",
+                }.get(status, status.upper())
 
         if role == Qt.ToolTipRole:
             if col == 1:
-                return str(job.get("prompt") or "")
+                # Full prompt + model + account in tooltip
+                parts = [str(job.get("prompt") or "")]
+                model = str(job.get("model_display") or "")
+                account = str(job.get("account") or "")
+                progress = str(job.get("progress") or "")
+                if model:
+                    parts.append(f"Model: {model}")
+                if account:
+                    parts.append(f"Account: {account}")
+                if progress:
+                    parts.append(f"Progress: {progress}")
+                return "\n".join(parts)
             if col == 3:
-                return str(job.get("model_display") or "")
-            if col == 4:
-                return str(job.get("account") or "")
-            if col == 5:
-                return status.upper()
-            if col == 6:
-                return str(job.get("progress") or "")
+                progress = str(job.get("progress") or "")
+                return f"{status.upper()} {progress}" if progress else status.upper()
 
-        if role == Qt.TextAlignmentRole and col in (0, 2, 5, 6):
+        if role == Qt.TextAlignmentRole and col in (0, 2, 3):
             return int(Qt.AlignCenter)
 
+        if role == Qt.FontRole:
+            if col == 3:
+                from PySide6.QtGui import QFont
+                f = QFont()
+                f.setBold(True)
+                f.setPointSize(8)
+                return f
+
         if role == Qt.ForegroundRole:
-            if col == 5:
+            if col == 3:
                 return {
-                    "pending": QColor("#94A3B8"),
+                    "pending": QColor("#F59E0B"),
                     "running": QColor("#3B82F6"),
                     "completed": QColor("#22C55E"),
                     "failed": QColor("#EF4444"),
                     "moderated": QColor("#F59E0B"),
                 }.get(status, QColor("#F8FAFC"))
-            return QColor("#F8FAFC")
+            if col == 2:
+                return QColor("#94A3B8")
+            return QColor("#CBD5E1")
 
         if role == Qt.BackgroundRole:
-            if col == 5:
+            if col == 3:
                 return {
-                    "pending": QColor("#1D2535"),
-                    "running": QColor("#1A2744"),
-                    "completed": QColor("#132432"),
-                    "failed": QColor("#1F1A2A"),
-                    "moderated": QColor("#1C1E2A"),
-                }.get(status, QColor("#1D2535"))
+                    "pending": QColor(245, 158, 11, 25),
+                    "running": QColor(59, 130, 246, 30),
+                    "completed": QColor(34, 197, 94, 25),
+                    "failed": QColor(239, 68, 68, 30),
+                    "moderated": QColor(245, 158, 11, 25),
+                }.get(status)
             if job.get("is_retry"):
                 return QColor("#1A2744")
 

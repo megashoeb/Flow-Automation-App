@@ -925,16 +925,50 @@ class LogBuffer(QObject):
         if self.text_edit is not None:
             self.text_edit.clear()
 
+    @staticmethod
+    def _colorize_line(line):
+        """Apply color to log line based on content keywords."""
+        import html as _html
+        escaped = _html.escape(line)
+        # Determine line color based on keywords
+        low = line.lower()
+        if any(k in low for k in ("failed", "error", "exception", "traceback", "❌")):
+            color = "#EF4444"  # red
+        elif any(k in low for k in ("warning", "warn", "⚠")):
+            color = "#F59E0B"  # yellow
+        elif any(k in low for k in ("completed", "saved:", "done", "success", "✓", "✅")):
+            color = "#22C55E"  # green
+        elif any(k in low for k in ("[credits]", "remaining:", "estimated cost")):
+            color = "#22C55E"  # green
+        elif any(k in low for k in ("generating", "poll", "running", "uploading")):
+            color = "#60A5FA"  # blue
+        elif any(k in low for k in ("[bridge]", "[extmode]", "extension", "connected")):
+            color = "#60A5FA"  # blue
+        elif any(k in low for k in ("stopped", "stopping", "cancelled")):
+            color = "#F59E0B"  # yellow
+        else:
+            color = "#94A3B8"  # default grey
+        # Highlight bracketed tags like [e1], [Bridge], [CREDITS] etc.
+        import re
+        def _highlight_tag(m):
+            tag = _html.escape(m.group(0))
+            return f'<span style="color:#60A5FA;font-weight:600;">{tag}</span>'
+        escaped = re.sub(r'\[[^\]]{1,20}\]', _highlight_tag, escaped)
+        return f'<span style="color:{color};">{escaped}</span>'
+
     def flush(self):
         if not self._pending or self.text_edit is None:
             return
-        payload = "\n".join(self._pending)
-        self._pending.clear()
+        lines = self._pending
+        self._pending = []
+        html_lines = [self._colorize_line(l) for l in lines]
+        html_payload = "<br>".join(html_lines)
         cursor = self.text_edit.textCursor()
         cursor.movePosition(QTextCursor.End)
-        if self.text_edit.document().blockCount() > 0:
-            cursor.insertText("\n")
-        cursor.insertText(payload)
+        if self.text_edit.document().blockCount() > 1:
+            cursor.insertHtml("<br>" + html_payload)
+        else:
+            cursor.insertHtml(html_payload)
         self.text_edit.setTextCursor(cursor)
         scrollbar = self.text_edit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -1855,15 +1889,18 @@ class MainWindow(QMainWindow):
         hero = QFrame()
         hero.setObjectName("dashboardTopBar")
         hero_layout = QHBoxLayout(hero)
-        hero_layout.setContentsMargins(14, 10, 14, 10)
-        hero_layout.setSpacing(12)
+        hero_layout.setContentsMargins(12, 6, 12, 6)
+        hero_layout.setSpacing(10)
 
+        # Hidden hero text (kept for compatibility but not shown in new layout)
         hero_text_layout = QVBoxLayout()
-        hero_text_layout.setSpacing(2)
-        self.lbl_hero_title = QLabel("G-Labs Automation Studio")
+        hero_text_layout.setSpacing(0)
+        self.lbl_hero_title = QLabel("")
         self.lbl_hero_title.setObjectName("heroTitle")
-        self.lbl_hero_subtitle = QLabel("Compact generation workspace")
+        self.lbl_hero_title.setVisible(False)
+        self.lbl_hero_subtitle = QLabel("")
         self.lbl_hero_subtitle.setObjectName("heroSubtitle")
+        self.lbl_hero_subtitle.setVisible(False)
         hero_text_layout.addWidget(self.lbl_hero_title)
         hero_text_layout.addWidget(self.lbl_hero_subtitle)
 
@@ -1892,9 +1929,10 @@ class MainWindow(QMainWindow):
         self.toolbar_actions_layout.setContentsMargins(0, 0, 0, 0)
         self.toolbar_actions_layout.setSpacing(8)
 
-        hero_layout.addLayout(hero_text_layout, stretch=1)
-        hero_layout.addWidget(hero_meta_wrap, 0, Qt.AlignRight)
-        hero_layout.addWidget(self.toolbar_actions_host, 0, Qt.AlignRight)
+        hero_layout.addLayout(hero_text_layout, stretch=0)
+        hero_layout.addWidget(hero_meta_wrap, 0)
+        hero_layout.addStretch(1)
+        hero_layout.addWidget(self.toolbar_actions_host, 0)
         layout.addWidget(hero)
         self._apply_card_shadow(hero, blur=28, y_offset=8)
 
@@ -1978,23 +2016,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(stats_frame)
         self.progress_widget = QWidget()
         progress_layout = QHBoxLayout(self.progress_widget)
-        progress_layout.setContentsMargins(0, 2, 0, 2)
-        progress_layout.setSpacing(10)
+        progress_layout.setContentsMargins(0, 0, 0, 2)
+        progress_layout.setSpacing(8)
         self.overall_progress = QProgressBar()
         self.overall_progress.setRange(0, 100)
         self.overall_progress.setValue(0)
-        self.overall_progress.setFixedHeight(18)
+        self.overall_progress.setFixedHeight(6)
+        self.overall_progress.setTextVisible(False)
         self.overall_progress.setStyleSheet(
-            "QProgressBar { border: 1px solid #334155; border-radius: 4px; background-color: #1E293B; "
-            "text-align: center; color: white; font-size: 12px; font-weight: 600; } "
-            "QProgressBar::chunk { background-color: #2563EB; border-radius: 3px; }"
+            "QProgressBar { border: none; border-radius: 3px; background-color: #1E293B; } "
+            "QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, "
+            "stop:0 #2563EB, stop:1 #60A5FA); border-radius: 3px; }"
         )
         self.lbl_progress_text = QLabel("0/0 (0%)")
-        self.lbl_progress_text.setStyleSheet("color: #94A3B8; font-size: 11px; min-width: 92px;")
+        self.lbl_progress_text.setStyleSheet("color: #94A3B8; font-size: 10px; min-width: 80px;")
         self.lbl_speed = QLabel("Speed: --")
-        self.lbl_speed.setStyleSheet("color: #60A5FA; font-size: 11px; min-width: 100px;")
+        self.lbl_speed.setStyleSheet("color: #60A5FA; font-size: 10px; min-width: 90px;")
         self.lbl_eta = QLabel("ETA: --")
-        self.lbl_eta.setStyleSheet("color: #F59E0B; font-size: 11px; min-width: 90px;")
+        self.lbl_eta.setStyleSheet("color: #F59E0B; font-size: 10px; min-width: 80px;")
         progress_layout.addWidget(self.overall_progress, 1)
         progress_layout.addWidget(self.lbl_progress_text)
         progress_layout.addWidget(self.lbl_speed)
@@ -2014,7 +2053,7 @@ class MainWindow(QMainWindow):
         self.mode_tabs.setObjectName("modeTabs")
         self.mode_tabs.setDocumentMode(True)
         self.mode_tabs.tabBar().setDrawBase(False)
-        self.mode_tabs.setMinimumHeight(180)
+        self.mode_tabs.setMinimumHeight(120)
         self.mode_tabs.setMaximumHeight(16777215)
         self.mode_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
@@ -2038,16 +2077,18 @@ class MainWindow(QMainWindow):
         self._remove_stray_mode_tab_buttons()
         self._adjust_mode_tabs_height()
 
-        self.prompts_group = QGroupBox("Prompts Input")
+        self.prompts_group = QGroupBox("")
         self.prompts_group.setObjectName("dashboardPanel")
         prompts_layout = QVBoxLayout(self.prompts_group)
-        prompts_layout.setContentsMargins(12, 12, 12, 12)
-        prompts_layout.setSpacing(8)
+        prompts_layout.setContentsMargins(10, 8, 10, 8)
+        prompts_layout.setSpacing(6)
         prompts_header = QHBoxLayout()
         prompts_header.setContentsMargins(0, 0, 0, 0)
         prompts_header.setSpacing(8)
-        self.lbl_prompts_title = QLabel("Enter Prompts")
-        self.lbl_prompts_title.setStyleSheet("color: #F8FAFC; font-size: 12px; font-weight: 700;")
+        self.lbl_prompts_title = QLabel("PROMPTS")
+        self.lbl_prompts_title.setStyleSheet(
+            "color: #60A5FA; font-size: 11px; font-weight: 700; letter-spacing: 1px;"
+        )
         self.btn_import_txt = QPushButton("Import TXT")
         self.btn_import_txt.setFixedHeight(26)
         self.btn_import_txt.setStyleSheet(
@@ -2109,16 +2150,18 @@ class MainWindow(QMainWindow):
         self._apply_card_shadow(self.prompts_group, blur=24, y_offset=8)
         self.prompts_input_widget = self.prompts_group
 
-        queue_group = QGroupBox("Task Queue")
+        queue_group = QGroupBox("")
         queue_group.setObjectName("dashboardPanel")
         queue_layout = QVBoxLayout(queue_group)
-        queue_layout.setContentsMargins(12, 12, 12, 12)
-        queue_layout.setSpacing(8)
+        queue_layout.setContentsMargins(10, 8, 10, 8)
+        queue_layout.setSpacing(6)
         queue_header_wrap = QHBoxLayout()
         queue_header_wrap.setContentsMargins(0, 0, 0, 0)
-        queue_header_wrap.setSpacing(8)
-        self.lbl_queue_title = QLabel("Task Queue")
-        self.lbl_queue_title.setStyleSheet("color: #F8FAFC; font-size: 12px; font-weight: 700;")
+        queue_header_wrap.setSpacing(6)
+        self.lbl_queue_title = QLabel("TASK QUEUE")
+        self.lbl_queue_title.setStyleSheet(
+            "color: #60A5FA; font-size: 11px; font-weight: 700; letter-spacing: 1px;"
+        )
         queue_header_wrap.addWidget(self.lbl_queue_title)
         queue_header_wrap.addStretch(1)
         queue_layout.addLayout(queue_header_wrap)
@@ -2128,24 +2171,20 @@ class MainWindow(QMainWindow):
         self.queue_table.setModel(self.queue_model)
         self.queue_table.verticalHeader().setVisible(False)
         self.queue_table.setAlternatingRowColors(False)
-        self.queue_table.verticalHeader().setDefaultSectionSize(42)
+        self.queue_table.verticalHeader().setDefaultSectionSize(32)
         self.queue_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.queue_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.queue_table.setShowGrid(True)
         queue_header = self.queue_table.horizontalHeader()
-        queue_header.setMinimumSectionSize(40)
+        queue_header.setMinimumSectionSize(30)
         queue_header.setStretchLastSection(False)
-        queue_header.setSectionResizeMode(0, QHeaderView.Fixed)
-        queue_header.setSectionResizeMode(1, QHeaderView.Stretch)
-        queue_header.setSectionResizeMode(2, QHeaderView.Fixed)
-        queue_header.setSectionResizeMode(3, QHeaderView.Stretch)
-        queue_header.setSectionResizeMode(4, QHeaderView.Stretch)
-        queue_header.setSectionResizeMode(5, QHeaderView.Fixed)
-        queue_header.setSectionResizeMode(6, QHeaderView.Fixed)
-        self.queue_table.setColumnWidth(0, 75)  # No. — wide enough for 4-digit queue numbers
+        queue_header.setSectionResizeMode(0, QHeaderView.Fixed)    # #
+        queue_header.setSectionResizeMode(1, QHeaderView.Stretch)  # Prompt
+        queue_header.setSectionResizeMode(2, QHeaderView.Fixed)    # Type
+        queue_header.setSectionResizeMode(3, QHeaderView.Fixed)    # Status
+        self.queue_table.setColumnWidth(0, 30)
         self.queue_table.setColumnWidth(2, 60)
-        self.queue_table.setColumnWidth(5, 80)
-        self.queue_table.setColumnWidth(6, 60)
+        self.queue_table.setColumnWidth(3, 80)
         self.queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.queue_table.customContextMenuRequested.connect(self.show_queue_context_menu)
         self._configure_table_scrolling(self.queue_table)
@@ -2161,13 +2200,7 @@ class MainWindow(QMainWindow):
                 selection-color: #F8FAFC;
             }
             QTableView::item {
-                padding: 6px 8px;
-                color: #F8FAFC;
-                background: #1E293B;
-            }
-            QTableView::item:alternate {
-                background: #253145;
-                color: #F8FAFC;
+                padding: 4px 6px;
             }
             QTableView::item:selected {
                 background: #2a3a5c;
@@ -2177,7 +2210,7 @@ class MainWindow(QMainWindow):
                 background: #0F172A;
                 color: #94A3B8;
                 font-weight: 600;
-                padding: 8px;
+                padding: 6px;
                 border: none;
                 border-bottom: 1px solid #334155;
             }
@@ -2187,54 +2220,43 @@ class MainWindow(QMainWindow):
         self._apply_card_shadow(queue_group, blur=24, y_offset=8)
         self.task_queue_widget = queue_group
 
-        self.content_splitter = QSplitter(Qt.Horizontal)
-        self.content_splitter.setChildrenCollapsible(False)
-        self.content_splitter.setHandleWidth(8)
-        self.content_splitter.addWidget(self.prompts_group)
-        self.content_splitter.addWidget(queue_group)
-        self.content_splitter.setStretchFactor(0, 35)
-        self.content_splitter.setStretchFactor(1, 65)
-        self.content_splitter.setSizes([380, 760])
+        # ── 2-COLUMN LAYOUT (mockup redesign) ─────────────────
+        # Left: mode_tabs + prompts + Add to Queue
+        # Right: task queue + logs (fixed width)
+        self._left_panel = QWidget()
+        self._left_panel.setObjectName("leftPanel")
+        left_vlayout = QVBoxLayout(self._left_panel)
+        left_vlayout.setContentsMargins(0, 0, 0, 0)
+        left_vlayout.setSpacing(8)
+        left_vlayout.addWidget(self.mode_tabs, 1)
+        left_vlayout.addWidget(self.prompts_group, 1)
 
-        self.dashboard_body_splitter = QSplitter(Qt.Vertical)
-        self.dashboard_body_splitter.setChildrenCollapsible(False)
-        self.dashboard_body_splitter.setHandleWidth(6)
-        self.dashboard_body_splitter.addWidget(self.mode_tabs)
-        self.dashboard_body_splitter.addWidget(self.content_splitter)
-        self.dashboard_body_splitter.setStretchFactor(0, 40)
-        self.dashboard_body_splitter.setStretchFactor(1, 60)
-        self.dashboard_body_splitter.setSizes([260, 520])
-        self.dashboard_body_splitter.setStyleSheet(
-            "QSplitter::handle:vertical { background: #334155; height: 3px; } "
-            "QSplitter::handle:vertical:hover { background: #60A5FA; }"
-        )
-        layout.addWidget(self.dashboard_body_splitter, 1)
+        self._right_panel = QWidget()
+        self._right_panel.setObjectName("rightPanel")
+        self._right_panel.setMinimumWidth(340)
+        self._right_panel.setMaximumWidth(460)
+        right_vlayout = QVBoxLayout(self._right_panel)
+        right_vlayout.setContentsMargins(0, 0, 0, 0)
+        right_vlayout.setSpacing(8)
 
-        self.logs_widget = QGroupBox("Live Logs")
-        self.logs_widget.setTitle("")
+        # ── Logs widget (placed in right panel) ───────────────
+        self.logs_widget = QGroupBox("")
         self.logs_widget.setObjectName("dashboardPanel")
         logs_layout = QVBoxLayout(self.logs_widget)
+        logs_layout.setContentsMargins(10, 8, 10, 8)
         logs_header = QHBoxLayout()
         self.lbl_logs_title = QLabel("Live Logs")
-        self.lbl_logs_title.setStyleSheet("color: white; font-size: 14px; font-weight: 700;")
+        self.lbl_logs_title.setStyleSheet("color: #94A3B8; font-size: 12px; font-weight: 700;")
         logs_header.addWidget(self.lbl_logs_title)
         logs_header.addStretch()
-        _ClearLogsCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
-        self.btn_clear_logs = _ClearLogsCls()
-        self.btn_clear_logs.setText("Clear")
-        if _FLUENT_UI_AVAILABLE:
-            try:
-                self.btn_clear_logs.setIcon(FluentIcon.BROOM)
-            except Exception:
-                pass
-        self.btn_clear_logs.setFixedHeight(30)
-        self.btn_clear_logs.setFixedWidth(90)
-        if not _FLUENT_UI_AVAILABLE:
-            self.btn_clear_logs.setStyleSheet(
-                "QPushButton { background-color: #334155; color: #94A3B8; font-size: 11px; "
-                "border: 1px solid #475569; border-radius: 3px; } "
-                "QPushButton:hover { background-color: #475569; }"
-            )
+        self.btn_clear_logs = QPushButton("Clear")
+        self.btn_clear_logs.setFixedHeight(24)
+        self.btn_clear_logs.setFixedWidth(60)
+        self.btn_clear_logs.setStyleSheet(
+            "QPushButton { background-color: transparent; color: #64748B; font-size: 10px; "
+            "border: 1px solid #334155; border-radius: 3px; } "
+            "QPushButton:hover { background-color: #334155; color: #94A3B8; }"
+        )
         self.btn_clear_logs.clicked.connect(self._clear_logs)
         logs_header.addWidget(self.btn_clear_logs)
         logs_layout.addLayout(logs_header)
@@ -2242,24 +2264,20 @@ class MainWindow(QMainWindow):
         self.logs_output.setObjectName("logsOutput")
         self.logs_output.setReadOnly(True)
         self.logs_output.setUndoRedoEnabled(False)
-        self.logs_output.setMinimumHeight(150)
+        self.logs_output.setMinimumHeight(120)
         self.logs_output.document().setMaximumBlockCount(5000)
         self.logs_output.verticalScrollBar().setSingleStep(6)
+        self.logs_output.setStyleSheet(
+            "QTextEdit { background: #0B1120; border: 1px solid #1E293B; border-radius: 8px; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; color: #64748B; }"
+        )
         logs_layout.addWidget(self.logs_output)
         self.log_buffer = LogBuffer(self.logs_output, self, interval_ms=180)
-        self._apply_card_shadow(self.logs_widget, blur=24, y_offset=8)
 
-        # Phase 3: Main toolbar action buttons — Fluent PrimaryPushButton
-        # for blue "go" actions, PushButton with color override for
-        # Pause (orange) and Stop (red) so semantic colors are preserved.
+        # ── Toolbar action buttons ────────────────────────────────
         _StartBtnCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
         self.btn_start = _StartBtnCls()
         self.btn_start.setText("Start Automation")
-        if _FLUENT_UI_AVAILABLE:
-            try:
-                self.btn_start.setIcon(FluentIcon.PLAY)
-            except Exception:
-                pass
         self.btn_start.setFixedHeight(34)
         self.btn_start.setMinimumWidth(140)
         if not _FLUENT_UI_AVAILABLE:
@@ -2271,29 +2289,21 @@ class MainWindow(QMainWindow):
             )
         self.btn_start.clicked.connect(self.start_queue_manager)
 
-        # Pause: keep stock QPushButton — Fluent PushButton's internal
-        # paint conflicts with our orange color override, causing icon/
-        # text overlap. Colored action buttons work best with plain QSS.
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setFixedHeight(30)
-        self.btn_pause.setFixedWidth(84)
+        self.btn_pause.setFixedWidth(74)
         self.btn_pause.setStyleSheet(
-            "QPushButton { background-color: #D97706; color: white; font-size: 12px; font-weight: 600; "
-            "border: none; border-radius: 6px; } "
-            "QPushButton:hover { background-color: #F59E0B; } "
-            "QPushButton:disabled { background-color: #4A3A1A; color: #64748B; }"
+            "QPushButton { background-color: #1E293B; color: #94A3B8; font-size: 12px; font-weight: 600; "
+            "border: 1px solid #334155; border-radius: 6px; } "
+            "QPushButton:hover { background-color: #334155; color: white; } "
+            "QPushButton:disabled { background-color: #1E293B; color: #334155; }"
         )
         self.btn_pause.clicked.connect(self.pause_queue_manager)
 
         self.btn_resume = _StartBtnCls()
         self.btn_resume.setText("Resume")
-        if _FLUENT_UI_AVAILABLE:
-            try:
-                self.btn_resume.setIcon(FluentIcon.PLAY)
-            except Exception:
-                pass
         self.btn_resume.setFixedHeight(30)
-        self.btn_resume.setFixedWidth(94)
+        self.btn_resume.setFixedWidth(84)
         if not _FLUENT_UI_AVAILABLE:
             self.btn_resume.setStyleSheet(
                 "QPushButton { background-color: #1D4ED8; color: white; font-size: 12px; font-weight: 600; "
@@ -2303,10 +2313,9 @@ class MainWindow(QMainWindow):
             )
         self.btn_resume.clicked.connect(self.resume_queue_manager)
 
-        # Stop: same story as Pause — stock QPushButton + red QSS.
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setFixedHeight(30)
-        self.btn_stop.setFixedWidth(84)
+        self.btn_stop.setFixedWidth(64)
         self.btn_stop.setStyleSheet(
             "QPushButton { background-color: #DC2626; color: white; font-size: 12px; font-weight: 600; "
             "border: none; border-radius: 6px; } "
@@ -2315,79 +2324,52 @@ class MainWindow(QMainWindow):
         )
         self.btn_stop.clicked.connect(self.stop_queue_manager)
 
-        # Phase 3 + Fix: Queue clear buttons → Fluent PushButton with
-        # BROOM icon. TransparentPushButton was too subtle (text floating
-        # with no border). PushButton gives visible Fluent border +
-        # hover state so users can actually see the button.
-        _ClearBtnCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
-        self.btn_clear_queue = _ClearBtnCls()
-        self.btn_clear_queue.setText("Clear Queue")
-        self.btn_clear_queue.setFixedHeight(30)
-        self.btn_clear_queue.setMinimumWidth(110)
-        if _FLUENT_UI_AVAILABLE:
-            try:
-                self.btn_clear_queue.setIcon(FluentIcon.DELETE)
-            except Exception:
-                pass
-        else:
-            self.btn_clear_queue.setStyleSheet(
-                "QPushButton { background-color: #334155; color: #94A3B8; font-size: 11px; "
-                "border: 1px solid #475569; border-radius: 4px; padding: 0 10px; } "
-                "QPushButton:hover { background-color: #475569; color: white; }"
-            )
+        self.btn_clear_queue = QPushButton("Clear Queue")
+        self.btn_clear_queue.setFixedHeight(24)
+        self.btn_clear_queue.setStyleSheet(
+            "QPushButton { background-color: transparent; color: #94A3B8; font-size: 10px; "
+            "border: 1px solid #334155; border-radius: 4px; padding: 0 8px; } "
+            "QPushButton:hover { background-color: #334155; color: white; }"
+        )
         self.btn_clear_queue.clicked.connect(self.clear_queue)
 
-        self.btn_clear_done = _ClearBtnCls()
-        self.btn_clear_done.setText("Clear Done")
-        self.btn_clear_done.setFixedHeight(30)
-        self.btn_clear_done.setMinimumWidth(110)
-        if _FLUENT_UI_AVAILABLE:
-            try:
-                self.btn_clear_done.setIcon(FluentIcon.ACCEPT)
-            except Exception:
-                pass
-        else:
-            self.btn_clear_done.setStyleSheet(self.btn_clear_queue.styleSheet())
+        self.btn_clear_done = QPushButton("Clear Done")
+        self.btn_clear_done.setFixedHeight(24)
+        self.btn_clear_done.setStyleSheet(self.btn_clear_queue.styleSheet())
         self.btn_clear_done.clicked.connect(self.clear_completed_jobs_from_queue)
 
+        # Place buttons in toolbar (top bar)
         self.toolbar_actions_layout.addWidget(self.btn_start)
         self.toolbar_actions_layout.addWidget(self.btn_pause)
         self.toolbar_actions_layout.addWidget(self.btn_resume)
         self.toolbar_actions_layout.addWidget(self.btn_stop)
+        # Place clear buttons in queue header
         queue_header_wrap.addWidget(self.btn_clear_queue)
         queue_header_wrap.addWidget(self.btn_clear_done)
 
-        # ── Responsive scroll wrapper ─────────────────────────────
-        # Wrap dashboard_content in a QScrollArea so small screens
-        # scroll gracefully instead of cramping everything, and large
-        # screens still show everything without waste. The scroll area
-        # sits inside the top half of the vertical splitter with
-        # logs_widget beneath it.
-        self.dashboard_scroll = QScrollArea()
-        self.dashboard_scroll.setObjectName("dashboardScroll")
-        self.dashboard_scroll.setWidgetResizable(True)
-        self.dashboard_scroll.setFrameShape(QFrame.NoFrame)
-        self.dashboard_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.dashboard_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.dashboard_scroll.setWidget(self.dashboard_content)
+        # ── Assemble right panel: queue + logs ────────────────────
+        right_vlayout.addWidget(queue_group, 1)
+        right_vlayout.addWidget(self.logs_widget, 0)
+        self.logs_widget.setMinimumHeight(180)
+        self.logs_widget.setMaximumHeight(240)
+        self.task_queue_widget = queue_group
 
-        self.main_splitter = QSplitter(Qt.Vertical)
-        self.main_splitter.addWidget(self.dashboard_scroll)
-        self.main_splitter.addWidget(self.logs_widget)
-        # Use stretch factors instead of hard-coded pixel sizes so the
-        # split scales proportionally on any screen (75% content,
-        # 25% logs).
-        self.main_splitter.setStretchFactor(0, 3)
-        self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([720, 240])
-        self.main_splitter.setCollapsible(0, False)
-        self.main_splitter.setCollapsible(1, True)
-        self.main_splitter.setHandleWidth(6)
-        self.main_splitter.setStyleSheet(
-            "QSplitter::handle:vertical { background-color: #334155; height: 4px; margin: 2px 0; } "
-            "QSplitter::handle:vertical:hover { background-color: #60A5FA; }"
+        # ── Assemble 2-column content splitter ────────────────────
+        self.content_splitter = QSplitter(Qt.Horizontal)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.setHandleWidth(4)
+        self.content_splitter.addWidget(self._left_panel)
+        self.content_splitter.addWidget(self._right_panel)
+        self.content_splitter.setStretchFactor(0, 1)
+        self.content_splitter.setStretchFactor(1, 0)
+        self.content_splitter.setSizes([700, 400])
+        self.content_splitter.setStyleSheet(
+            "QSplitter::handle:horizontal { background: #1E293B; width: 2px; } "
+            "QSplitter::handle:horizontal:hover { background: #60A5FA; }"
         )
-        root_layout.addWidget(self.main_splitter, 1)
+        layout.addWidget(self.content_splitter, 1)
+
+        root_layout.addWidget(self.dashboard_content, 1)
 
         self._set_queue_controls_state("stopped")
         self._sync_generation_mode_ui()
@@ -9095,6 +9077,26 @@ class MainWindow(QMainWindow):
     def _sync_primary_reference_path(self):
         return self.current_ref_paths[0] if getattr(self, "current_ref_paths", None) else None
 
+    @staticmethod
+    def _make_ref_thumbnail(path, size=48):
+        """Create a QLabel with a thumbnail preview of the image."""
+        from PyQt5.QtGui import QPixmap
+        thumb_label = QLabel()
+        thumb_label.setFixedSize(size, size)
+        thumb_label.setStyleSheet(
+            f"background: #0F172A; border: 1px solid #334155; border-radius: 4px;"
+        )
+        thumb_label.setAlignment(Qt.AlignCenter)
+        try:
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(size - 4, size - 4, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                thumb_label.setPixmap(scaled)
+        except Exception:
+            thumb_label.setText("?")
+        thumb_label.setToolTip(path)
+        return thumb_label
+
     def _rebuild_reference_image_rows(self):
         if not hasattr(self, "ref_items_layout"):
             return
@@ -9108,12 +9110,16 @@ class MainWindow(QMainWindow):
         for path in list(getattr(self, "current_ref_paths", []) or []):
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setContentsMargins(0, 2, 0, 2)
             row_layout.setSpacing(8)
 
-            label = QLabel(f"📎 {os.path.basename(path)}")
+            thumb = self._make_ref_thumbnail(path, size=44)
+            row_layout.addWidget(thumb)
+
+            label = QLabel(os.path.basename(path))
             label.setObjectName("refStatusLabel")
             label.setToolTip(path)
+            label.setStyleSheet("font-size: 12px; color: #CBD5E1;")
 
             btn_remove = QPushButton("X")
             btn_remove.setObjectName("refClearButton")
@@ -9153,6 +9159,8 @@ class MainWindow(QMainWindow):
         if normalized in self.current_ref_paths:
             return False
         self.current_ref_paths.append(normalized)
+        # Sort A-Z by filename
+        self.current_ref_paths.sort(key=lambda p: os.path.basename(p).lower())
         self._update_reference_image_ui()
         return True
 
@@ -9194,12 +9202,16 @@ class MainWindow(QMainWindow):
         for path in list(getattr(self, "current_pipe_ref_paths", []) or []):
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setContentsMargins(0, 2, 0, 2)
             row_layout.setSpacing(8)
 
-            label = QLabel(f"📎 {os.path.basename(path)}")
+            thumb = self._make_ref_thumbnail(path, size=44)
+            row_layout.addWidget(thumb)
+
+            label = QLabel(os.path.basename(path))
             label.setObjectName("refStatusLabel")
             label.setToolTip(path)
+            label.setStyleSheet("font-size: 12px; color: #CBD5E1;")
 
             btn_remove = QPushButton("X")
             btn_remove.setObjectName("refClearButton")
@@ -9238,6 +9250,8 @@ class MainWindow(QMainWindow):
         if normalized in self.current_pipe_ref_paths:
             return False
         self.current_pipe_ref_paths.append(normalized)
+        # Sort A-Z by filename
+        self.current_pipe_ref_paths.sort(key=lambda p: os.path.basename(p).lower())
         self._update_pipeline_reference_ui()
         return True
 
@@ -9274,7 +9288,32 @@ class MainWindow(QMainWindow):
             self.lbl_ref_single.setText(os.path.basename(self.current_ref_path) if has_ref else "None")
         if hasattr(self, "btn_ref_single_clear"):
             self.btn_ref_single_clear.setVisible(has_ref)
+        # Show/update thumbnail preview
+        self._update_path_row_thumbnail(self.ref_single_row, self.current_ref_path if has_ref else None)
         self._on_generation_settings_changed()
+
+    def _update_path_row_thumbnail(self, row_frame, path):
+        """Add or update a thumbnail in a path row frame."""
+        # Remove old thumbnail if exists
+        old_thumb = row_frame.findChild(QLabel, "pathRowThumb")
+        if old_thumb:
+            old_thumb.deleteLater()
+        if path and os.path.exists(path):
+            from PyQt5.QtGui import QPixmap
+            thumb = QLabel()
+            thumb.setObjectName("pathRowThumb")
+            thumb.setFixedSize(40, 40)
+            thumb.setStyleSheet("background: #0F172A; border: 1px solid #334155; border-radius: 4px;")
+            thumb.setAlignment(Qt.AlignCenter)
+            try:
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    thumb.setPixmap(scaled)
+            except Exception:
+                pass
+            thumb.setToolTip(path)
+            row_frame.layout().insertWidget(0, thumb)
 
     def clear_single_reference_image(self):
         self.current_ref_path = None
@@ -9297,6 +9336,7 @@ class MainWindow(QMainWindow):
             self.lbl_start_image.setText("None")
         if hasattr(self, "btn_clear_start_image"):
             self.btn_clear_start_image.setVisible(False)
+        self._update_path_row_thumbnail(self.start_row, None)
         self._on_generation_settings_changed()
 
     def select_start_image(self):
@@ -9310,6 +9350,7 @@ class MainWindow(QMainWindow):
             self.current_start_image_path = file_path
             self.lbl_start_image.setText(os.path.basename(file_path))
             self.btn_clear_start_image.setVisible(True)
+            self._update_path_row_thumbnail(self.start_row, file_path)
             self._on_generation_settings_changed()
         elif not self.current_start_image_path and hasattr(self, "lbl_start_image"):
             self.lbl_start_image.setText("None")
@@ -9320,6 +9361,7 @@ class MainWindow(QMainWindow):
             self.lbl_end_image.setText("None")
         if hasattr(self, "btn_clear_end_image"):
             self.btn_clear_end_image.setVisible(False)
+        self._update_path_row_thumbnail(self.end_row, None)
         self._on_generation_settings_changed()
 
     def select_end_image(self):
@@ -9333,6 +9375,7 @@ class MainWindow(QMainWindow):
             self.current_end_image_path = file_path
             self.lbl_end_image.setText(os.path.basename(file_path))
             self.btn_clear_end_image.setVisible(True)
+            self._update_path_row_thumbnail(self.end_row, file_path)
             self._on_generation_settings_changed()
         elif not self.current_end_image_path and hasattr(self, "lbl_end_image"):
             self.lbl_end_image.setText("None")
@@ -9604,7 +9647,10 @@ class MainWindow(QMainWindow):
             self.btn_clear_end_image.setVisible(frame_mode == "frames_start_end" and bool(self.current_end_image_path))
         if hasattr(self, "prompts_group"):
             self.prompts_group.setEnabled(not pipeline_active)
-            self.prompts_group.setTitle("Prompts Input" if not pipeline_active else "Prompts Input (use Pipeline tab prompts)")
+        if hasattr(self, "lbl_prompts_title"):
+            self.lbl_prompts_title.setText(
+                "PROMPTS" if not pipeline_active else "PROMPTS (use Pipeline tab)"
+            )
         if hasattr(self, "prompts_input"):
             self.prompts_input.setPlaceholderText(
                 "Paste your prompts here, one per line..."
