@@ -1202,8 +1202,21 @@ class ExtensionModeManager:
             self._log("[ExtMode] Extension mode stopped.")
 
     def _get_available_worker(self, busy_slots):
-        """Find an available worker across all accounts."""
+        """Find an available worker across all accounts, respecting 429 throttle."""
+        import time as _time
+        now = _time.time()
         for account_email, workers in self._workers.items():
+            # Check if account is 429-throttled — limit concurrent slots
+            throttle_max = self.qm.account_throttle_max_slots.get(account_email)
+            if throttle_max is not None and self.qm.account_throttle_until.get(account_email, 0) > now:
+                busy_count = sum(1 for w in workers if w.slot_id in busy_slots or w.is_busy)
+                if busy_count >= throttle_max:
+                    continue  # This account is at its throttled limit
+
+            # Check account disabled (hard hold for auth errors etc.)
+            if self.qm.account_disabled.get(account_email):
+                continue
+
             for worker in workers:
                 if worker.slot_id not in busy_slots and not worker.is_busy:
                     return worker
@@ -1458,6 +1471,22 @@ class ExtensionModeManager:
                 self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                 return
 
+            # If account is 429-throttled, check if THIS slot should yield
+            # (too many busy slots on this account — let others finish first)
+            import time as _time
+            _throttle_max = self.qm.account_throttle_max_slots.get(worker.account_email)
+            if _throttle_max is not None and self.qm.account_throttle_until.get(worker.account_email, 0) > _time.time():
+                # Count how many workers on this account are busy
+                _account_workers = self._workers.get(worker.account_email, [])
+                _busy = sum(1 for w in _account_workers if w.is_busy)
+                if _busy > _throttle_max and attempt > 0:
+                    self._log(
+                        f"[{worker.slot_id}] Account throttled ({_throttle_max} slots max) — yielding job."
+                    )
+                    update_job_status(job_id, "pending", account="")
+                    self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                    return
+
             try:
                 if "video" in job_type:
                     video_model = job.get("video_model") or model
@@ -1524,6 +1553,7 @@ class ExtensionModeManager:
                     else:
                         update_job_status(job_id, "completed", account=worker.account_email)
                         self.qm.signals.job_updated.emit(job_id, "completed", worker.account_email, "")
+                        self.qm._record_throttle_success(worker.account_email)
                         self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed! ({output_path})")
                         return
 
@@ -1544,11 +1574,11 @@ class ExtensionModeManager:
                     await asyncio.sleep(8)  # wait for tab reload + reCAPTCHA init
                     continue
 
-                # 429 Rate limit — immediately put account on hold and re-queue job
+                # 429 Rate limit — throttle account slots (reduce, don't block) and re-queue job
                 err_lower = last_error.lower()
                 if any(p in err_lower for p in ("429", "rate limit", "too many requests")):
-                    self.qm._put_account_on_hold(worker.account_email, "rate limited (429)", 300)
-                    self._log(f"[{worker.slot_id}] 429 detected — account on hold, re-queuing job.")
+                    self.qm._throttle_account_for_429(worker.account_email)
+                    self._log(f"[{worker.slot_id}] 429 detected — slots reduced, re-queuing job.")
                     update_job_status(job_id, "pending", account="")
                     self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                     return

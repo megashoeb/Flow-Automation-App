@@ -173,6 +173,11 @@ class AsyncQueueManager(QThread):
         self.account_hold_reason = {}  # account_name -> reason string
         self.account_hold_count = {}   # account_name -> how many times held (for escalation)
         self._account_hold_lock = None  # Initialized in process_queue (needs event loop)
+
+        # Smart slot throttle for 429 — reduce slots instead of hard-blocking account
+        self.account_throttle_max_slots = {}   # account_name -> max allowed concurrent slots
+        self.account_throttle_until = {}       # account_name -> timestamp when throttle expires
+        self.account_throttle_successes = {}   # account_name -> consecutive successes since throttle (for ramp-up)
         self.account_warmup_ready = {}
         self.account_warmup_tasks = {}
 
@@ -1302,6 +1307,13 @@ class AsyncQueueManager(QThread):
     def _get_ready_slots(self, worker_slots):
         now = time.time()
         ready = []
+        # Track how many busy slots each throttled account already has
+        account_busy_count = {}
+        for slot in worker_slots:
+            if slot["is_busy"]:
+                acc = slot["account_name"]
+                account_busy_count[acc] = account_busy_count.get(acc, 0) + 1
+
         for slot in worker_slots:
             if slot["is_busy"]:
                 continue
@@ -1320,6 +1332,15 @@ class AsyncQueueManager(QThread):
                 continue
             if float(slot.get("startup_ready_at", 0.0) or 0.0) > now:
                 continue
+
+            # Smart throttle: limit concurrent slots for 429-throttled accounts
+            acc = slot["account_name"]
+            throttle_max = self.account_throttle_max_slots.get(acc)
+            if throttle_max is not None and self.account_throttle_until.get(acc, 0) > now:
+                busy_now = account_busy_count.get(acc, 0)
+                if busy_now >= throttle_max:
+                    continue  # Account already at throttled limit, skip this slot
+
             ready.append(slot)
         return ready
 
@@ -1396,6 +1417,73 @@ class AsyncQueueManager(QThread):
                     f"[SYSTEM] Account {account_name} hold expired ({reason}). Reactivated."
                 )
                 self.signals.account_auth_status.emit(account_name, "logged_in", "Hold expired")
+
+        # Also expire throttles whose time window has passed
+        for account_name in list(self.account_throttle_until.keys()):
+            if self.account_throttle_until[account_name] <= now:
+                self.account_throttle_max_slots.pop(account_name, None)
+                self.account_throttle_until.pop(account_name, None)
+                self.account_throttle_successes.pop(account_name, None)
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] Account {account_name}: 429 throttle expired. Full speed restored."
+                )
+
+    def _throttle_account_for_429(self, account_name):
+        """On 429: reduce allowed slots to 2, set a 60s throttle window.
+        If already throttled, tighten to 1 slot and extend window."""
+        current_max = self.account_throttle_max_slots.get(account_name)
+        now = time.time()
+
+        if current_max is not None and self.account_throttle_until.get(account_name, 0) > now:
+            # Already throttled — tighten further
+            new_max = max(1, current_max - 1)
+            duration = 90  # extend window
+        else:
+            # First 429 — drop from full to 2 slots
+            new_max = 2
+            duration = 60
+
+        self.account_throttle_max_slots[account_name] = new_max
+        self.account_throttle_until[account_name] = now + duration
+        self.account_throttle_successes[account_name] = 0
+        self.signals.log_msg.emit(
+            f"[SYSTEM] Account {account_name}: 429 detected — throttled to {new_max} slot(s) "
+            f"for {duration}s. Other accounts unaffected."
+        )
+
+    def _record_throttle_success(self, account_name):
+        """On successful job: ramp up throttled account's slots gradually."""
+        if account_name not in self.account_throttle_max_slots:
+            return  # Not throttled, nothing to do
+
+        now = time.time()
+        if self.account_throttle_until.get(account_name, 0) <= now:
+            return  # Throttle already expired
+
+        successes = self.account_throttle_successes.get(account_name, 0) + 1
+        self.account_throttle_successes[account_name] = successes
+
+        # Every 3 consecutive successes → add 1 slot back
+        if successes % 3 == 0:
+            current_max = self.account_throttle_max_slots.get(account_name, 2)
+            new_max = current_max + 1
+            if new_max >= self.account_parallel_slots:
+                # Fully recovered — remove throttle
+                self.account_throttle_max_slots.pop(account_name, None)
+                self.account_throttle_until.pop(account_name, None)
+                self.account_throttle_successes.pop(account_name, None)
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] Account {account_name}: 429 recovery complete! "
+                    f"Full speed restored ({successes} consecutive successes)."
+                )
+            else:
+                self.account_throttle_max_slots[account_name] = new_max
+                # Extend throttle window since we're still recovering
+                self.account_throttle_until[account_name] = now + 60
+                self.signals.log_msg.emit(
+                    f"[SYSTEM] Account {account_name}: ramping up to {new_max} slot(s) "
+                    f"({successes} successes since throttle)."
+                )
 
     def _apply_account_recaptcha_cooldown(self, slot):
         account_name = slot["account_name"]
@@ -2023,7 +2111,7 @@ class AsyncQueueManager(QThread):
             "rate limit", "429", "quota exceeded", "resource exhausted",
             "too many requests", "quota_exceeded", "rate_limit",
         )):
-            self._put_account_on_hold(account_name, "rate limited", 300)
+            self._throttle_account_for_429(account_name)
         elif "access denied" in msg_lower or "account suspended" in msg_lower:
             self._put_account_on_hold(account_name, "access denied", 1800)
         elif category == "recaptcha_block":
@@ -2188,6 +2276,7 @@ class AsyncQueueManager(QThread):
                 slot["consecutive_failures"] = 0
                 self.account_recaptcha_streak.pop(slot["account_name"], None)
                 self.account_hold_count.pop(slot["account_name"], None)  # Reset escalation on success
+                self._record_throttle_success(slot["account_name"])  # Ramp up slots after 429 recovery
                 self.account_restart_count[self._slot_restart_key(slot)] = 0
                 slot["pending_browser_restart"] = False
                 slot["is_restarting"] = False
