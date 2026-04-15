@@ -2728,6 +2728,10 @@ class MainWindow(QMainWindow):
         self.warning_banner.setText(f"⚠ {text}")
         self.warning_container.setVisible(True)
 
+        # Also show a popup dialog for critical warnings (reCAPTCHA flagged accounts)
+        if "reCAPTCHA" in text:
+            QMessageBox.warning(self, "⚠ Account Flagged — reCAPTCHA", text)
+
     def _create_setting_combo(self, items, current_data=None, *, trigger_sync=True, min_height=38):
         combo = QComboBox()
         combo.setObjectName("settingInput")
