@@ -1008,6 +1008,9 @@ class ExtensionModeManager:
         self._bridge = ExtensionBridge(self._log)
         self._workers: Dict[str, list] = {}  # account_email -> [ExtensionWorker, ...]
         self._active_tasks = []
+        # reCAPTCHA streak tracking — auto-hold after consecutive failures
+        self._recaptcha_streak: Dict[str, int] = {}  # account -> consecutive recaptcha failures
+        self.RECAPTCHA_HOLD_THRESHOLD = 3  # hold account after this many consecutive failures
 
     async def run(self):
         """Main entry — start bridge, wait for extension, dispatch jobs."""
@@ -1555,6 +1558,8 @@ class ExtensionModeManager:
                         update_job_status(job_id, "completed", account=worker.account_email)
                         self.qm.signals.job_updated.emit(job_id, "completed", worker.account_email, "")
                         self.qm._record_throttle_success(worker.account_email)
+                        # Reset reCAPTCHA streak on success
+                        self._recaptcha_streak.pop(worker.account_email, None)
                         self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed! ({output_path})")
                         return
 
@@ -1584,8 +1589,50 @@ class ExtensionModeManager:
                     self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                     return
 
-                # reCAPTCHA score/token failure → reload tab and retry
+                # reCAPTCHA score/token failure → track streak, hold if persistent
                 if "recaptcha" in err_lower or "captcha" in err_lower:
+                    streak = self._recaptcha_streak.get(worker.account_email, 0) + 1
+                    self._recaptcha_streak[worker.account_email] = streak
+                    self._log(
+                        f"[{worker.slot_id}] reCAPTCHA failure #{streak} for {worker.account_email}"
+                    )
+
+                    if streak >= self.RECAPTCHA_HOLD_THRESHOLD:
+                        already_held = self.qm.account_disabled.get(worker.account_email, False)
+                        # Account is flagged — hold it and reassign jobs
+                        self.qm.account_disabled[worker.account_email] = True
+                        if not already_held:
+                            # First slot to detect — log, warn, reassign
+                            self._log(
+                                f"[ExtMode] ⛔ Account {worker.account_email} hit {streak} consecutive "
+                                f"reCAPTCHA failures — HOLDING account and reassigning jobs."
+                            )
+                            self.qm.signals.account_auth_status.emit(
+                                worker.account_email, "expired",
+                                f"reCAPTCHA flagged ({streak} failures)"
+                            )
+                            # Show warning popup
+                            self.qm.signals.show_warning.emit(
+                                f"Account '{worker.account_email}' has {streak} consecutive reCAPTCHA failures.\n"
+                                f"Google has likely flagged this account.\n"
+                                f"Close this account's extension tab and use a different account."
+                            )
+                            # Reassign this account's pending/running jobs to other accounts
+                            try:
+                                from src.db.db_manager import reassign_account_jobs
+                                count = reassign_account_jobs(worker.account_email)
+                                if count > 0:
+                                    self._log(
+                                        f"[ExtMode] Reassigned {count} job(s) from {worker.account_email} to other accounts."
+                                    )
+                            except Exception:
+                                pass
+                        # Re-queue current job too
+                        update_job_status(job_id, "pending", account="")
+                        self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                        return
+
+                    # Not at threshold yet — reload tab and retry
                     self._bridge.send_command("reload_tab", worker.account_email)
                     if self.qm.stop_requested or self.qm.force_stop_requested:
                         update_job_status(job_id, "pending", account="")
