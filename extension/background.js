@@ -634,6 +634,48 @@ async function handleCommand(cmd) {
       }
       break;
 
+    case "clean_tracking":
+      // Remove Service Workers + IndexedDB for labs.google — preserves login cookies
+      try {
+        await chrome.browsingData.remove(
+          { origins: ["https://labs.google"] },
+          {
+            serviceWorkers: true,
+            indexedDB: true,
+            cacheStorage: true,
+          }
+        );
+        console.log(`[G-Labs Helper] Tracking data cleaned for ${account || "all accounts"}`);
+      } catch (e) {
+        console.warn("[G-Labs Helper] clean_tracking failed:", e.message);
+      }
+      // Reload tab after cleanup so reCAPTCHA re-initializes fresh
+      if (tabId) {
+        try { await chrome.tabs.reload(tabId); } catch {}
+      }
+      break;
+
+    case "clean_recaptcha_cookie":
+      // Delete _GRECAPTCHA cookie only — keeps login session intact
+      try {
+        const allCookies = await chrome.cookies.getAll({ domain: ".google.com" });
+        let deleted = 0;
+        for (const c of allCookies) {
+          if (c.name === "_GRECAPTCHA" || c.name.startsWith("_GRECAPTCHA")) {
+            const protocol = c.secure ? "https" : "http";
+            await chrome.cookies.remove({
+              url: `${protocol}://${c.domain.replace(/^\./, "")}${c.path}`,
+              name: c.name,
+            });
+            deleted++;
+          }
+        }
+        console.log(`[G-Labs Helper] Removed ${deleted} _GRECAPTCHA cookie(s)`);
+      } catch (e) {
+        console.warn("[G-Labs Helper] clean_recaptcha_cookie failed:", e.message);
+      }
+      break;
+
     case "new_project":
       if (tabId) {
         try {

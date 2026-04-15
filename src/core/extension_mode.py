@@ -1012,6 +1012,12 @@ class ExtensionModeManager:
         self._recaptcha_streak: Dict[str, int] = {}  # account -> consecutive recaptcha failures
         self.RECAPTCHA_HOLD_THRESHOLD = 3  # hold account after this many consecutive failures
 
+        # ─── Auto tracking cleanup — keeps reCAPTCHA score healthy ───
+        self._account_gen_count: Dict[str, int] = {}   # account -> generations since last cleanup
+        self._account_last_cleanup: Dict[str, float] = {}  # account -> timestamp of last cleanup
+        self.CLEANUP_EVERY_N_GENS = 150      # clean tracking data every N generations per account
+        self.CLEANUP_MIN_INTERVAL = 259200   # minimum 3 days (seconds) between cleanups
+
     async def run(self):
         """Main entry — start bridge, wait for extension, dispatch jobs."""
         if aiohttp is None:
@@ -1224,6 +1230,39 @@ class ExtensionModeManager:
                 if worker.slot_id not in busy_slots and not worker.is_busy:
                     return worker
         return None
+
+    def _check_auto_cleanup(self, account_email: str):
+        """Auto-clean tracking data (Service Workers, IndexedDB, _GRECAPTCHA cookie)
+        every N generations or every 3 days — whichever comes first.
+        Keeps reCAPTCHA score healthy by removing accumulated bot fingerprints."""
+        now = time.time()
+        count = self._account_gen_count.get(account_email, 0) + 1
+        self._account_gen_count[account_email] = count
+        last_cleanup = self._account_last_cleanup.get(account_email, now)
+
+        # Initialize last_cleanup on first call
+        if account_email not in self._account_last_cleanup:
+            self._account_last_cleanup[account_email] = now
+            return
+
+        time_since = now - last_cleanup
+        needs_cleanup = (
+            count >= self.CLEANUP_EVERY_N_GENS
+            or time_since >= self.CLEANUP_MIN_INTERVAL
+        )
+
+        if needs_cleanup:
+            self._log(
+                f"[ExtMode] Auto-cleanup for {account_email}: "
+                f"{count} generations, {time_since / 3600:.1f}h since last cleanup. "
+                f"Cleaning Service Workers + IndexedDB + _GRECAPTCHA cookie..."
+            )
+            # Send cleanup commands to extension
+            self._bridge.send_command("clean_tracking", account_email)
+            self._bridge.send_command("clean_recaptcha_cookie", account_email)
+            # Reset counters
+            self._account_gen_count[account_email] = 0
+            self._account_last_cleanup[account_email] = now
 
     async def _run_pipeline_job(self, worker: ExtensionWorker, job: dict):
         """Execute a pipeline job: Step 1 = generate image, Step 2 = generate video from it."""
@@ -1560,6 +1599,8 @@ class ExtensionModeManager:
                         self.qm._record_throttle_success(worker.account_email)
                         # Reset reCAPTCHA streak on success
                         self._recaptcha_streak.pop(worker.account_email, None)
+                        # Track generation count for auto cleanup
+                        self._check_auto_cleanup(worker.account_email)
                         self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed! ({output_path})")
                         return
 
