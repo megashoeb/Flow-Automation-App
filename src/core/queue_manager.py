@@ -171,6 +171,7 @@ class AsyncQueueManager(QThread):
         self.account_disabled = {}
         self.account_hold_until = {}   # account_name -> timestamp when hold expires
         self.account_hold_reason = {}  # account_name -> reason string
+        self.account_hold_count = {}   # account_name -> how many times held (for escalation)
         self._account_hold_lock = None  # Initialized in process_queue (needs event loop)
         self.account_warmup_ready = {}
         self.account_warmup_tasks = {}
@@ -1350,14 +1351,25 @@ class AsyncQueueManager(QThread):
                 self.account_recaptcha_streak.pop(account_name, None)
 
     def _put_account_on_hold(self, account_name, reason, hold_seconds):
-        """Put account on hold — stop dispatching jobs to it. (Thread-safe via dict atomicity)"""
-        self.account_hold_until[account_name] = time.time() + hold_seconds
+        """Put account on hold — stop dispatching jobs to it. (Thread-safe via dict atomicity)
+        hold_seconds is the BASE duration; actual duration escalates with repeated holds."""
+        # Escalate hold duration: 1st=base, 2nd=base*3, 3rd+=base*6
+        hold_count = self.account_hold_count.get(account_name, 0) + 1
+        self.account_hold_count[account_name] = hold_count
+        if hold_count == 1:
+            actual_hold = hold_seconds          # 5 min (300s)
+        elif hold_count == 2:
+            actual_hold = hold_seconds * 3      # 15 min (900s)
+        else:
+            actual_hold = hold_seconds * 6      # 30 min (1800s)
+
+        self.account_hold_until[account_name] = time.time() + actual_hold
         self.account_hold_reason[account_name] = reason
         self.account_disabled[account_name] = True  # Set LAST — readers check this first
-        mins = hold_seconds // 60
-        secs = hold_seconds % 60
+        mins = actual_hold // 60
+        secs = actual_hold % 60
         self.signals.log_msg.emit(
-            f"[SYSTEM] Account {account_name} ON HOLD: {reason} "
+            f"[SYSTEM] Account {account_name} ON HOLD (#{hold_count}): {reason} "
             f"(resume in {mins}m {secs}s)"
         )
         self.signals.account_auth_status.emit(account_name, "expired", f"On hold: {reason}")
@@ -1390,6 +1402,14 @@ class AsyncQueueManager(QThread):
         account_name = slot["account_name"]
         streak = self.account_recaptcha_streak.get(account_name, 0) + 1
         self.account_recaptcha_streak[account_name] = streak
+
+        # If streak >= 5, put the ENTIRE account on hold (not just the slot)
+        # This prevents all 10 workers from burning through jobs when reCAPTCHA is consistently failing
+        if streak >= 5:
+            self._put_account_on_hold(account_name, f"reCAPTCHA persistent failure (streak {streak})", 300)
+            slot["consecutive_failures"] = 0
+            slot["cooldown_announced"] = True
+            return
 
         cooldown_seconds = self.recaptcha_account_cooldown_seconds * min(streak, 3)
         cooldown_until = time.time() + cooldown_seconds
@@ -1994,7 +2014,7 @@ class AsyncQueueManager(QThread):
             f"[{label}] Failure detected: category={category}, retryable={'yes' if retryable else 'no'}."
         )
 
-        # Put account on hold for auth/rate-limit errors (Bug #13: all comparisons use .lower())
+        # Put account on hold for auth/rate-limit/reCAPTCHA errors (Bug #13: all comparisons use .lower())
         msg_lower = (error_msg or "").lower()
         if category in ("auth_missing", "project_resolution_failed"):
             self._put_account_on_hold(account_name, f"session expired ({category})", 300)
@@ -2007,6 +2027,12 @@ class AsyncQueueManager(QThread):
             self._put_account_on_hold(account_name, "rate limited", 300)
         elif "access denied" in msg_lower or "account suspended" in msg_lower:
             self._put_account_on_hold(account_name, "access denied", 1800)
+        elif category == "recaptcha_block":
+            # reCAPTCHA failures: streak-based hold is in _apply_account_recaptcha_cooldown,
+            # but if a job exhausted ALL retries on reCAPTCHA, force account hold
+            streak = self.account_recaptcha_streak.get(account_name, 0)
+            if streak >= 3:
+                self._put_account_on_hold(account_name, f"reCAPTCHA block (streak {streak})", 300)
 
         if category == "audio_filter" and retryable:
             self.signals.log_msg.emit(
@@ -2162,6 +2188,7 @@ class AsyncQueueManager(QThread):
             if success:
                 slot["consecutive_failures"] = 0
                 self.account_recaptcha_streak.pop(slot["account_name"], None)
+                self.account_hold_count.pop(slot["account_name"], None)  # Reset escalation on success
                 self.account_restart_count[self._slot_restart_key(slot)] = 0
                 slot["pending_browser_restart"] = False
                 slot["is_restarting"] = False
