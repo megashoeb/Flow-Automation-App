@@ -1413,6 +1413,8 @@ class AsyncQueueManager(QThread):
                 self.account_disabled.pop(account_name, None)
                 reason = self.account_hold_reason.pop(account_name, "")
                 self.account_hold_until.pop(account_name, None)
+                # Reset reCAPTCHA streak so account gets a fresh start
+                self.account_recaptcha_streak.pop(account_name, None)
                 self.signals.log_msg.emit(
                     f"[SYSTEM] Account {account_name} hold expired ({reason}). Reactivated."
                 )
@@ -1484,6 +1486,23 @@ class AsyncQueueManager(QThread):
                     f"[SYSTEM] Account {account_name}: ramping up to {new_max} slot(s) "
                     f"({successes} successes since throttle)."
                 )
+
+    def _report_recaptcha_from_extension(self, account_name):
+        """Called by extension_mode on EACH reCAPTCHA failure (not after all retries).
+        Tracks failures at account level. Returns True if account is now on hold."""
+        streak = self.account_recaptcha_streak.get(account_name, 0) + 1
+        self.account_recaptcha_streak[account_name] = streak
+
+        # 3 reCAPTCHA failures across ANY slots = account-level problem → hold it
+        if streak >= 3:
+            if not self.account_disabled.get(account_name):
+                self._put_account_on_hold(
+                    account_name,
+                    f"reCAPTCHA persistent failure (streak {streak})",
+                    120,  # 2 min base (escalates on repeat)
+                )
+            return True
+        return False
 
     def _apply_account_recaptcha_cooldown(self, slot):
         account_name = slot["account_name"]
