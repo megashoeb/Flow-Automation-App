@@ -2249,14 +2249,24 @@ class MainWindow(QMainWindow):
         self.lbl_logs_title.setStyleSheet("color: #94A3B8; font-size: 12px; font-weight: 700;")
         logs_header.addWidget(self.lbl_logs_title)
         logs_header.addStretch()
-        self.btn_clear_logs = QPushButton("Clear")
+        _ClearLogCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_clear_logs = _ClearLogCls()
+        self.btn_clear_logs.setText("Clear")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_clear_logs.setIcon(FluentIcon.BROOM)
+            except Exception:
+                pass
         self.btn_clear_logs.setFixedHeight(24)
-        self.btn_clear_logs.setFixedWidth(60)
-        self.btn_clear_logs.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #64748B; font-size: 10px; "
-            "border: 1px solid #334155; border-radius: 3px; } "
-            "QPushButton:hover { background-color: #334155; color: #94A3B8; }"
-        )
+        self.btn_clear_logs.setCursor(Qt.PointingHandCursor)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_clear_logs.setStyleSheet(
+                "QPushButton { background: rgba(51,65,85,0.4); color: #64748B; font-size: 10px; "
+                "border: 1px solid rgba(51,65,85,0.6); border-radius: 11px; padding: 0 12px; "
+                "font-weight: 500; letter-spacing: 0.5px; } "
+                "QPushButton:hover { background: rgba(96,165,250,0.15); color: #60A5FA; "
+                "border-color: rgba(96,165,250,0.4); }"
+            )
         self.btn_clear_logs.clicked.connect(self._clear_logs)
         logs_header.addWidget(self.btn_clear_logs)
         logs_layout.addLayout(logs_header)
@@ -2278,6 +2288,11 @@ class MainWindow(QMainWindow):
         _StartBtnCls = PrimaryPushButton if _FLUENT_UI_AVAILABLE else QPushButton
         self.btn_start = _StartBtnCls()
         self.btn_start.setText("Start Automation")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_start.setIcon(FluentIcon.PLAY)
+            except Exception:
+                pass
         self.btn_start.setFixedHeight(34)
         self.btn_start.setMinimumWidth(140)
         if not _FLUENT_UI_AVAILABLE:
@@ -2289,21 +2304,34 @@ class MainWindow(QMainWindow):
             )
         self.btn_start.clicked.connect(self.start_queue_manager)
 
-        self.btn_pause = QPushButton("Pause")
+        _PauseBtnCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_pause = _PauseBtnCls()
+        self.btn_pause.setText("Pause")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_pause.setIcon(FluentIcon.PAUSE)
+            except Exception:
+                pass
         self.btn_pause.setFixedHeight(30)
-        self.btn_pause.setFixedWidth(74)
-        self.btn_pause.setStyleSheet(
-            "QPushButton { background-color: #1E293B; color: #94A3B8; font-size: 12px; font-weight: 600; "
-            "border: 1px solid #334155; border-radius: 6px; } "
-            "QPushButton:hover { background-color: #334155; color: white; } "
-            "QPushButton:disabled { background-color: #1E293B; color: #334155; }"
-        )
+        self.btn_pause.setFixedWidth(84)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_pause.setStyleSheet(
+                "QPushButton { background-color: #1E293B; color: #94A3B8; font-size: 12px; font-weight: 600; "
+                "border: 1px solid #334155; border-radius: 6px; } "
+                "QPushButton:hover { background-color: #334155; color: white; } "
+                "QPushButton:disabled { background-color: #1E293B; color: #334155; }"
+            )
         self.btn_pause.clicked.connect(self.pause_queue_manager)
 
         self.btn_resume = _StartBtnCls()
         self.btn_resume.setText("Resume")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_resume.setIcon(FluentIcon.PLAY)
+            except Exception:
+                pass
         self.btn_resume.setFixedHeight(30)
-        self.btn_resume.setFixedWidth(84)
+        self.btn_resume.setFixedWidth(94)
         if not _FLUENT_UI_AVAILABLE:
             self.btn_resume.setStyleSheet(
                 "QPushButton { background-color: #1D4ED8; color: white; font-size: 12px; font-weight: 600; "
@@ -2315,7 +2343,7 @@ class MainWindow(QMainWindow):
 
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setFixedHeight(30)
-        self.btn_stop.setFixedWidth(64)
+        self.btn_stop.setFixedWidth(74)
         self.btn_stop.setStyleSheet(
             "QPushButton { background-color: #DC2626; color: white; font-size: 12px; font-weight: 600; "
             "border: none; border-radius: 6px; } "
@@ -2324,18 +2352,37 @@ class MainWindow(QMainWindow):
         )
         self.btn_stop.clicked.connect(self.stop_queue_manager)
 
-        self.btn_clear_queue = QPushButton("Clear Queue")
-        self.btn_clear_queue.setFixedHeight(24)
-        self.btn_clear_queue.setStyleSheet(
-            "QPushButton { background-color: transparent; color: #94A3B8; font-size: 10px; "
-            "border: 1px solid #334155; border-radius: 4px; padding: 0 8px; } "
-            "QPushButton:hover { background-color: #334155; color: white; }"
-        )
+        _ClearBtnCls = PushButton if _FLUENT_UI_AVAILABLE else QPushButton
+        self.btn_clear_queue = _ClearBtnCls()
+        self.btn_clear_queue.setText("Clear Queue")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_clear_queue.setIcon(FluentIcon.DELETE)
+            except Exception:
+                pass
+        self.btn_clear_queue.setFixedHeight(26)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_clear_queue.setStyleSheet(
+                "QPushButton { background-color: transparent; color: #94A3B8; font-size: 10px; "
+                "border: 1px solid #334155; border-radius: 4px; padding: 0 8px; } "
+                "QPushButton:hover { background-color: #334155; color: white; }"
+            )
         self.btn_clear_queue.clicked.connect(self.clear_queue)
 
-        self.btn_clear_done = QPushButton("Clear Done")
-        self.btn_clear_done.setFixedHeight(24)
-        self.btn_clear_done.setStyleSheet(self.btn_clear_queue.styleSheet())
+        self.btn_clear_done = _ClearBtnCls()
+        self.btn_clear_done.setText("Clear Done")
+        if _FLUENT_UI_AVAILABLE:
+            try:
+                self.btn_clear_done.setIcon(FluentIcon.ACCEPT)
+            except Exception:
+                pass
+        self.btn_clear_done.setFixedHeight(26)
+        if not _FLUENT_UI_AVAILABLE:
+            self.btn_clear_done.setStyleSheet(
+                "QPushButton { background-color: transparent; color: #94A3B8; font-size: 10px; "
+                "border: 1px solid #334155; border-radius: 4px; padding: 0 8px; } "
+                "QPushButton:hover { background-color: #334155; color: white; }"
+            )
         self.btn_clear_done.clicked.connect(self.clear_completed_jobs_from_queue)
 
         # Place buttons in toolbar (top bar)
