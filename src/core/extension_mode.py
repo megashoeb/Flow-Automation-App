@@ -1449,6 +1449,15 @@ class ExtensionModeManager:
                 self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                 return
 
+            # If account was put on hold (by another slot's failure), abort retries and re-queue
+            if self.qm.account_disabled.get(worker.account_email):
+                self._log(
+                    f"[{worker.slot_id}] Account on hold — aborting retries, re-queuing job."
+                )
+                update_job_status(job_id, "pending", account="")
+                self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                return
+
             try:
                 if "video" in job_type:
                     video_model = job.get("video_model") or model
@@ -1535,8 +1544,17 @@ class ExtensionModeManager:
                     await asyncio.sleep(8)  # wait for tab reload + reCAPTCHA init
                     continue
 
+                # 429 Rate limit — immediately put account on hold and re-queue job
+                err_lower = last_error.lower()
+                if any(p in err_lower for p in ("429", "rate limit", "too many requests")):
+                    self.qm._put_account_on_hold(worker.account_email, "rate limited (429)", 300)
+                    self._log(f"[{worker.slot_id}] 429 detected — account on hold, re-queuing job.")
+                    update_job_status(job_id, "pending", account="")
+                    self.qm.signals.job_updated.emit(job_id, "pending", "", "")
+                    return
+
                 # reCAPTCHA score/token failure → reload tab
-                if "recaptcha" in last_error.lower() or "captcha" in last_error.lower():
+                if "recaptcha" in err_lower or "captcha" in err_lower:
                     self._bridge.send_command("reload_tab", worker.account_email)
                     if self.qm.stop_requested or self.qm.force_stop_requested:
                         update_job_status(job_id, "pending", account="")
