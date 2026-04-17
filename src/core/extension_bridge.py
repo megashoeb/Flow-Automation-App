@@ -77,8 +77,14 @@ class ExtensionBridge:
             "last_state_change": 0,
             "state": "idle",      # idle | running | paused | disabled
         }
-        # Per-account ecosystem hold (syncs with reCAPTCHA hold state)
+        # Per-account ecosystem hold (syncs with reCAPTCHA hold state).
+        # Held accounts: warmup stops AND new generation jobs are blocked
+        # from dispatching to them (bridge refuses tokens) until hold expires
+        # OR user toggles force-enable.
         self._ecosystem_held_accounts: Dict[str, float] = {}  # email -> released_at_ts
+        # Force-enable override: user can choose to use a held account at
+        # their own risk. Generation allowed, warmup still blocked.
+        self._force_enabled_accounts: set = set()
 
     # ═══════════════════════════════════════════════════════════════
     # Lifecycle
@@ -151,6 +157,15 @@ class ExtensionBridge:
         Returns:
             dict with keys: token, access_token, project_id, error
         """
+        # ─── Block dispatch if account is held (Phase 7 emergency stop) ───
+        if self.is_account_held(account):
+            info = self.get_hold_info(account)
+            return {
+                "error": f"account_held:{info['seconds_remaining']}s_remaining",
+                "held": True,
+                "seconds_remaining": info["seconds_remaining"],
+            }
+
         # ─── Check token pool first ───
         pool = self._token_pool.get(account)
         if pool:
@@ -558,6 +573,12 @@ class ExtensionBridge:
                 self._log(
                     f"[Bridge] Ecosystem mode: {'ENABLED' if new_val else 'DISABLED'}"
                 )
+                # Persist to DB so it survives app restart
+                try:
+                    from src.db.db_manager import set_setting
+                    set_setting("ecosystem_enabled", "1" if new_val else "0")
+                except Exception:
+                    pass
                 changed = True
 
         if "generation_running" in data:
@@ -586,6 +607,18 @@ class ExtensionBridge:
             if self._ecosystem_held_accounts.pop(account, None) is not None:
                 self._log(f"[Bridge] Ecosystem hold released: {account}")
                 changed = True
+            self._force_enabled_accounts.discard(account)
+
+        if "force_enable_account" in data:
+            account = data["force_enable_account"]
+            enable = bool(data.get("enable", True))
+            self.force_enable_account(account, enable)
+            status = "FORCE-ENABLED" if enable else "un-forced"
+            self._log(
+                f"[Bridge] {account} {status} by user "
+                f"(hold still counting — generation allowed, warmup blocked)"
+            )
+            changed = True
 
         return web.json_response({
             "ok": True,
@@ -652,8 +685,12 @@ class ExtensionBridge:
 
     def hold_ecosystem_account(self, account: str, duration_seconds: int = 172800):
         """Hold ecosystem activity for an account (called when reCAPTCHA flags it).
-        Default 48 hours."""
+        Default 48 hours. Also blocks token dispatch unless force-enabled."""
         self._ecosystem_held_accounts[account] = time.time() + duration_seconds
+        # Clear any cached tokens for held account so stale ones aren't served
+        self._token_pool.pop(account, None)
+        # Reset force_enable when a new hold is applied (safety)
+        self._force_enabled_accounts.discard(account)
 
     def release_ecosystem_account(self, account: str):
         """Manually release an account's ecosystem hold."""
@@ -664,3 +701,30 @@ class ExtensionBridge:
 
     def set_ecosystem_enabled(self, enabled: bool):
         self._ecosystem_enabled = bool(enabled)
+
+    def is_account_held(self, account: str) -> bool:
+        """True if the account is currently held (reCAPTCHA flagged) AND
+        the user has NOT force-enabled it. Held accounts block both dispatch
+        and ecosystem activity."""
+        released = self._ecosystem_held_accounts.get(account, 0)
+        if released <= 0 or released <= time.time():
+            return False
+        if account in self._force_enabled_accounts:
+            return False  # user chose to override
+        return True
+
+    def force_enable_account(self, account: str, enable: bool = True):
+        if enable:
+            self._force_enabled_accounts.add(account)
+        else:
+            self._force_enabled_accounts.discard(account)
+
+    def get_hold_info(self, account: str):
+        released = self._ecosystem_held_accounts.get(account, 0)
+        now = time.time()
+        return {
+            "held": released > now,
+            "seconds_remaining": max(0, int(released - now)),
+            "released_at": released,
+            "force_enabled": account in self._force_enabled_accounts,
+        }

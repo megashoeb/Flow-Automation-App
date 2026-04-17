@@ -754,6 +754,96 @@ async function handleCommand(cmd) {
 // Auto Warmup Mode — Ecosystem Activity Engine (Phase 1)
 // ═══════════════════════════════════════════════════════════════════
 
+// ─── Phase 4: Account service profile cache ───
+// For each account, track which Google services have content (Drive files,
+// Photos, Gmail messages). Services with no content get weight=0 so we don't
+// do weird "open empty Drive, scroll nothing" activity that looks like a bot.
+// Cache TTL: 24 hours — services can be re-checked daily.
+const accountServiceProfile = {};  // email -> { drive: bool, photos: bool, gmail: bool, checked_at: ts }
+const SERVICE_PROBE_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function probeAccountServices(account) {
+  const now = Date.now();
+  const cached = accountServiceProfile[account];
+  if (cached && now - cached.checked_at < SERVICE_PROBE_TTL_MS) return cached;
+
+  const profile = {
+    drive: true,    // default true — err on side of trying
+    photos: true,
+    gmail: true,
+    checked_at: now,
+  };
+
+  // Probe Drive — fetch the main folder listing HTML, check for "Nothing in here"
+  try {
+    const resp = await fetch("https://drive.google.com/drive/my-drive", {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (resp.ok) {
+      const html = await resp.text();
+      // Drive returns SPA shell; we check for localized empty state markers
+      const emptyMarkers = [
+        "A place for all of your files",  // EN empty state
+        "no files",
+        "Nothing in here",
+        "यहाँ कुछ नहीं है",
+      ];
+      const looksEmpty = emptyMarkers.some((m) => html.includes(m));
+      profile.drive = !looksEmpty;
+    }
+  } catch {}
+
+  // Probe Photos
+  try {
+    const resp = await fetch("https://photos.google.com/", {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (resp.ok) {
+      const html = await resp.text();
+      const emptyMarkers = [
+        "You haven't added any photos yet",
+        "No photos",
+        "Add your photos",
+      ];
+      const looksEmpty = emptyMarkers.some((m) => html.includes(m));
+      profile.photos = !looksEmpty;
+    }
+  } catch {}
+
+  // Gmail — we assume almost always has emails, but still check basic
+  try {
+    const resp = await fetch("https://mail.google.com/mail/u/0/#inbox", {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (resp.ok) {
+      const html = await resp.text();
+      profile.gmail = !html.includes("No conversations selected");
+    }
+  } catch {}
+
+  accountServiceProfile[account] = profile;
+  console.log(
+    `[Ecosystem] Probed ${account}: drive=${profile.drive}, photos=${profile.photos}, gmail=${profile.gmail}`
+  );
+  return profile;
+}
+
+// Given an activity + account profile, return the effective weight
+// (0 if service empty for this account, else base weight).
+function effectiveWeight(activity, profile) {
+  if (!profile) return activity.weight;
+  if (activity.name === "drive" && !profile.drive) return 0;
+  if (activity.name === "photos" && !profile.photos) return 0;
+  if (activity.name === "gmail" && !profile.gmail) return 0;
+  return activity.weight;
+}
+
 // ─── Basic search query pool (Phase 3 will replace with per-persona pools) ───
 const ECOSYSTEM_SEARCH_QUERIES = [
   "best pizza near me", "weather today", "cricket score", "bollywood news",
@@ -840,17 +930,126 @@ async function waitForTabLoad(tabId, maxMs) {
 // All interactions run inside MAIN world so they look like real user events.
 // ═══════════════════════════════════════════════════════════════════
 
-// Common: natural scroll in the tab
+// ─── Phase 5: Natural behavior helpers ───
+// Realistic scroll with variable speed, read-pauses, occasional reversal.
 async function naturalScroll(tabId, scrolls, checkAbort) {
   for (let i = 0; i < scrolls; i++) {
     if (checkAbort && checkAbort()) throw new Error("aborted");
     const direction = Math.random() < 0.85 ? 1 : -1;   // mostly down, sometimes up
-    const amount = randInt(200, 700) * direction;
-    await injectInTab(tabId, (amt) => {
-      window.scrollBy({ top: amt, behavior: "smooth" });
-    }, [amount]);
-    await abortableSleep(randInt(1500, 4500), checkAbort);
+    const amount = randInt(150, 750) * direction;
+    // Break big scroll into 3-7 small incremental scrolls with short pauses
+    const steps = randInt(3, 7);
+    const perStep = Math.floor(amount / steps);
+    await injectInTab(tabId, async (perStep, steps) => {
+      for (let k = 0; k < steps; k++) {
+        window.scrollBy({ top: perStep, behavior: "smooth" });
+        await new Promise((r) => setTimeout(r, 80 + Math.random() * 180));
+      }
+    }, [perStep, steps]);
+    // Read pause after scroll (some longer, some shorter — realistic)
+    const readPause = Math.random() < 0.3
+      ? randInt(3500, 7000)   // longer read (30% chance)
+      : randInt(1000, 3500);  // shorter glance
+    await abortableSleep(readPause, checkAbort);
   }
+}
+
+// Realistic human typing:
+// - Variable per-character delay (60-200ms)
+// - 5% chance of typo with correction (backspace)
+// - Occasional pauses between words (200-500ms)
+// Returns injected function body as source string so we can pass it directly.
+function humanTypeInto(selector, text) {
+  return async function (sel, txt) {
+    const box = document.querySelector(sel);
+    if (!box) return false;
+    box.focus();
+    // Clear existing value gently
+    box.value = "";
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < txt.length; i++) {
+      const ch = txt[i];
+      // 5% typo chance on letter keys
+      if (/[a-z]/i.test(ch) && Math.random() < 0.05) {
+        const typoChars = "abcdefghijklmnopqrstuvwxyz";
+        const wrong = typoChars[Math.floor(Math.random() * 26)];
+        box.value += wrong;
+        box.dispatchEvent(new Event("input", { bubbles: true }));
+        await sleep(80 + Math.random() * 120);
+        // Realize mistake, backspace
+        await sleep(120 + Math.random() * 180);
+        box.value = box.value.slice(0, -1);
+        box.dispatchEvent(new Event("input", { bubbles: true }));
+        await sleep(80 + Math.random() * 120);
+      }
+      box.value += ch;
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+      // Base delay per char
+      let delay = 60 + Math.random() * 140;
+      // Word-break pause
+      if (ch === " " && Math.random() < 0.3) delay += 200 + Math.random() * 300;
+      await sleep(delay);
+    }
+    return true;
+  };
+}
+
+// Simulate a realistic mouse movement along a Bezier curve between two points.
+// This fires mouseover/mousemove events so Google's behavioral sensors see
+// non-robotic pointer paths, not just clicks. Runs entirely in-page.
+function bezierMouseMoveFn(fromX, fromY, toX, toY, steps) {
+  return async function (fx, fy, tx, ty, n) {
+    // Control points with random jitter (Bezier cubic)
+    const c1x = fx + (tx - fx) * (0.2 + Math.random() * 0.2) + (Math.random() - 0.5) * 40;
+    const c1y = fy + (ty - fy) * (0.1 + Math.random() * 0.2) + (Math.random() - 0.5) * 40;
+    const c2x = fx + (tx - fx) * (0.6 + Math.random() * 0.2) + (Math.random() - 0.5) * 40;
+    const c2y = fy + (ty - fy) * (0.7 + Math.random() * 0.2) + (Math.random() - 0.5) * 40;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      const u = 1 - t;
+      const x = u*u*u*fx + 3*u*u*t*c1x + 3*u*t*t*c2x + t*t*t*tx;
+      const y = u*u*u*fy + 3*u*u*t*c1y + 3*u*t*t*c2y + t*t*t*ty;
+      const el = document.elementFromPoint(x, y);
+      if (el) {
+        const ev = new MouseEvent("mousemove", {
+          bubbles: true, cancelable: true,
+          clientX: x, clientY: y, view: window,
+        });
+        el.dispatchEvent(ev);
+      }
+      await sleep(10 + Math.random() * 15);  // ~60-90fps ish
+    }
+  };
+}
+
+// Inject a natural idle movement — mouse meanders gently around viewport.
+async function idleMouseMeander(tabId) {
+  await injectInTab(tabId, async () => {
+    const w = window.innerWidth, h = window.innerHeight;
+    let x = Math.random() * w, y = Math.random() * h;
+    const steps = 3 + Math.floor(Math.random() * 4);
+    for (let s = 0; s < steps; s++) {
+      const nx = Math.random() * w, ny = Math.random() * h;
+      // Bezier-ish interpolation
+      const n = 10 + Math.floor(Math.random() * 15);
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        const px = x + (nx - x) * t + Math.sin(t * Math.PI) * 30 * (Math.random() - 0.5);
+        const py = y + (ny - y) * t + Math.sin(t * Math.PI) * 30 * (Math.random() - 0.5);
+        const el = document.elementFromPoint(px, py);
+        if (el) {
+          el.dispatchEvent(new MouseEvent("mousemove", {
+            bubbles: true, cancelable: true, clientX: px, clientY: py, view: window,
+          }));
+        }
+        await new Promise((r) => setTimeout(r, 12 + Math.random() * 18));
+      }
+      x = nx; y = ny;
+      await new Promise((r) => setTimeout(r, 400 + Math.random() * 600));
+    }
+  });
 }
 
 // YouTube: persona search, scroll, click a video, watch for most of duration
@@ -862,21 +1061,20 @@ async function activityYouTube(tabId, duration, checkAbort, account) {
   const doSearch = Math.random() < 0.6 && typeof personaForAccount === "function" && account;
   if (doSearch) {
     const q = personaYoutubeQuery(personaForAccount(account));
-    await injectInTab(tabId, async (query) => {
+    await idleMouseMeander(tabId);
+    await chrome.scripting.executeScript({
+      target: { tabId }, world: "MAIN",
+      func: humanTypeInto(),
+      args: ["input#search, input[name='search_query']", q],
+    }).catch(() => {});
+    await abortableSleep(randInt(400, 900), checkAbort);
+    await injectInTab(tabId, () => {
       const box = document.querySelector("input#search, input[name='search_query']");
-      if (!box) return false;
-      box.focus();
-      box.value = "";
-      for (const ch of query) {
-        box.value += ch;
-        box.dispatchEvent(new Event("input", { bubbles: true }));
-        await new Promise((r) => setTimeout(r, 70 + Math.random() * 140));
-      }
+      if (!box) return;
       const form = box.form || box.closest("form");
       if (form) form.submit();
       else box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-      return true;
-    }, [q]);
+    });
     await abortableSleep(randInt(3000, 5000), checkAbort);
     await waitForTabLoad(tabId, 10000);
   }
@@ -958,23 +1156,28 @@ async function activitySearch(tabId, duration, checkAbort, account) {
   } else {
     query = rand(ECOSYSTEM_SEARCH_QUERIES);
   }
-  // Type query into search box (simulate character-by-character)
-  await injectInTab(tabId, async (q) => {
+
+  // Mouse meander before typing — looks more realistic to Google's ML
+  await idleMouseMeander(tabId);
+
+  // Human-like typing with typos + natural delays (Phase 5)
+  await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN",
+    func: humanTypeInto(),
+    args: ["textarea[name='q'], input[name='q']", query],
+  }).catch(() => {});
+
+  // Brief pause before submit (reading what we typed)
+  await abortableSleep(randInt(300, 900), checkAbort);
+
+  // Submit
+  await injectInTab(tabId, () => {
     const box = document.querySelector("textarea[name='q'], input[name='q']");
-    if (!box) return false;
-    box.focus();
-    box.value = "";
-    for (const ch of q) {
-      box.value += ch;
-      box.dispatchEvent(new Event("input", { bubbles: true }));
-      await new Promise((r) => setTimeout(r, 70 + Math.random() * 150));
-    }
-    // Submit form
+    if (!box) return;
     const form = box.form || box.closest("form");
     if (form) form.submit();
     else box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    return true;
-  }, [query]);
+  });
 
   await abortableSleep(randInt(3000, 5000), checkAbort);
   await waitForTabLoad(tabId, 10000);
@@ -1005,19 +1208,17 @@ async function activityMaps(tabId, duration, checkAbort, account) {
   } else {
     q = rand(ECOSYSTEM_MAPS_QUERIES);
   }
-  await injectInTab(tabId, async (query) => {
+  await idleMouseMeander(tabId);
+  await chrome.scripting.executeScript({
+    target: { tabId }, world: "MAIN",
+    func: humanTypeInto(),
+    args: ["input#searchboxinput, input[name='q'], input[placeholder]", q],
+  }).catch(() => {});
+  await abortableSleep(randInt(400, 900), checkAbort);
+  await injectInTab(tabId, () => {
     const box = document.querySelector("input#searchboxinput, input[name='q'], input[placeholder]");
-    if (!box) return false;
-    box.focus();
-    box.value = "";
-    for (const ch of query) {
-      box.value += ch;
-      box.dispatchEvent(new Event("input", { bubbles: true }));
-      await new Promise((r) => setTimeout(r, 80 + Math.random() * 130));
-    }
-    box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
-    return true;
-  }, [q]);
+    if (box) box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  });
 
   await abortableSleep(randInt(5000, 10000), checkAbort);
   await naturalScroll(tabId, randInt(2, 4), checkAbort);
@@ -1056,14 +1257,20 @@ async function activityPhotos(tabId, duration, checkAbort) {
   await naturalScroll(tabId, randInt(3, 5), checkAbort);
 }
 
-function ecosystemPickActivity() {
-  const totalWeight = ECOSYSTEM_ACTIVITIES.reduce((s, a) => s + a.weight, 0);
+function ecosystemPickActivity(profile) {
+  // Apply smart check: services with no content get weight 0.
+  const weighted = ECOSYSTEM_ACTIVITIES.map((a) => ({
+    activity: a,
+    weight: effectiveWeight(a, profile),
+  })).filter((x) => x.weight > 0);
+  if (!weighted.length) return ECOSYSTEM_ACTIVITIES[0];
+  const totalWeight = weighted.reduce((s, x) => s + x.weight, 0);
   let r = Math.random() * totalWeight;
-  for (const a of ECOSYSTEM_ACTIVITIES) {
-    r -= a.weight;
-    if (r <= 0) return a;
+  for (const x of weighted) {
+    r -= x.weight;
+    if (r <= 0) return x.activity;
   }
-  return ECOSYSTEM_ACTIVITIES[0];
+  return weighted[0].activity;
 }
 
 function ecosystemPickAccount() {
@@ -1137,7 +1344,10 @@ async function ecosystemRunActivity() {
     ecosystemState.nextActivityAt = Date.now() + 5 * 60 * 1000;
     return;
   }
-  const activity = ecosystemPickActivity();
+  // Probe services for this account (cached 24h) and pick activity weighted
+  // by what content this account actually has.
+  const profile = await probeAccountServices(account.email);
+  const activity = ecosystemPickActivity(profile);
   const [minDur, maxDur] = activity.duration;
   const duration = Math.floor(minDur + Math.random() * (maxDur - minDur)) * 1000;
 
@@ -1201,6 +1411,46 @@ async function ecosystemRunActivity() {
   }
 }
 
+// ─── Phase 6: Resource / safety guards ───
+// Check battery via offscreen document (service workers can't access
+// navigator.getBattery directly). Fallback: assume plugged in if unavailable.
+let _lastBatteryCheck = 0;
+let _batteryCache = { level: 1, charging: true };
+async function checkBatterySafe() {
+  const now = Date.now();
+  if (now - _lastBatteryCheck < 60000) return _batteryCache;
+  _lastBatteryCheck = now;
+  try {
+    // Run navigator.getBattery() inside a tab we already control
+    // (we don't have one if idle, so we skip check and assume OK)
+    const tabs = await chrome.tabs.query({ url: "https://*/*" });
+    if (!tabs.length) return _batteryCache;
+    const result = await chrome.scripting.executeScript({
+      target: { tabId: tabs[0].id }, world: "MAIN",
+      func: async () => {
+        if (!navigator.getBattery) return { level: 1, charging: true };
+        const b = await navigator.getBattery();
+        return { level: b.level, charging: b.charging };
+      },
+    });
+    if (result?.[0]?.result) _batteryCache = result[0].result;
+  } catch {}
+  return _batteryCache;
+}
+
+// Detect if user is actively working in Chrome (recent foreground tab activity).
+// If user is working, we back off ecosystem activity so we don't interfere.
+let _lastUserActivity = 0;
+chrome.tabs.onActivated.addListener(() => { _lastUserActivity = Date.now(); });
+chrome.tabs.onUpdated.addListener((tid, changeInfo) => {
+  if (changeInfo.status === "complete") _lastUserActivity = Date.now();
+});
+chrome.windows.onFocusChanged.addListener(() => { _lastUserActivity = Date.now(); });
+
+function userRecentlyActive() {
+  return (Date.now() - _lastUserActivity) < 90 * 1000;  // active in last 90s
+}
+
 // Ecosystem scheduler tick — fires every 30s
 async function ecosystemTick() {
   if (ecosystemDirective !== "active") return;
@@ -1211,6 +1461,28 @@ async function ecosystemTick() {
   if (ecosystemState.nextActivityAt === 0) {
     ecosystemState.nextActivityAt = Date.now() + (60 + Math.random() * 240) * 1000;
     return;
+  }
+
+  // Phase 6 safety guards
+
+  // User is actively using Chrome? Back off.
+  if (userRecentlyActive()) {
+    console.log("[Ecosystem] User active — deferring 5 min");
+    ecosystemState.nextActivityAt = Date.now() + 5 * 60 * 1000;
+    return;
+  }
+
+  // Battery check
+  const battery = await checkBatterySafe();
+  if (!battery.charging && battery.level < 0.30) {
+    console.log(`[Ecosystem] Battery ${Math.round(battery.level * 100)}% not charging — paused`);
+    ecosystemState.nextActivityAt = Date.now() + 15 * 60 * 1000;
+    return;
+  }
+  if (!battery.charging && battery.level < 0.50) {
+    // Half the frequency on medium battery
+    ecosystemState.nextActivityAt = Date.now() + ecosystemNextGap();
+    if (Math.random() < 0.5) return;  // skip 50% of ticks
   }
 
   await ecosystemRunActivity();

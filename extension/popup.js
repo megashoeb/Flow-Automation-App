@@ -28,45 +28,88 @@ function updateStatus(status) {
         const heldSec = (status.ecosystem?.heldAccounts || {})[acc.email];
         const count = (status.ecosystem?.todayCounts || {})[acc.email] || 0;
         let badge = "";
+        let actionBtn = "";
         if (heldSec && heldSec > 0) {
           const hrs = Math.floor(heldSec / 3600);
           const mins = Math.floor((heldSec % 3600) / 60);
-          badge = `<div class="name" style="color:#ef5350">🔒 Held (${hrs}h ${mins}m)</div>`;
+          badge = `<div class="name" style="color:#ef5350">🔒 Held (${hrs}h ${mins}m left)</div>`;
+          actionBtn = `
+            <div style="margin-top:6px;display:flex;gap:4px;">
+              <button class="btn btn-secondary force-btn"
+                data-email="${acc.email}"
+                style="margin:0;padding:4px 8px;font-size:10px;flex:1;">
+                ⚠ Force Enable
+              </button>
+              <button class="btn btn-secondary release-btn"
+                data-email="${acc.email}"
+                style="margin:0;padding:4px 8px;font-size:10px;flex:1;">
+                Release
+              </button>
+            </div>`;
         } else if (count > 0) {
           badge = `<div class="name" style="color:#66bb6a">🌱 ${count} activities today</div>`;
         }
         return `
-      <div class="account-card">
-        <div class="icon">${(acc.email || "?")[0].toUpperCase()}</div>
-        <div class="info">
-          <div class="email">${acc.email || "Unknown"}</div>
-          ${badge || `<div class="name">${acc.name || ""}</div>`}
+      <div class="account-card" style="flex-direction:column;align-items:stretch;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div class="icon">${(acc.email || "?")[0].toUpperCase()}</div>
+          <div class="info">
+            <div class="email">${acc.email || "Unknown"}</div>
+            ${badge || `<div class="name">${acc.name || ""}</div>`}
+          </div>
         </div>
+        ${actionBtn}
       </div>`;
       })
       .join("");
+
+    // Wire action buttons
+    document.querySelectorAll(".force-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const email = e.target.dataset.email;
+        if (!confirm(
+          `⚠ Warning: Account '${email}' was flagged by reCAPTCHA.\n\n` +
+          `Force-enabling it may cause permanent flagging.\n\n` +
+          `Continue?`
+        )) return;
+        fetch("http://127.0.0.1:18924/ecosystem", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ force_enable_account: email, enable: true }),
+        }).then(() => setTimeout(refresh, 300));
+      });
+    });
+    document.querySelectorAll(".release-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const email = e.target.dataset.email;
+        chrome.runtime.sendMessage(
+          { type: "ecosystemReleaseAccount", account: email },
+          () => setTimeout(refresh, 300)
+        );
+      });
+    });
   } else {
     container.innerHTML = '<div class="no-accounts">No accounts detected.<br>Open labs.google.com and log in.</div>';
   }
 
   // Ecosystem state
   const eco = status.ecosystem || { directive: "disabled", running: false };
-  const toggle = document.getElementById("ecoToggle");
-  const dot = document.getElementById("ecoDot");
-  const text = document.getElementById("ecoStatusText");
+  const ecoToggle = document.getElementById("ecoToggle");
+  const ecoDot = document.getElementById("ecoDot");
+  const ecoText = document.getElementById("ecoStatusText");
   const isOn = eco.directive !== "disabled";
-  toggle.classList.toggle("on", isOn);
+  ecoToggle.classList.toggle("on", isOn);
   if (eco.directive === "active") {
-    dot.className = "eco-dot active";
-    text.textContent = eco.running
+    ecoDot.className = "eco-dot active";
+    ecoText.textContent = eco.running
       ? `Active — ${eco.currentSite} (${eco.currentAccount?.split("@")[0] || ""})`
       : "Active — idle, next activity coming";
   } else if (eco.directive === "paused") {
-    dot.className = "eco-dot paused";
-    text.textContent = "Paused — generation running";
+    ecoDot.className = "eco-dot paused";
+    ecoText.textContent = "Paused — generation running";
   } else {
-    dot.className = "eco-dot disabled";
-    text.textContent = "Disabled — toggle ON to build trust";
+    ecoDot.className = "eco-dot disabled";
+    ecoText.textContent = "Disabled — toggle ON to build trust";
   }
 }
 

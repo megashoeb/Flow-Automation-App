@@ -30,9 +30,11 @@ from src.core.extension_bridge import ExtensionBridge
 from src.db.db_manager import (
     get_accounts,
     get_all_jobs,
+    get_bool_setting,
     get_setting,
     get_int_setting,
     get_output_directory,
+    set_setting,
     update_job_status,
     update_job_runtime_state,
     get_cached_media_id,
@@ -1027,6 +1029,15 @@ class ExtensionModeManager:
         # Start bridge server
         await self._bridge.start()
 
+        # Restore ecosystem toggle state from DB (persists across app restarts)
+        try:
+            saved = get_bool_setting("ecosystem_enabled", False)
+            self._bridge.set_ecosystem_enabled(bool(saved))
+            if saved:
+                self._log("[ExtMode] Auto Warmup Mode restored: ENABLED")
+        except Exception:
+            pass
+
         try:
             slots_per_account = max(1, min(40, get_int_setting("slots_per_account", 5)))
 
@@ -1227,8 +1238,21 @@ class ExtensionModeManager:
                     continue  # This account is at its throttled limit
 
             # Check account disabled (hard hold for auth errors etc.)
+            # If account was reCAPTCHA-held AND user force-enabled it, bridge
+            # returns is_account_held=False — allow dispatch despite qm flag.
             if self.qm.account_disabled.get(account_email):
-                continue
+                try:
+                    if not self._bridge.is_account_held(account_email):
+                        # Check if this is a force-enable override
+                        hold_info = self._bridge.get_hold_info(account_email)
+                        if hold_info.get("force_enabled"):
+                            pass  # user allowed it — fall through
+                        else:
+                            continue
+                    else:
+                        continue
+                except Exception:
+                    continue
 
             for worker in workers:
                 if worker.slot_id not in busy_slots and not worker.is_busy:
