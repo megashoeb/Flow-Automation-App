@@ -48,11 +48,17 @@ Object.defineProperty(self, "ecosystemDirective", {
   get: ecosystemComputeDirective,
 });
 
-// Load persisted toggle on startup
-chrome.storage.local.get(["ecosystemEnabledLocal"], (result) => {
-  ecosystemEnabledLocal = !!result.ecosystemEnabledLocal;
-  console.log(`[Ecosystem] Restored local toggle: ${ecosystemEnabledLocal ? "ON" : "OFF"}`);
-});
+// Load persisted toggle on startup (guarded — works even if storage API unavailable)
+try {
+  if (chrome.storage && chrome.storage.local) {
+    chrome.storage.local.get(["ecosystemEnabledLocal"], (result) => {
+      ecosystemEnabledLocal = !!(result && result.ecosystemEnabledLocal);
+      console.log(`[Ecosystem] Restored local toggle: ${ecosystemEnabledLocal ? "ON" : "OFF"}`);
+    });
+  }
+} catch (e) {
+  console.warn("[Ecosystem] storage.local unavailable:", e.message);
+}
 const ecosystemState = {
   running: false,       // an activity is currently executing
   currentAccount: "",   // which account's tab is active
@@ -1735,7 +1741,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Apply locally IMMEDIATELY (works even if bridge offline)
     const enabled = !!msg.enabled;
     ecosystemEnabledLocal = enabled;
-    chrome.storage.local.set({ ecosystemEnabledLocal: enabled });
+    try {
+      if (chrome.storage && chrome.storage.local) {
+        chrome.storage.local.set({ ecosystemEnabledLocal: enabled });
+      }
+    } catch (e) {
+      console.warn("[Ecosystem] storage.set failed:", e.message);
+    }
     console.log(`[Ecosystem] Local toggle: ${enabled ? "ON" : "OFF"}`);
 
     // Abort running activity if user turned OFF

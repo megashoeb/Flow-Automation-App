@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "G-Labs Studio Helper",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image generation",
   "permissions": [
     "tabs",
     "scripting",
     "cookies",
     "webRequest",
-    "browsingData"
+    "browsingData",
+    "storage"
   ],
   "host_permissions": [
     "https://labs.google/*",
