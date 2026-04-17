@@ -103,9 +103,13 @@ function updateStatus(status) {
   ecoToggle.classList.toggle("on", isOn);
 
   if (!eco.bridgeOnline && isOn) {
-    // Toggle is ON but bridge is offline — ecosystem will activate when app starts
-    ecoDot.className = "eco-dot paused";
-    ecoText.textContent = "Waiting for app to start...";
+    // Bridge offline but toggle ON — warmup still runs independently,
+    // just without generation-pause awareness (no generation can happen
+    // without the app anyway).
+    ecoDot.className = "eco-dot active";
+    ecoText.textContent = eco.running
+      ? `Active (standalone) — ${eco.currentSite}`
+      : "Active (standalone) — app not needed for warmup";
   } else if (eco.directive === "active") {
     ecoDot.className = "eco-dot active";
     ecoText.textContent = eco.running
