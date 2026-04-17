@@ -930,44 +930,105 @@ async function waitForTabLoad(tabId, maxMs) {
 // All interactions run inside MAIN world so they look like real user events.
 // ═══════════════════════════════════════════════════════════════════
 
-// ─── Phase 5: Natural behavior helpers ───
-// Realistic scroll with variable speed, read-pauses, occasional reversal.
+// ─── Phase 5 (Upgraded): Human-grade natural behavior helpers ───
+// Upgrades vs original:
+//  1. Bell-curve velocity (ease-in-out: fast in middle, slow at start/end)
+//  2. Overshoot + correct (20% chance of crossing target and coming back)
+//  3. Scroll with logarithmic deceleration + overshoot
+//  4. Smoothed noise (1D low-pass filter instead of pure Math.random jitter)
+
+// Note: smoothNoise + easeInOutCubic are defined inline inside the MAIN-world
+// injected functions below (they run in page context, can't see outer scope).
+//
+// Realistic scroll with bell-curve velocity, logarithmic deceleration,
+// occasional overshoot + correction, and smoothed noise on step sizes.
 async function naturalScroll(tabId, scrolls, checkAbort) {
   for (let i = 0; i < scrolls; i++) {
     if (checkAbort && checkAbort()) throw new Error("aborted");
     const direction = Math.random() < 0.85 ? 1 : -1;   // mostly down, sometimes up
-    const amount = randInt(150, 750) * direction;
-    // Break big scroll into 3-7 small incremental scrolls with short pauses
-    const steps = randInt(3, 7);
-    const perStep = Math.floor(amount / steps);
-    await injectInTab(tabId, async (perStep, steps) => {
+    const total = randInt(200, 900) * direction;
+    // 20% chance of overshoot on primary scroll (goes too far, corrects back)
+    const overshoot = Math.random() < 0.20;
+    const overshootAmount = overshoot
+      ? Math.floor(total * (0.15 + Math.random() * 0.20))
+      : 0;
+
+    // Break big scroll into 5-9 increments with logarithmic deceleration
+    // (faster start, slower end — like a real scroll wheel spin)
+    const steps = randInt(5, 9);
+    await injectInTab(tabId, async (total, overshootAmt, steps) => {
+      // Smoothed noise for per-step timing
+      let noisePrev = Math.random() * 2 - 1;
+      const noise = () => { noisePrev = noisePrev * 0.6 + (Math.random() * 2 - 1) * 0.4; return noisePrev; };
+      // Logarithmic distribution of step sizes: sum = total
+      const weights = [];
       for (let k = 0; k < steps; k++) {
-        window.scrollBy({ top: perStep, behavior: "smooth" });
-        await new Promise((r) => setTimeout(r, 80 + Math.random() * 180));
+        // exp decay — first steps bigger, last steps smaller
+        weights.push(Math.exp(-k * 0.4));
       }
-    }, [perStep, steps]);
-    // Read pause after scroll (some longer, some shorter — realistic)
-    const readPause = Math.random() < 0.3
-      ? randInt(3500, 7000)   // longer read (30% chance)
-      : randInt(1000, 3500);  // shorter glance
+      const weightSum = weights.reduce((a, b) => a + b, 0);
+      // Primary scroll (possibly past target if overshoot)
+      const primaryTarget = total + overshootAmt;
+      for (let k = 0; k < steps; k++) {
+        const stepSize = Math.round((weights[k] / weightSum) * primaryTarget);
+        window.scrollBy({ top: stepSize, behavior: "smooth" });
+        // Step delay: base 70-180ms + noise
+        const base = 70 + Math.random() * 110;
+        const jitter = noise() * 30;
+        await new Promise((r) => setTimeout(r, Math.max(30, base + jitter)));
+      }
+      // If we overshot, correct back
+      if (overshootAmt !== 0) {
+        // Short pause (human notices overshoot)
+        await new Promise((r) => setTimeout(r, 150 + Math.random() * 250));
+        // Correct: scroll back the overshoot amount in 2-3 small steps
+        const correctSteps = 2 + Math.floor(Math.random() * 2);
+        for (let k = 0; k < correctSteps; k++) {
+          window.scrollBy({ top: -overshootAmt / correctSteps, behavior: "smooth" });
+          await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+        }
+      }
+    }, [total, overshootAmount, steps]);
+
+    // Read pause — 3 levels of realism:
+    // - Long read (30% chance): 3.5-7s
+    // - Glance (50%): 1-3.5s
+    // - Very quick flick (20%): 0.3-1s
+    const r = Math.random();
+    let readPause;
+    if (r < 0.30) readPause = randInt(3500, 7000);
+    else if (r < 0.80) readPause = randInt(1000, 3500);
+    else readPause = randInt(300, 1000);
     await abortableSleep(readPause, checkAbort);
   }
 }
 
-// Realistic human typing:
-// - Variable per-character delay (60-200ms)
+// Realistic human typing (upgraded):
+// - Variable per-character delay driven by smoothed noise (correlated —
+//   real typists speed up in rhythm, slow down occasionally, not pure random)
 // - 5% chance of typo with correction (backspace)
-// - Occasional pauses between words (200-500ms)
-// Returns injected function body as source string so we can pass it directly.
+// - Bigrams that are common in English type faster, uncommon slower
+// - Occasional pauses between words
+// - Long pause 3% chance (thinking mid-query)
 function humanTypeInto(selector, text) {
   return async function (sel, txt) {
     const box = document.querySelector(sel);
     if (!box) return false;
     box.focus();
-    // Clear existing value gently
     box.value = "";
     box.dispatchEvent(new Event("input", { bubbles: true }));
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Smoothed 1D noise for typing rhythm
+    let noise = Math.random() * 2 - 1;
+    const nextNoise = () => { noise = noise * 0.7 + (Math.random() * 2 - 1) * 0.3; return noise; };
+
+    // Common bigrams that real typists hit faster (just a shortlist)
+    const fastBigrams = new Set([
+      "th", "he", "in", "er", "an", "re", "on", "en", "at", "nd", "ed",
+      "nt", "ha", "st", "or", "ou", "ng", "as", "is", "of", "it", "es"
+    ]);
+
     for (let i = 0; i < txt.length; i++) {
       const ch = txt[i];
       // 5% typo chance on letter keys
@@ -977,19 +1038,36 @@ function humanTypeInto(selector, text) {
         box.value += wrong;
         box.dispatchEvent(new Event("input", { bubbles: true }));
         await sleep(80 + Math.random() * 120);
-        // Realize mistake, backspace
+        // Realize mistake — hesitation + backspace
         await sleep(120 + Math.random() * 180);
         box.value = box.value.slice(0, -1);
         box.dispatchEvent(new Event("input", { bubbles: true }));
         await sleep(80 + Math.random() * 120);
       }
+
       box.value += ch;
       box.dispatchEvent(new Event("input", { bubbles: true }));
-      // Base delay per char
-      let delay = 60 + Math.random() * 140;
+
+      // Base delay — smoothed noise shifts the mean ±25%
+      const baseMean = 110;
+      const noiseShift = nextNoise() * 40;   // ±40ms from rhythm
+      let delay = baseMean + noiseShift + Math.random() * 80;
+
+      // Bigram speed-up
+      if (i + 1 < txt.length) {
+        const bi = (ch + txt[i + 1]).toLowerCase();
+        if (fastBigrams.has(bi)) delay *= 0.75;
+      }
+
       // Word-break pause
-      if (ch === " " && Math.random() < 0.3) delay += 200 + Math.random() * 300;
-      await sleep(delay);
+      if (ch === " " && Math.random() < 0.35) delay += 180 + Math.random() * 320;
+
+      // 3% chance of "thinking" pause mid-query
+      if (Math.random() < 0.03 && i > 2 && i < txt.length - 3) {
+        delay += 500 + Math.random() * 1200;
+      }
+
+      await sleep(Math.max(35, delay));
     }
     return true;
   };
@@ -1024,30 +1102,103 @@ function bezierMouseMoveFn(fromX, fromY, toX, toY, steps) {
   };
 }
 
-// Inject a natural idle movement — mouse meanders gently around viewport.
+// Human-grade mouse meander across viewport. Upgrades:
+//  - Bezier cubic with randomized control points (shy-mouse style)
+//  - Bell-curve velocity (ease-in-out cubic — fast middle, slow ends)
+//  - 20% overshoot + correct at waypoints
+//  - Smoothed noise for jitter (correlated, not chaotic)
+//  - Fitts's-Law-inspired movement time: longer = slower per-pixel
+//  - Variable polling interval 10-20ms (~60-100Hz)
+//  - Occasional hesitation mid-path
 async function idleMouseMeander(tabId) {
   await injectInTab(tabId, async () => {
     const w = window.innerWidth, h = window.innerHeight;
-    let x = Math.random() * w, y = Math.random() * h;
-    const steps = 3 + Math.floor(Math.random() * 4);
-    for (let s = 0; s < steps; s++) {
-      const nx = Math.random() * w, ny = Math.random() * h;
-      // Bezier-ish interpolation
-      const n = 10 + Math.floor(Math.random() * 15);
-      for (let i = 0; i <= n; i++) {
-        const t = i / n;
-        const px = x + (nx - x) * t + Math.sin(t * Math.PI) * 30 * (Math.random() - 0.5);
-        const py = y + (ny - y) * t + Math.sin(t * Math.PI) * 30 * (Math.random() - 0.5);
-        const el = document.elementFromPoint(px, py);
-        if (el) {
-          el.dispatchEvent(new MouseEvent("mousemove", {
-            bubbles: true, cancelable: true, clientX: px, clientY: py, view: window,
-          }));
-        }
-        await new Promise((r) => setTimeout(r, 12 + Math.random() * 18));
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Smoothed 1D noise
+    let nX = Math.random() * 2 - 1, nY = Math.random() * 2 - 1;
+    const noiseX = () => { nX = nX * 0.65 + (Math.random() * 2 - 1) * 0.35; return nX; };
+    const noiseY = () => { nY = nY * 0.65 + (Math.random() * 2 - 1) * 0.35; return nY; };
+
+    // Ease-in-out cubic — bell-curve velocity profile
+    const ease = (t) => (t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2);
+
+    // Fitts's Law-ish duration estimate: base + k * log2(distance / target_size)
+    function fittsMs(dist) {
+      // Assume effective target width ~ 80px. a=120ms, b=80ms/bit.
+      const bits = Math.log2(dist / 80 + 1);
+      return 120 + 80 * bits + Math.random() * 80;  // jitter
+    }
+
+    // Dispatch mousemove event at (px, py)
+    function fire(px, py) {
+      const el = document.elementFromPoint(px, py);
+      if (el) {
+        el.dispatchEvent(new MouseEvent("mousemove", {
+          bubbles: true, cancelable: true, clientX: px, clientY: py, view: window,
+        }));
       }
+    }
+
+    // Bezier cubic with ease-in-out velocity + overshoot-correct
+    async function moveTo(fx, fy, tx, ty) {
+      const dist = Math.hypot(tx - fx, ty - fy);
+      const durationMs = fittsMs(dist);
+      // Randomized control points (asymmetric so path isn't a perfect arc)
+      const c1x = fx + (tx - fx) * (0.15 + Math.random() * 0.25) + noiseX() * 50;
+      const c1y = fy + (ty - fy) * (0.10 + Math.random() * 0.20) + noiseY() * 50;
+      const c2x = fx + (tx - fx) * (0.60 + Math.random() * 0.25) + noiseX() * 50;
+      const c2y = fy + (ty - fy) * (0.70 + Math.random() * 0.20) + noiseY() * 50;
+      // 20% overshoot — extend target by 8-15% then correct back
+      const overshoot = Math.random() < 0.20;
+      const overExt = overshoot ? 0.08 + Math.random() * 0.07 : 0;
+      const dx = tx - fx, dy = ty - fy;
+      const extX = tx + dx * overExt;
+      const extY = ty + dy * overExt;
+      const ux = overshoot ? extX : tx;
+      const uy = overshoot ? extY : ty;
+
+      const steps = Math.max(15, Math.floor(durationMs / 14));
+      const stepMs = durationMs / steps;
+
+      for (let i = 0; i <= steps; i++) {
+        const raw = i / steps;
+        const t = ease(raw);                     // bell-curve velocity
+        const u = 1 - t;
+        const x = u*u*u*fx + 3*u*u*t*c1x + 3*u*t*t*c2x + t*t*t*ux + noiseX() * 1.5;
+        const y = u*u*u*fy + 3*u*u*t*c1y + 3*u*t*t*c2y + t*t*t*uy + noiseY() * 1.5;
+        fire(x, y);
+        // Variable polling ~60-100Hz
+        await sleep(Math.max(8, stepMs + (Math.random() - 0.5) * 6));
+        // 5% chance of mid-path micro-hesitation
+        if (Math.random() < 0.05 && i > 3 && i < steps - 3) {
+          await sleep(80 + Math.random() * 180);
+        }
+      }
+
+      // Correct overshoot if needed (short reverse path)
+      if (overshoot) {
+        await sleep(100 + Math.random() * 200);
+        const correctSteps = 5 + Math.floor(Math.random() * 4);
+        for (let i = 1; i <= correctSteps; i++) {
+          const ct = i / correctSteps;
+          const cx = ux + (tx - ux) * ease(ct);
+          const cy = uy + (ty - uy) * ease(ct);
+          fire(cx, cy);
+          await sleep(14 + Math.random() * 8);
+        }
+      }
+    }
+
+    // Meander across 3-5 waypoints
+    let x = Math.random() * w, y = Math.random() * h;
+    const waypoints = 3 + Math.floor(Math.random() * 3);
+    for (let s = 0; s < waypoints; s++) {
+      const nx = Math.random() * w, ny = Math.random() * h;
+      await moveTo(x, y, nx, ny);
       x = nx; y = ny;
-      await new Promise((r) => setTimeout(r, 400 + Math.random() * 600));
+      // Pause at waypoint (human-like)
+      await sleep(300 + Math.random() * 700);
     }
   });
 }
