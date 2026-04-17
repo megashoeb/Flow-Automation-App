@@ -135,7 +135,13 @@ function updateStatus(status) {
     const wait = Math.round((eco.nextActivityAt - Date.now()) / 1000);
     const mins = Math.floor(wait / 60), secs = wait % 60;
     progWrap.style.display = "none";
-    nextEl.textContent = `Next activity in ~${mins}m ${secs}s`;
+    const reasonMap = {
+      user_navigating: " (you're navigating — waiting for you)",
+      low_battery: " (low battery — conserving)",
+      battery_conserve: " (battery save mode)",
+    };
+    const reasonText = reasonMap[eco.deferReason] || "";
+    nextEl.textContent = `Next activity in ~${mins}m ${secs}s${reasonText}`;
   } else {
     progWrap.style.display = "none";
     nextEl.textContent = "";

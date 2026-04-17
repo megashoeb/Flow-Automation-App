@@ -67,6 +67,7 @@ const ecosystemState = {
   currentStartedAt: 0,  // when current activity started (timestamp)
   currentDurationMs: 0, // how long current activity will run
   nextActivityAt: 0,    // timestamp when next activity should fire
+  deferReason: "",      // why we're deferring ("user_navigating", etc.)
   todayCounts: {},      // email -> int (reset daily locally)
   lastReset: 0,         // date tracker
   log: [],              // ring buffer of recent events (see logEcosystem)
@@ -1651,17 +1652,23 @@ async function checkBatterySafe() {
   return _batteryCache;
 }
 
-// Detect if user is actively working in Chrome (recent foreground tab activity).
-// If user is working, we back off ecosystem activity so we don't interfere.
+// Detect if user is actively typing/clicking in Chrome.
+// Previously tracked tab-switch + focus changes too, but those trigger
+// when user opens the popup — causing warmup to forever-defer while
+// user tests the extension. Now we only count ACTUAL interaction
+// (tab URL changes by user navigation, which excludes our own bg tabs).
 let _lastUserActivity = 0;
-chrome.tabs.onActivated.addListener(() => { _lastUserActivity = Date.now(); });
-chrome.tabs.onUpdated.addListener((tid, changeInfo) => {
-  if (changeInfo.status === "complete") _lastUserActivity = Date.now();
+chrome.tabs.onUpdated.addListener((tid, changeInfo, tab) => {
+  // Only count navigation to a new URL (real user action), not load completion.
+  // Also skip if this is one of our own ecosystem background tabs.
+  if (changeInfo.url && ecosystemState.currentTabId !== tid) {
+    _lastUserActivity = Date.now();
+  }
 });
-chrome.windows.onFocusChanged.addListener(() => { _lastUserActivity = Date.now(); });
 
 function userRecentlyActive() {
-  return (Date.now() - _lastUserActivity) < 90 * 1000;  // active in last 90s
+  // 45s window, only counts real navigations. Less aggressive than before.
+  return (Date.now() - _lastUserActivity) < 45 * 1000;
 }
 
 // Ecosystem scheduler tick — fires every 30s
@@ -1678,10 +1685,10 @@ async function ecosystemTick() {
 
   // Phase 6 safety guards
 
-  // User is actively using Chrome? Back off.
+  // User is actively navigating Chrome? Back off briefly.
   if (userRecentlyActive()) {
-    console.log("[Ecosystem] User active — deferring 5 min");
-    ecosystemState.nextActivityAt = Date.now() + 5 * 60 * 1000;
+    ecosystemState.deferReason = "user_navigating";
+    ecosystemState.nextActivityAt = Date.now() + 90 * 1000;  // 90s, not 5 min
     return;
   }
 
@@ -1689,15 +1696,20 @@ async function ecosystemTick() {
   const battery = await checkBatterySafe();
   if (!battery.charging && battery.level < 0.30) {
     console.log(`[Ecosystem] Battery ${Math.round(battery.level * 100)}% not charging — paused`);
+    ecosystemState.deferReason = "low_battery";
     ecosystemState.nextActivityAt = Date.now() + 15 * 60 * 1000;
     return;
   }
   if (!battery.charging && battery.level < 0.50) {
     // Half the frequency on medium battery
     ecosystemState.nextActivityAt = Date.now() + ecosystemNextGap();
-    if (Math.random() < 0.5) return;  // skip 50% of ticks
+    if (Math.random() < 0.5) {
+      ecosystemState.deferReason = "battery_conserve";
+      return;
+    }
   }
 
+  ecosystemState.deferReason = "";
   await ecosystemRunActivity();
 }
 
@@ -1753,6 +1765,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         currentStartedAt: ecosystemState.currentStartedAt,
         currentDurationMs: ecosystemState.currentDurationMs,
         nextActivityAt: ecosystemState.nextActivityAt,
+        deferReason: ecosystemState.deferReason || "",
         heldAccounts: ecosystemHeldAccounts,
         todayCounts: ecosystemState.todayCounts,
         log: ecosystemState.log.slice(-15),  // last 15 events
