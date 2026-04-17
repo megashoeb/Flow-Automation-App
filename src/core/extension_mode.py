@@ -1140,6 +1140,10 @@ class ExtensionModeManager:
 
                 self._active_tasks = [t for t in self._active_tasks if not t.done()]
 
+                # Signal ecosystem: generation is running iff there are active tasks
+                # Extension will pause background activity during generation.
+                self._bridge.set_generation_running(len(self._active_tasks) > 0)
+
                 jobs = get_all_jobs()
                 pending = [j for j in jobs if j["status"] == "pending"]
 
@@ -1642,6 +1646,14 @@ class ExtensionModeManager:
                         already_held = self.qm.account_disabled.get(worker.account_email, False)
                         # Account is flagged — hold it and reassign jobs
                         self.qm.account_disabled[worker.account_email] = True
+                        # Also hold ecosystem activity for this account (48h default)
+                        # Using warmup on a flagged account makes things worse.
+                        try:
+                            self._bridge.hold_ecosystem_account(
+                                worker.account_email, duration_seconds=172800
+                            )
+                        except Exception:
+                            pass
                         if not already_held:
                             # First slot to detect — log, warn, reassign
                             self._log(

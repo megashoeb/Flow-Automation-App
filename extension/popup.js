@@ -24,20 +24,49 @@ function updateStatus(status) {
   const container = document.getElementById("accountsList");
   if (status.accounts && status.accounts.length > 0) {
     container.innerHTML = status.accounts
-      .map(
-        (acc) => `
+      .map((acc) => {
+        const heldSec = (status.ecosystem?.heldAccounts || {})[acc.email];
+        const count = (status.ecosystem?.todayCounts || {})[acc.email] || 0;
+        let badge = "";
+        if (heldSec && heldSec > 0) {
+          const hrs = Math.floor(heldSec / 3600);
+          const mins = Math.floor((heldSec % 3600) / 60);
+          badge = `<div class="name" style="color:#ef5350">🔒 Held (${hrs}h ${mins}m)</div>`;
+        } else if (count > 0) {
+          badge = `<div class="name" style="color:#66bb6a">🌱 ${count} activities today</div>`;
+        }
+        return `
       <div class="account-card">
         <div class="icon">${(acc.email || "?")[0].toUpperCase()}</div>
         <div class="info">
           <div class="email">${acc.email || "Unknown"}</div>
-          <div class="name">${acc.name || ""}</div>
+          ${badge || `<div class="name">${acc.name || ""}</div>`}
         </div>
-      </div>
-    `
-      )
+      </div>`;
+      })
       .join("");
   } else {
     container.innerHTML = '<div class="no-accounts">No accounts detected.<br>Open labs.google.com and log in.</div>';
+  }
+
+  // Ecosystem state
+  const eco = status.ecosystem || { directive: "disabled", running: false };
+  const toggle = document.getElementById("ecoToggle");
+  const dot = document.getElementById("ecoDot");
+  const text = document.getElementById("ecoStatusText");
+  const isOn = eco.directive !== "disabled";
+  toggle.classList.toggle("on", isOn);
+  if (eco.directive === "active") {
+    dot.className = "eco-dot active";
+    text.textContent = eco.running
+      ? `Active — ${eco.currentSite} (${eco.currentAccount?.split("@")[0] || ""})`
+      : "Active — idle, next activity coming";
+  } else if (eco.directive === "paused") {
+    dot.className = "eco-dot paused";
+    text.textContent = "Paused — generation running";
+  } else {
+    dot.className = "eco-dot disabled";
+    text.textContent = "Disabled — toggle ON to build trust";
   }
 }
 
@@ -58,6 +87,16 @@ document.getElementById("btnRefresh").addEventListener("click", () => {
   chrome.runtime.sendMessage({ type: "detectAccounts" }, (response) => {
     refresh();
   });
+});
+
+// Ecosystem toggle
+document.getElementById("ecoToggle").addEventListener("click", () => {
+  const toggle = document.getElementById("ecoToggle");
+  const newState = !toggle.classList.contains("on");
+  chrome.runtime.sendMessage(
+    { type: "ecosystemToggle", enabled: newState },
+    () => setTimeout(refresh, 500)
+  );
 });
 
 // Initial load

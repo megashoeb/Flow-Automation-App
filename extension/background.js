@@ -25,6 +25,26 @@ let _workInProgress = false;  // serialization lock — only one handleWork at a
 const _recaptchaCache = {};  // tabId → { valid: bool, ts: timestamp }
 const _RECAPTCHA_CACHE_TTL = 30000;  // 30 seconds
 
+// ─── Ecosystem / Auto Warmup Mode state ───
+// Directive comes from bridge via /poll:
+//   "disabled" = toggle off, do nothing
+//   "paused"   = generation is running, stop activity
+//   "active"   = idle, run warmup activity
+let ecosystemDirective = "disabled";
+let ecosystemHeldAccounts = {};  // email -> seconds_remaining
+const ecosystemState = {
+  running: false,       // an activity is currently executing
+  currentAccount: "",   // which account's tab is active
+  currentSite: "",      // e.g. "youtube"
+  currentTabId: null,
+  nextActivityAt: 0,    // timestamp when next activity should fire
+  todayCounts: {},      // email -> int (reset daily locally)
+  lastReset: 0,         // date tracker
+};
+const ECOSYSTEM_MIN_GAP_MS = 15 * 60 * 1000;   // 15 min
+const ECOSYSTEM_MAX_GAP_MS = 40 * 60 * 1000;   // 40 min
+const ECOSYSTEM_MAX_PER_DAY = 35;              // safety cap per account per day
+
 // ═══════════════════════════════════════════════════════════════════
 // Bridge Communication
 // ═══════════════════════════════════════════════════════════════════
@@ -69,6 +89,23 @@ async function pollBridge() {
     // Handle commands (cookie clear, tab reload, etc.)
     if (data.command) {
       await handleCommand(data.command);
+    }
+
+    // ─── Ecosystem directive from bridge ───
+    if (data.ecosystem) {
+      const prevDirective = ecosystemDirective;
+      ecosystemDirective = data.ecosystem.directive || "disabled";
+      ecosystemHeldAccounts = data.ecosystem.held_accounts || {};
+
+      if (prevDirective !== ecosystemDirective) {
+        console.log(`[Ecosystem] Directive changed: ${prevDirective} → ${ecosystemDirective}`);
+      }
+
+      // If we were running an activity and directive is now paused/disabled,
+      // abort it IMMEDIATELY so generation never shares bandwidth/CPU.
+      if (ecosystemState.running && ecosystemDirective !== "active") {
+        await ecosystemAbortCurrent("directive_changed:" + ecosystemDirective);
+      }
     }
   } catch (e) {
     bridgeConnected = false;
@@ -711,6 +748,164 @@ async function handleCommand(cmd) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Auto Warmup Mode — Ecosystem Activity Engine (Phase 1)
+// ═══════════════════════════════════════════════════════════════════
+
+// Activity pool. Phase 1 stubs — Phase 2 will flesh out each.
+const ECOSYSTEM_ACTIVITIES = [
+  { name: "youtube",  weight: 30, url: "https://www.youtube.com/",        duration: [120, 300] },
+  { name: "gmail",    weight: 20, url: "https://mail.google.com/",        duration: [60, 120] },
+  { name: "search",   weight: 15, url: "https://www.google.com/",         duration: [60, 180] },
+  { name: "drive",    weight: 10, url: "https://drive.google.com/",       duration: [60, 120] },
+  { name: "maps",     weight: 10, url: "https://www.google.com/maps",     duration: [60, 120] },
+  { name: "news",     weight: 10, url: "https://news.google.com/",        duration: [60, 180] },
+  { name: "photos",   weight: 5,  url: "https://photos.google.com/",      duration: [60, 120] },
+];
+
+function ecosystemPickActivity() {
+  const totalWeight = ECOSYSTEM_ACTIVITIES.reduce((s, a) => s + a.weight, 0);
+  let r = Math.random() * totalWeight;
+  for (const a of ECOSYSTEM_ACTIVITIES) {
+    r -= a.weight;
+    if (r <= 0) return a;
+  }
+  return ECOSYSTEM_ACTIVITIES[0];
+}
+
+function ecosystemPickAccount() {
+  // Pick a random logged-in account that isn't held and hasn't hit daily cap.
+  const today = new Date().toISOString().slice(0, 10);
+  if (ecosystemState.lastReset !== today) {
+    ecosystemState.todayCounts = {};
+    ecosystemState.lastReset = today;
+  }
+  const candidates = Object.values(connectedAccounts)
+    .filter((a) => a.logged_in && a.email)
+    .filter((a) => !(a.email in ecosystemHeldAccounts))
+    .filter((a) => (ecosystemState.todayCounts[a.email] || 0) < ECOSYSTEM_MAX_PER_DAY);
+  if (!candidates.length) return null;
+  return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+// Gaussian-ish random gap (Box-Muller)
+function ecosystemNextGap() {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  const mean = (ECOSYSTEM_MIN_GAP_MS + ECOSYSTEM_MAX_GAP_MS) / 2;
+  const std = (ECOSYSTEM_MAX_GAP_MS - ECOSYSTEM_MIN_GAP_MS) / 4;
+  let gap = mean + z * std;
+  gap = Math.max(ECOSYSTEM_MIN_GAP_MS, Math.min(ECOSYSTEM_MAX_GAP_MS, gap));
+  return Math.floor(gap);
+}
+
+async function ecosystemReportActivity(account, site, action, durationSec) {
+  try {
+    await fetch(`${BRIDGE_URL}/ecosystem/activity`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account, site, action, duration_sec: durationSec || 0 }),
+    });
+  } catch {}
+}
+
+async function ecosystemAbortCurrent(reason) {
+  if (!ecosystemState.running) return;
+  const { currentAccount, currentSite, currentTabId } = ecosystemState;
+  console.log(`[Ecosystem] Aborting ${currentSite} on ${currentAccount}: ${reason}`);
+  ecosystemState.running = false;
+  if (currentTabId) {
+    try { await chrome.tabs.remove(currentTabId); } catch {}
+  }
+  ecosystemState.currentTabId = null;
+  ecosystemState.currentAccount = "";
+  ecosystemState.currentSite = "";
+  ecosystemReportActivity(currentAccount, currentSite, "abort", 0);
+}
+
+async function ecosystemRunActivity() {
+  if (ecosystemState.running) return;
+  if (ecosystemDirective !== "active") return;
+
+  const account = ecosystemPickAccount();
+  if (!account) {
+    console.log("[Ecosystem] No eligible accounts — waiting");
+    ecosystemState.nextActivityAt = Date.now() + 5 * 60 * 1000;
+    return;
+  }
+  const activity = ecosystemPickActivity();
+  const [minDur, maxDur] = activity.duration;
+  const duration = Math.floor(minDur + Math.random() * (maxDur - minDur)) * 1000;
+
+  ecosystemState.running = true;
+  ecosystemState.currentAccount = account.email;
+  ecosystemState.currentSite = activity.name;
+
+  console.log(
+    `[Ecosystem] ${account.email} → ${activity.name} for ${Math.round(duration / 1000)}s`
+  );
+  ecosystemReportActivity(account.email, activity.name, "start", 0);
+
+  let tabId = null;
+  try {
+    // Open background tab (invisible to user)
+    const tab = await chrome.tabs.create({ url: activity.url, active: false });
+    tabId = tab.id;
+    ecosystemState.currentTabId = tabId;
+
+    // Wait for activity duration, but check abort every 3s
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < duration) {
+      if (ecosystemDirective !== "active") {
+        // Directive changed mid-activity — abort
+        throw new Error("directive_changed_mid_activity");
+      }
+      if (!ecosystemState.running) {
+        // Aborted externally
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+
+    // Activity completed — track count
+    ecosystemState.todayCounts[account.email] =
+      (ecosystemState.todayCounts[account.email] || 0) + 1;
+    ecosystemReportActivity(
+      account.email, activity.name, "end", Math.round(duration / 1000)
+    );
+  } catch (e) {
+    console.warn(`[Ecosystem] Activity error: ${e.message}`);
+    ecosystemReportActivity(account.email, activity.name, "error", 0);
+  } finally {
+    if (tabId) {
+      try { await chrome.tabs.remove(tabId); } catch {}
+    }
+    ecosystemState.running = false;
+    ecosystemState.currentTabId = null;
+    ecosystemState.currentAccount = "";
+    ecosystemState.currentSite = "";
+    // Schedule next activity
+    ecosystemState.nextActivityAt = Date.now() + ecosystemNextGap();
+  }
+}
+
+// Ecosystem scheduler tick — fires every 30s
+async function ecosystemTick() {
+  if (ecosystemDirective !== "active") return;
+  if (ecosystemState.running) return;
+  if (Date.now() < ecosystemState.nextActivityAt) return;
+
+  // Schedule first run 1-5 min after becoming active
+  if (ecosystemState.nextActivityAt === 0) {
+    ecosystemState.nextActivityAt = Date.now() + (60 + Math.random() * 240) * 1000;
+    return;
+  }
+
+  await ecosystemRunActivity();
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Lifecycle
 // ═══════════════════════════════════════════════════════════════════
 
@@ -718,6 +913,10 @@ async function handleCommand(cmd) {
 // prevents concurrent handleWork calls. This ensures fast pickup
 // of queued work (important when 6+ jobs are pending).
 setInterval(pollBridge, 500);
+
+// Ecosystem scheduler — checks every 30s whether to fire an activity.
+// Heavy work is gated by directive + nextActivityAt, so idle cost is minimal.
+setInterval(ecosystemTick, 30000);
 
 // Detect accounts periodically
 setInterval(detectAccounts, ACCOUNT_DETECT_INTERVAL);
@@ -748,8 +947,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       accounts: accs.map((a) => ({ email: a.email, name: a.name })),
       tokenCount,
       lastError: lastPollError,
+      ecosystem: {
+        directive: ecosystemDirective,
+        running: ecosystemState.running,
+        currentAccount: ecosystemState.currentAccount,
+        currentSite: ecosystemState.currentSite,
+        heldAccounts: ecosystemHeldAccounts,
+        todayCounts: ecosystemState.todayCounts,
+      },
     });
     return false;
+  }
+
+  if (msg.type === "ecosystemToggle") {
+    // User clicked toggle in popup. Tell bridge; bridge broadcasts back
+    // via /poll so all extensions (in multi-profile setups) stay in sync.
+    const enabled = !!msg.enabled;
+    fetch(`${BRIDGE_URL}/ecosystem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    })
+      .then((r) => r.json())
+      .then((data) => sendResponse({ ok: true, ...data }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true; // async
+  }
+
+  if (msg.type === "ecosystemReleaseAccount") {
+    fetch(`${BRIDGE_URL}/ecosystem`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ release_account: msg.account }),
+    })
+      .then((r) => r.json())
+      .then((data) => sendResponse({ ok: true, ...data }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
   }
 
   if (msg.type === "detectAccounts") {

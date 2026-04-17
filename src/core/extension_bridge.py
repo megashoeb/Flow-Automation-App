@@ -67,6 +67,19 @@ class ExtensionBridge:
         self._tokens_received = 0
         self._extension_last_seen = 0
 
+        # ─── Auto Warmup Mode (Ecosystem Activity) ───
+        # Controls whether the extension performs background ecosystem activity
+        # (YouTube, Search, Maps, etc.) to keep reCAPTCHA scores healthy.
+        self._ecosystem_enabled: bool = False     # toggle from extension popup or app
+        self._generation_running: bool = False    # set True when any slot is running a job
+        self._ecosystem_stats: Dict[str, Any] = {
+            "accounts": {},       # email -> { "last_activity": ts, "today_count": n, "current_site": str }
+            "last_state_change": 0,
+            "state": "idle",      # idle | running | paused | disabled
+        }
+        # Per-account ecosystem hold (syncs with reCAPTCHA hold state)
+        self._ecosystem_held_accounts: Dict[str, float] = {}  # email -> released_at_ts
+
     # ═══════════════════════════════════════════════════════════════
     # Lifecycle
     # ═══════════════════════════════════════════════════════════════
@@ -80,6 +93,10 @@ class ExtensionBridge:
         self._app.router.add_post("/project", self._handle_project)
         self._app.router.add_get("/status", self._handle_status)
         self._app.router.add_post("/command", self._handle_command_post)
+        # Ecosystem / Auto Warmup Mode endpoints
+        self._app.router.add_get("/ecosystem", self._handle_ecosystem_status)
+        self._app.router.add_post("/ecosystem", self._handle_ecosystem_update)
+        self._app.router.add_post("/ecosystem/activity", self._handle_ecosystem_activity_report)
 
         self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
@@ -106,6 +123,10 @@ class ExtensionBridge:
         self._dispatched_to.clear()
         self._token_pool.clear()
         self._prefetch_accounts.clear()
+        # Ecosystem state cleanup
+        self._generation_running = False
+        # Keep _ecosystem_enabled + _ecosystem_held_accounts across restarts —
+        # they persist via bridge runtime (user's toggle choice survives).
 
         if self._site:
             await self._site.stop()
@@ -229,6 +250,12 @@ class ExtensionBridge:
         if not ext_accounts:
             if self._pending_commands:
                 response_data["command"] = self._pending_commands.pop(0)
+            # Also share ecosystem directive here
+            response_data["ecosystem"] = {
+                "directive": "disabled" if not self._ecosystem_enabled
+                             else ("paused" if self._generation_running else "active"),
+                "held_accounts": {},
+            }
             return web.json_response(response_data, headers={"Access-Control-Allow-Origin": "*"})
 
         # Check for pending token requests — match to this extension's accounts
@@ -284,6 +311,28 @@ class ExtensionBridge:
         # Check for pending commands
         if self._pending_commands:
             response_data["command"] = self._pending_commands.pop(0)
+
+        # ─── Piggyback ecosystem directive ───
+        # Extension uses this to decide whether to run background activity.
+        now = time.time()
+        # Clean expired holds
+        for a in [k for k, v in self._ecosystem_held_accounts.items() if v <= now]:
+            self._ecosystem_held_accounts.pop(a, None)
+
+        if not self._ecosystem_enabled:
+            eco_directive = "disabled"
+        elif self._generation_running:
+            eco_directive = "paused"
+        else:
+            eco_directive = "active"
+
+        response_data["ecosystem"] = {
+            "directive": eco_directive,
+            "held_accounts": {
+                a: max(0, int(ts - now))
+                for a, ts in self._ecosystem_held_accounts.items()
+            },
+        }
 
         return web.json_response(response_data, headers={"Access-Control-Allow-Origin": "*"})
 
@@ -455,3 +504,163 @@ class ExtensionBridge:
             data.get("data"),
         )
         return web.json_response({"ok": True}, headers={"Access-Control-Allow-Origin": "*"})
+
+    # ═══════════════════════════════════════════════════════════════
+    # Auto Warmup Mode (Ecosystem Activity) — Phase 1
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _handle_ecosystem_status(self, request: web.Request) -> web.Response:
+        """Extension/App reads current ecosystem state + directive.
+        Extension polls this (alongside /poll) to know whether to run activity,
+        pause, or stay disabled.
+        """
+        now = time.time()
+        # Clean up expired holds
+        expired = [a for a, ts in self._ecosystem_held_accounts.items() if ts <= now]
+        for a in expired:
+            self._ecosystem_held_accounts.pop(a, None)
+
+        # Determine effective state
+        if not self._ecosystem_enabled:
+            directive = "disabled"
+        elif self._generation_running:
+            directive = "paused"
+        else:
+            directive = "active"
+
+        held_list = {a: max(0, int(ts - now)) for a, ts in self._ecosystem_held_accounts.items()}
+
+        return web.json_response({
+            "directive": directive,
+            "enabled": self._ecosystem_enabled,
+            "generation_running": self._generation_running,
+            "held_accounts": held_list,   # email -> seconds_remaining
+            "stats": self._ecosystem_stats,
+        }, headers={"Access-Control-Allow-Origin": "*"})
+
+    async def _handle_ecosystem_update(self, request: web.Request) -> web.Response:
+        """App or extension popup updates ecosystem state.
+        Body: { "enabled": true/false } or { "generation_running": true/false }
+               or { "hold_account": "email@gmail.com", "duration_seconds": 172800 }
+               or { "release_account": "email@gmail.com" }
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False}, status=400)
+
+        changed = False
+        if "enabled" in data:
+            new_val = bool(data["enabled"])
+            if new_val != self._ecosystem_enabled:
+                self._ecosystem_enabled = new_val
+                self._ecosystem_stats["last_state_change"] = time.time()
+                self._log(
+                    f"[Bridge] Ecosystem mode: {'ENABLED' if new_val else 'DISABLED'}"
+                )
+                changed = True
+
+        if "generation_running" in data:
+            new_val = bool(data["generation_running"])
+            if new_val != self._generation_running:
+                self._generation_running = new_val
+                self._ecosystem_stats["last_state_change"] = time.time()
+                self._log(
+                    f"[Bridge] Ecosystem: generation {'STARTED' if new_val else 'ENDED'} "
+                    f"— activity {'paused' if new_val else 'will resume'}"
+                )
+                changed = True
+
+        if data.get("hold_account"):
+            account = data["hold_account"]
+            duration = int(data.get("duration_seconds", 172800))  # default 48h
+            self._ecosystem_held_accounts[account] = time.time() + duration
+            self._log(
+                f"[Bridge] Ecosystem hold: {account} for {duration // 3600}h "
+                f"(recaptcha flagged — activity stopped for this account)"
+            )
+            changed = True
+
+        if data.get("release_account"):
+            account = data["release_account"]
+            if self._ecosystem_held_accounts.pop(account, None) is not None:
+                self._log(f"[Bridge] Ecosystem hold released: {account}")
+                changed = True
+
+        return web.json_response({
+            "ok": True,
+            "changed": changed,
+            "enabled": self._ecosystem_enabled,
+            "generation_running": self._generation_running,
+        }, headers={"Access-Control-Allow-Origin": "*"})
+
+    async def _handle_ecosystem_activity_report(self, request: web.Request) -> web.Response:
+        """Extension reports an activity it just did (for logs + stats).
+        Body: { "account": "email", "site": "youtube", "duration_sec": 180,
+                "action": "start" | "end" }
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False}, status=400)
+
+        account = data.get("account", "")
+        site = data.get("site", "")
+        action = data.get("action", "start")
+        duration = int(data.get("duration_sec", 0))
+
+        if not account:
+            return web.json_response({"ok": False}, status=400)
+
+        accounts_stats = self._ecosystem_stats.setdefault("accounts", {})
+        acct = accounts_stats.setdefault(account, {
+            "last_activity": 0,
+            "today_count": 0,
+            "current_site": "",
+            "today_date": "",
+        })
+
+        # Reset daily count on date change
+        today = time.strftime("%Y-%m-%d")
+        if acct.get("today_date") != today:
+            acct["today_count"] = 0
+            acct["today_date"] = today
+
+        now = time.time()
+        if action == "start":
+            acct["current_site"] = site
+            acct["last_activity"] = now
+            self._log(f"[Ecosystem] {account}: started {site}")
+        elif action == "end":
+            acct["current_site"] = ""
+            acct["last_activity"] = now
+            acct["today_count"] = acct.get("today_count", 0) + 1
+            self._log(
+                f"[Ecosystem] {account}: finished {site} ({duration}s) "
+                f"— today: {acct['today_count']} activities"
+            )
+
+        return web.json_response({"ok": True}, headers={"Access-Control-Allow-Origin": "*"})
+
+    # ─── Python-side API for ExtensionModeManager ───
+
+    def set_generation_running(self, running: bool):
+        """Called from extension_mode.py to signal generation start/end."""
+        if running != self._generation_running:
+            self._generation_running = running
+            self._ecosystem_stats["last_state_change"] = time.time()
+
+    def hold_ecosystem_account(self, account: str, duration_seconds: int = 172800):
+        """Hold ecosystem activity for an account (called when reCAPTCHA flags it).
+        Default 48 hours."""
+        self._ecosystem_held_accounts[account] = time.time() + duration_seconds
+
+    def release_ecosystem_account(self, account: str):
+        """Manually release an account's ecosystem hold."""
+        self._ecosystem_held_accounts.pop(account, None)
+
+    def is_ecosystem_enabled(self) -> bool:
+        return self._ecosystem_enabled
+
+    def set_ecosystem_enabled(self, enabled: bool):
+        self._ecosystem_enabled = bool(enabled)
