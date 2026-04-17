@@ -29,12 +29,30 @@ const _recaptchaCache = {};  // tabId → { valid: bool, ts: timestamp }
 const _RECAPTCHA_CACHE_TTL = 30000;  // 30 seconds
 
 // ─── Ecosystem / Auto Warmup Mode state ───
-// Directive comes from bridge via /poll:
-//   "disabled" = toggle off, do nothing
-//   "paused"   = generation is running, stop activity
-//   "active"   = idle, run warmup activity
-let ecosystemDirective = "disabled";
-let ecosystemHeldAccounts = {};  // email -> seconds_remaining
+// Local toggle persisted in chrome.storage so it survives SW restarts AND
+// works without bridge being online. Bridge is notified when reachable, but
+// is not required for the extension to know its own toggle state.
+let ecosystemEnabledLocal = false;   // user's toggle choice (persisted)
+let ecosystemGenerationRunning = false; // from bridge /poll
+let ecosystemHeldAccounts = {};  // email -> seconds_remaining (from bridge)
+
+// Derived directive — what the scheduler uses each tick.
+function ecosystemComputeDirective() {
+  if (!ecosystemEnabledLocal) return "disabled";
+  if (ecosystemGenerationRunning) return "paused";
+  return "active";
+}
+
+// Convenience getter — exposed to callers that used the old variable name.
+Object.defineProperty(self, "ecosystemDirective", {
+  get: ecosystemComputeDirective,
+});
+
+// Load persisted toggle on startup
+chrome.storage.local.get(["ecosystemEnabledLocal"], (result) => {
+  ecosystemEnabledLocal = !!result.ecosystemEnabledLocal;
+  console.log(`[Ecosystem] Restored local toggle: ${ecosystemEnabledLocal ? "ON" : "OFF"}`);
+});
 const ecosystemState = {
   running: false,       // an activity is currently executing
   currentAccount: "",   // which account's tab is active
@@ -74,9 +92,20 @@ async function pollBridge() {
       return;
     }
 
+    // Detect reconnect — if bridge just came back online, push local toggle
+    const wasDisconnected = !bridgeConnected;
     bridgeConnected = true;
     lastPollError = "";
     const data = await resp.json();
+
+    if (wasDisconnected) {
+      // Sync local ecosystem state to bridge so it knows our toggle
+      fetch(`${BRIDGE_URL}/ecosystem`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: ecosystemEnabledLocal }),
+      }).catch(() => {});
+    }
 
     // Handle pending work (token request) — serialize to avoid
     // 6 concurrent executeScript calls on the same tab hanging Chrome
@@ -94,20 +123,27 @@ async function pollBridge() {
       await handleCommand(data.command);
     }
 
-    // ─── Ecosystem directive from bridge ───
+    // ─── Ecosystem signals from bridge ───
+    // Bridge tells us: is generation running? which accounts are held?
+    // Our LOCAL toggle (ecosystemEnabledLocal) is the source of truth for
+    // enable/disable; bridge only affects pause/held state.
     if (data.ecosystem) {
-      const prevDirective = ecosystemDirective;
-      ecosystemDirective = data.ecosystem.directive || "disabled";
+      const prevDirective = ecosystemComputeDirective();
+      // Only take generation_running + held_accounts from bridge.
+      // If bridge says "disabled" but we're locally enabled, prefer local.
+      const bridgeDir = data.ecosystem.directive || "disabled";
+      ecosystemGenerationRunning = (bridgeDir === "paused");
       ecosystemHeldAccounts = data.ecosystem.held_accounts || {};
 
-      if (prevDirective !== ecosystemDirective) {
-        console.log(`[Ecosystem] Directive changed: ${prevDirective} → ${ecosystemDirective}`);
+      const newDirective = ecosystemComputeDirective();
+      if (prevDirective !== newDirective) {
+        console.log(`[Ecosystem] Directive: ${prevDirective} → ${newDirective}`);
       }
 
       // If we were running an activity and directive is now paused/disabled,
       // abort it IMMEDIATELY so generation never shares bandwidth/CPU.
-      if (ecosystemState.running && ecosystemDirective !== "active") {
-        await ecosystemAbortCurrent("directive_changed:" + ecosystemDirective);
+      if (ecosystemState.running && newDirective !== "active") {
+        await ecosystemAbortCurrent("directive_changed:" + newDirective);
       }
     }
   } catch (e) {
@@ -1682,7 +1718,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       tokenCount,
       lastError: lastPollError,
       ecosystem: {
-        directive: ecosystemDirective,
+        directive: ecosystemComputeDirective(),
+        enabled: ecosystemEnabledLocal,
+        bridgeOnline: bridgeConnected,
         running: ecosystemState.running,
         currentAccount: ecosystemState.currentAccount,
         currentSite: ecosystemState.currentSite,
@@ -1694,18 +1732,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "ecosystemToggle") {
-    // User clicked toggle in popup. Tell bridge; bridge broadcasts back
-    // via /poll so all extensions (in multi-profile setups) stay in sync.
+    // Apply locally IMMEDIATELY (works even if bridge offline)
     const enabled = !!msg.enabled;
+    ecosystemEnabledLocal = enabled;
+    chrome.storage.local.set({ ecosystemEnabledLocal: enabled });
+    console.log(`[Ecosystem] Local toggle: ${enabled ? "ON" : "OFF"}`);
+
+    // Abort running activity if user turned OFF
+    if (!enabled && ecosystemState.running) {
+      ecosystemAbortCurrent("user_toggle_off");
+    }
+
+    // Also try to sync to bridge — fire and forget, don't block the UI
     fetch(`${BRIDGE_URL}/ecosystem`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled }),
-    })
-      .then((r) => r.json())
-      .then((data) => sendResponse({ ok: true, ...data }))
-      .catch((e) => sendResponse({ ok: false, error: e.message }));
-    return true; // async
+    }).catch(() => {});
+
+    // Respond immediately with local state
+    sendResponse({ ok: true, enabled });
+    return false;
   }
 
   if (msg.type === "ecosystemReleaseAccount") {

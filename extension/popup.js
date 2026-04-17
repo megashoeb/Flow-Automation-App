@@ -92,14 +92,21 @@ function updateStatus(status) {
     container.innerHTML = '<div class="no-accounts">No accounts detected.<br>Open labs.google.com and log in.</div>';
   }
 
-  // Ecosystem state
-  const eco = status.ecosystem || { directive: "disabled", running: false };
+  // Ecosystem state — toggle reflects LOCAL enabled flag, not just directive.
+  // This way the toggle stays consistent with what the user chose, even if
+  // the bridge (app) is offline.
+  const eco = status.ecosystem || { directive: "disabled", running: false, enabled: false };
   const ecoToggle = document.getElementById("ecoToggle");
   const ecoDot = document.getElementById("ecoDot");
   const ecoText = document.getElementById("ecoStatusText");
-  const isOn = eco.directive !== "disabled";
+  const isOn = !!eco.enabled;
   ecoToggle.classList.toggle("on", isOn);
-  if (eco.directive === "active") {
+
+  if (!eco.bridgeOnline && isOn) {
+    // Toggle is ON but bridge is offline — ecosystem will activate when app starts
+    ecoDot.className = "eco-dot paused";
+    ecoText.textContent = "Waiting for app to start...";
+  } else if (eco.directive === "active") {
     ecoDot.className = "eco-dot active";
     ecoText.textContent = eco.running
       ? `Active — ${eco.currentSite} (${eco.currentAccount?.split("@")[0] || ""})`
