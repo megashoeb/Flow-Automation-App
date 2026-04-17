@@ -9,6 +9,9 @@
  * Zero CDP, zero automation markers, real Chrome context.
  */
 
+// Load persona system (ecosystem/warmup query pools)
+try { importScripts("personas.js"); } catch (e) { console.warn("personas.js not loaded:", e); }
+
 const BRIDGE_URL = "http://127.0.0.1:18924";
 const POLL_INTERVAL = 1500;
 const LABS_ORIGIN = "https://labs.google";
@@ -751,16 +754,307 @@ async function handleCommand(cmd) {
 // Auto Warmup Mode — Ecosystem Activity Engine (Phase 1)
 // ═══════════════════════════════════════════════════════════════════
 
-// Activity pool. Phase 1 stubs — Phase 2 will flesh out each.
-const ECOSYSTEM_ACTIVITIES = [
-  { name: "youtube",  weight: 30, url: "https://www.youtube.com/",        duration: [120, 300] },
-  { name: "gmail",    weight: 20, url: "https://mail.google.com/",        duration: [60, 120] },
-  { name: "search",   weight: 15, url: "https://www.google.com/",         duration: [60, 180] },
-  { name: "drive",    weight: 10, url: "https://drive.google.com/",       duration: [60, 120] },
-  { name: "maps",     weight: 10, url: "https://www.google.com/maps",     duration: [60, 120] },
-  { name: "news",     weight: 10, url: "https://news.google.com/",        duration: [60, 180] },
-  { name: "photos",   weight: 5,  url: "https://photos.google.com/",      duration: [60, 120] },
+// ─── Basic search query pool (Phase 3 will replace with per-persona pools) ───
+const ECOSYSTEM_SEARCH_QUERIES = [
+  "best pizza near me", "weather today", "cricket score", "bollywood news",
+  "tech news today", "best mobile under 20000", "laptop deals",
+  "recipe for pasta", "stock market today", "ipl schedule",
+  "car reviews", "youtube trending", "movie reviews", "best smartphone 2026",
+  "food near me", "chai recipe", "how to cook biryani", "shopping deals",
+  "health tips", "morning workout", "news live", "cricket news today",
+  "upcoming movies 2026", "travel destinations", "best restaurants in delhi",
+  "electric car price", "iphone 17 features", "samsung new phone",
+  "football news", "world news", "share market tips", "gold rate today",
 ];
+
+const ECOSYSTEM_YT_QUERIES = [
+  "funny cricket moments", "cooking at home", "car review", "phone unboxing",
+  "bollywood songs", "motivational videos", "how to make pizza",
+  "travel vlog india", "tech tips", "fitness workout", "ipl highlights",
+  "movie trailer", "cricket highlights", "street food", "gaming stream",
+];
+
+const ECOSYSTEM_MAPS_QUERIES = [
+  "restaurants near me", "coffee shops", "shopping mall", "petrol pump",
+  "ATM nearby", "pharmacy near me", "hospital", "park", "gym near me",
+  "metro station", "hotel near me", "movie theater", "grocery store",
+];
+
+// Activity pool — each activity has an executor function.
+const ECOSYSTEM_ACTIVITIES = [
+  { name: "youtube",  weight: 30, url: "https://www.youtube.com/",        duration: [120, 300], run: activityYouTube },
+  { name: "gmail",    weight: 20, url: "https://mail.google.com/",        duration: [60, 120],  run: activityGmail },
+  { name: "search",   weight: 15, url: "https://www.google.com/",         duration: [60, 180],  run: activitySearch },
+  { name: "drive",    weight: 10, url: "https://drive.google.com/",       duration: [60, 120],  run: activityDrive },
+  { name: "maps",     weight: 10, url: "https://www.google.com/maps",     duration: [60, 120],  run: activityMaps },
+  { name: "news",     weight: 10, url: "https://news.google.com/",        duration: [60, 180],  run: activityNews },
+  { name: "photos",   weight: 5,  url: "https://photos.google.com/",      duration: [60, 120],  run: activityPhotos },
+];
+
+// Helper: pick a random item from array
+function rand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function randInt(min, max) { return Math.floor(min + Math.random() * (max - min + 1)); }
+function randFloat(min, max) { return min + Math.random() * (max - min); }
+
+// Helper: sleep with early-abort checks
+async function abortableSleep(ms, checkFn) {
+  const step = 500;
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    if (checkFn && checkFn()) throw new Error("aborted");
+    await new Promise((r) => setTimeout(r, Math.min(step, ms - (Date.now() - start))));
+  }
+}
+
+// Inject a function into the target tab's MAIN world and get result.
+async function injectInTab(tabId, fn, args) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: fn,
+      args: args || [],
+    });
+    return results?.[0]?.result;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Wait for tab to finish loading (polls webNavigation via tab status)
+async function waitForTabLoad(tabId, maxMs) {
+  const start = Date.now();
+  while (Date.now() - start < (maxMs || 15000)) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t && t.status === "complete") return true;
+    } catch { return false; }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Site-specific activity executors
+// Each returns when activity is done. Throws on abort/error.
+// All interactions run inside MAIN world so they look like real user events.
+// ═══════════════════════════════════════════════════════════════════
+
+// Common: natural scroll in the tab
+async function naturalScroll(tabId, scrolls, checkAbort) {
+  for (let i = 0; i < scrolls; i++) {
+    if (checkAbort && checkAbort()) throw new Error("aborted");
+    const direction = Math.random() < 0.85 ? 1 : -1;   // mostly down, sometimes up
+    const amount = randInt(200, 700) * direction;
+    await injectInTab(tabId, (amt) => {
+      window.scrollBy({ top: amt, behavior: "smooth" });
+    }, [amount]);
+    await abortableSleep(randInt(1500, 4500), checkAbort);
+  }
+}
+
+// YouTube: persona search, scroll, click a video, watch for most of duration
+async function activityYouTube(tabId, duration, checkAbort, account) {
+  await waitForTabLoad(tabId, 15000);
+  await abortableSleep(randInt(2000, 4000), checkAbort);
+
+  // 60% chance: search using persona-driven query; 40% chance: browse homepage
+  const doSearch = Math.random() < 0.6 && typeof personaForAccount === "function" && account;
+  if (doSearch) {
+    const q = personaYoutubeQuery(personaForAccount(account));
+    await injectInTab(tabId, async (query) => {
+      const box = document.querySelector("input#search, input[name='search_query']");
+      if (!box) return false;
+      box.focus();
+      box.value = "";
+      for (const ch of query) {
+        box.value += ch;
+        box.dispatchEvent(new Event("input", { bubbles: true }));
+        await new Promise((r) => setTimeout(r, 70 + Math.random() * 140));
+      }
+      const form = box.form || box.closest("form");
+      if (form) form.submit();
+      else box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      return true;
+    }, [q]);
+    await abortableSleep(randInt(3000, 5000), checkAbort);
+    await waitForTabLoad(tabId, 10000);
+  }
+
+  // Scroll 2-4 times
+  await naturalScroll(tabId, randInt(2, 4), checkAbort);
+
+  // Click a video thumbnail (random from visible)
+  await injectInTab(tabId, () => {
+    const thumbs = Array.from(
+      document.querySelectorAll("a#thumbnail, ytd-thumbnail a, a.ytd-thumbnail")
+    ).filter((a) => a.href && a.href.includes("watch"));
+    if (thumbs.length) {
+      const pick = thumbs[Math.floor(Math.random() * Math.min(thumbs.length, 10))];
+      pick.click();
+      return true;
+    }
+    return false;
+  });
+
+  await abortableSleep(randInt(3000, 5000), checkAbort);
+
+  // Mute for battery + bandwidth safety; lower quality if possible
+  await injectInTab(tabId, () => {
+    const vid = document.querySelector("video");
+    if (vid) {
+      vid.muted = true;
+      vid.volume = 0;
+      // Lower quality is controlled via player menu — skip for now
+    }
+  });
+
+  // Watch — during watch, scroll comments occasionally
+  const watchTime = Math.max(30000, duration - 20000);
+  const start = Date.now();
+  while (Date.now() - start < watchTime) {
+    if (checkAbort && checkAbort()) throw new Error("aborted");
+    await abortableSleep(randInt(10000, 25000), checkAbort);
+    // 40% chance to scroll comments
+    if (Math.random() < 0.4) {
+      await injectInTab(tabId, () => {
+        window.scrollBy({ top: 400 + Math.random() * 500, behavior: "smooth" });
+      });
+    }
+  }
+}
+
+// Gmail: open inbox, scroll, hover/click emails briefly
+async function activityGmail(tabId, duration, checkAbort) {
+  await waitForTabLoad(tabId, 20000);
+  await abortableSleep(randInt(3000, 6000), checkAbort);
+  await naturalScroll(tabId, randInt(3, 6), checkAbort);
+
+  // Try to click first email to read
+  await injectInTab(tabId, () => {
+    const row = document.querySelector("tr[role='row'], div[role='main'] tr");
+    if (row) row.click();
+  });
+  await abortableSleep(randInt(5000, 12000), checkAbort);
+
+  // Go back to inbox
+  await injectInTab(tabId, () => {
+    const back = document.querySelector("[aria-label='Back to Inbox'], [aria-label='Back to inbox']");
+    if (back) back.click();
+  });
+  // Scroll rest
+  await naturalScroll(tabId, randInt(2, 4), checkAbort);
+}
+
+// Google Search: type a query, submit, scroll results, click one
+async function activitySearch(tabId, duration, checkAbort, account) {
+  await waitForTabLoad(tabId, 15000);
+  await abortableSleep(randInt(1500, 3500), checkAbort);
+
+  // Prefer persona-driven query if available
+  let query;
+  if (typeof personaForAccount === "function" && account) {
+    query = personaSearchQuery(personaForAccount(account));
+  } else {
+    query = rand(ECOSYSTEM_SEARCH_QUERIES);
+  }
+  // Type query into search box (simulate character-by-character)
+  await injectInTab(tabId, async (q) => {
+    const box = document.querySelector("textarea[name='q'], input[name='q']");
+    if (!box) return false;
+    box.focus();
+    box.value = "";
+    for (const ch of q) {
+      box.value += ch;
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 70 + Math.random() * 150));
+    }
+    // Submit form
+    const form = box.form || box.closest("form");
+    if (form) form.submit();
+    else box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    return true;
+  }, [query]);
+
+  await abortableSleep(randInt(3000, 5000), checkAbort);
+  await waitForTabLoad(tabId, 10000);
+  await naturalScroll(tabId, randInt(2, 5), checkAbort);
+
+  // Click a result (50% chance)
+  if (Math.random() < 0.5) {
+    await injectInTab(tabId, () => {
+      const links = Array.from(document.querySelectorAll("#search a h3, #rso a h3"));
+      if (links.length) {
+        const pick = links[Math.floor(Math.random() * Math.min(5, links.length))];
+        pick.click();
+      }
+    });
+    await abortableSleep(randInt(5000, 15000), checkAbort);
+    await naturalScroll(tabId, randInt(2, 4), checkAbort);
+  }
+}
+
+// Google Maps: type a location, view results
+async function activityMaps(tabId, duration, checkAbort, account) {
+  await waitForTabLoad(tabId, 20000);
+  await abortableSleep(randInt(3000, 6000), checkAbort);
+
+  let q;
+  if (typeof personaForAccount === "function" && account) {
+    q = personaMapsQuery(personaForAccount(account));
+  } else {
+    q = rand(ECOSYSTEM_MAPS_QUERIES);
+  }
+  await injectInTab(tabId, async (query) => {
+    const box = document.querySelector("input#searchboxinput, input[name='q'], input[placeholder]");
+    if (!box) return false;
+    box.focus();
+    box.value = "";
+    for (const ch of query) {
+      box.value += ch;
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 80 + Math.random() * 130));
+    }
+    box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    return true;
+  }, [q]);
+
+  await abortableSleep(randInt(5000, 10000), checkAbort);
+  await naturalScroll(tabId, randInt(2, 4), checkAbort);
+}
+
+// Google Drive: scroll
+async function activityDrive(tabId, duration, checkAbort) {
+  await waitForTabLoad(tabId, 15000);
+  await abortableSleep(randInt(3000, 6000), checkAbort);
+  await naturalScroll(tabId, randInt(3, 6), checkAbort);
+}
+
+// Google News: scroll, click article
+async function activityNews(tabId, duration, checkAbort) {
+  await waitForTabLoad(tabId, 15000);
+  await abortableSleep(randInt(2000, 4000), checkAbort);
+  await naturalScroll(tabId, randInt(3, 5), checkAbort);
+
+  if (Math.random() < 0.5) {
+    await injectInTab(tabId, () => {
+      const links = Array.from(document.querySelectorAll("article a, a[href*='/articles/']"));
+      if (links.length) {
+        const pick = links[Math.floor(Math.random() * Math.min(10, links.length))];
+        pick.click();
+      }
+    });
+    await abortableSleep(randInt(5000, 15000), checkAbort);
+    await naturalScroll(tabId, randInt(2, 4), checkAbort);
+  }
+}
+
+// Google Photos: scroll
+async function activityPhotos(tabId, duration, checkAbort) {
+  await waitForTabLoad(tabId, 15000);
+  await abortableSleep(randInt(3000, 6000), checkAbort);
+  await naturalScroll(tabId, randInt(3, 5), checkAbort);
+}
 
 function ecosystemPickActivity() {
   const totalWeight = ECOSYSTEM_ACTIVITIES.reduce((s, a) => s + a.weight, 0);
@@ -787,7 +1081,9 @@ function ecosystemPickAccount() {
   return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
-// Gaussian-ish random gap (Box-Muller)
+// Gaussian-ish random gap (Box-Muller), time-of-day aware.
+// Hours 1 AM - 7 AM: huge gaps (simulate sleep).
+// Hours 11 PM - 1 AM and 7 AM - 9 AM: reduced activity.
 function ecosystemNextGap() {
   let u = 0, v = 0;
   while (u === 0) u = Math.random();
@@ -797,7 +1093,14 @@ function ecosystemNextGap() {
   const std = (ECOSYSTEM_MAX_GAP_MS - ECOSYSTEM_MIN_GAP_MS) / 4;
   let gap = mean + z * std;
   gap = Math.max(ECOSYSTEM_MIN_GAP_MS, Math.min(ECOSYSTEM_MAX_GAP_MS, gap));
-  return Math.floor(gap);
+
+  // Time-of-day multiplier
+  const hr = new Date().getHours();
+  let mult = 1.0;
+  if (hr >= 1 && hr < 7) mult = 4.0;       // deep sleep: 4x longer gaps
+  else if (hr >= 23 || hr < 1) mult = 2.0; // late night: 2x
+  else if (hr >= 7 && hr < 9) mult = 1.5;  // early morning: 1.5x
+  return Math.floor(gap * mult);
 }
 
 async function ecosystemReportActivity(account, site, action, durationSec) {
@@ -848,34 +1151,42 @@ async function ecosystemRunActivity() {
   ecosystemReportActivity(account.email, activity.name, "start", 0);
 
   let tabId = null;
+  const startedAtWall = Date.now();
   try {
     // Open background tab (invisible to user)
     const tab = await chrome.tabs.create({ url: activity.url, active: false });
     tabId = tab.id;
     ecosystemState.currentTabId = tabId;
 
-    // Wait for activity duration, but check abort every 3s
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < duration) {
-      if (ecosystemDirective !== "active") {
-        // Directive changed mid-activity — abort
-        throw new Error("directive_changed_mid_activity");
-      }
-      if (!ecosystemState.running) {
-        // Aborted externally
-        return;
-      }
-      await new Promise((r) => setTimeout(r, 3000));
+    // Abort check function — fast path for directive changes or external aborts
+    const checkAbort = () => {
+      if (ecosystemDirective !== "active") return true;
+      if (!ecosystemState.running) return true;
+      return false;
+    };
+
+    // Site-specific executor handles the real interaction
+    if (typeof activity.run === "function") {
+      await activity.run(tabId, duration, checkAbort, account.email);
+    } else {
+      // Fallback: just wait (for activities without executor)
+      await abortableSleep(duration, checkAbort);
     }
 
     // Activity completed — track count
     ecosystemState.todayCounts[account.email] =
       (ecosystemState.todayCounts[account.email] || 0) + 1;
+    const elapsedSec = Math.round((Date.now() - startedAtWall) / 1000);
     ecosystemReportActivity(
-      account.email, activity.name, "end", Math.round(duration / 1000)
+      account.email, activity.name, "end", elapsedSec
     );
   } catch (e) {
-    console.warn(`[Ecosystem] Activity error: ${e.message}`);
+    const msg = e && e.message ? e.message : String(e);
+    if (msg === "aborted" || msg.startsWith("directive_")) {
+      console.log(`[Ecosystem] Activity stopped: ${msg}`);
+    } else {
+      console.warn(`[Ecosystem] Activity error: ${msg}`);
+    }
     ecosystemReportActivity(account.email, activity.name, "error", 0);
   } finally {
     if (tabId) {
