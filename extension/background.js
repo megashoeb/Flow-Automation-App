@@ -1257,13 +1257,93 @@ async function idleMouseMeander(tabId) {
 }
 
 // YouTube: persona search, scroll, click a video, watch for most of duration
+// ─── YouTube activity — 3 entry paths, verified video playback ───
+//
+// Entry path (random, weighted):
+//   A. 40% DIRECT: already on youtube.com → browse homepage → click video
+//   B. 30% YT_SEARCH: on youtube.com → type query → click result
+//   C. 30% GOOGLE_PATH: navigate to Google → search "<topic> youtube" →
+//                      click a YouTube result → video page loads
+//
+// After click:
+//   - Wait for /watch URL to load
+//   - Explicitly call video.play() (handles autoplay-blocked background tabs)
+//   - Verify playback by checking currentTime advances (retry up to 3x)
+//   - Mute + stay on 144p (set via API if possible)
+//
+// This is what makes YouTube actually record the view in watch history.
 async function activityYouTube(tabId, duration, checkAbort, account) {
   await waitForTabLoad(tabId, 15000);
   await abortableSleep(randInt(2000, 4000), checkAbort);
 
-  // 60% chance: search using persona-driven query; 40% chance: browse homepage
-  const doSearch = Math.random() < 0.6 && typeof personaForAccount === "function" && account;
-  if (doSearch) {
+  // Pick entry path
+  const pathRoll = Math.random();
+  let entryPath;
+  if (pathRoll < 0.40) entryPath = "direct";
+  else if (pathRoll < 0.70) entryPath = "yt_search";
+  else entryPath = "google_path";
+
+  console.log(`[Ecosystem] YouTube entry path: ${entryPath}`);
+
+  const hasPersona = typeof personaForAccount === "function" && account;
+
+  if (entryPath === "google_path") {
+    // A. Navigate tab to Google first
+    await chrome.tabs.update(tabId, { url: "https://www.google.com/" }).catch(() => {});
+    await waitForTabLoad(tabId, 15000);
+    await abortableSleep(randInt(1500, 3000), checkAbort);
+
+    // B. Search "<topic> youtube" or "<topic> video"
+    let baseQuery = hasPersona
+      ? personaYoutubeQuery(personaForAccount(account))
+      : "funny videos";
+    const suffix = Math.random() < 0.6 ? " youtube" : " video";
+    const query = baseQuery + suffix;
+
+    await idleMouseMeander(tabId);
+    await chrome.scripting.executeScript({
+      target: { tabId }, world: "MAIN",
+      func: humanTypeInto(),
+      args: ["textarea[name='q'], input[name='q']", query],
+    }).catch(() => {});
+    await abortableSleep(randInt(400, 900), checkAbort);
+    await injectInTab(tabId, () => {
+      const box = document.querySelector("textarea[name='q'], input[name='q']");
+      if (!box) return;
+      const form = box.form || box.closest("form");
+      if (form) form.submit();
+      else box.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await abortableSleep(randInt(3000, 5000), checkAbort);
+    await waitForTabLoad(tabId, 10000);
+
+    // Scroll search results briefly
+    await naturalScroll(tabId, randInt(1, 3), checkAbort);
+
+    // C. Click a YouTube result link (prefer watch URL, fallback any youtube.com)
+    const clickedYT = await injectInTab(tabId, () => {
+      const results = Array.from(document.querySelectorAll("#search a, #rso a"));
+      // Prefer video results (watch URLs)
+      const watchLinks = results.filter((a) =>
+        a.href && /youtube\.com\/watch\?v=/.test(a.href)
+      );
+      const ytLinks = watchLinks.length ? watchLinks
+        : results.filter((a) => a.href && a.href.includes("youtube.com"));
+      if (!ytLinks.length) return false;
+      const pick = ytLinks[Math.floor(Math.random() * Math.min(5, ytLinks.length))];
+      pick.click();
+      return true;
+    });
+
+    if (!clickedYT) {
+      // Fallback: navigate to youtube.com directly
+      await chrome.tabs.update(tabId, { url: "https://www.youtube.com/" }).catch(() => {});
+    }
+    await abortableSleep(randInt(3000, 5000), checkAbort);
+    await waitForTabLoad(tabId, 15000);
+  }
+  else if (entryPath === "yt_search" && hasPersona) {
+    // Already on youtube.com → type a persona query
     const q = personaYoutubeQuery(personaForAccount(account));
     await idleMouseMeander(tabId);
     await chrome.scripting.executeScript({
@@ -1282,45 +1362,102 @@ async function activityYouTube(tabId, duration, checkAbort, account) {
     await abortableSleep(randInt(3000, 5000), checkAbort);
     await waitForTabLoad(tabId, 10000);
   }
+  // else "direct": just homepage browsing, no search
 
-  // Scroll 2-4 times
+  // Browse whatever page we're on (homepage / search results / already-at-video)
   await naturalScroll(tabId, randInt(2, 4), checkAbort);
 
-  // Click a video thumbnail (random from visible)
-  await injectInTab(tabId, () => {
-    const thumbs = Array.from(
-      document.querySelectorAll("a#thumbnail, ytd-thumbnail a, a.ytd-thumbnail")
-    ).filter((a) => a.href && a.href.includes("watch"));
-    if (thumbs.length) {
+  // If we're NOT already on a /watch page, click a video thumbnail
+  const isOnWatchPage = await injectInTab(tabId, () => /\/watch\?v=/.test(location.href));
+  if (!isOnWatchPage) {
+    const clickResult = await injectInTab(tabId, () => {
+      // YouTube thumb selectors (DOM differs between homepage / results / shelf)
+      const selectors = [
+        "a#thumbnail[href*='watch']",
+        "ytd-thumbnail a[href*='watch']",
+        "a.ytd-thumbnail[href*='watch']",
+        "ytd-rich-item-renderer a[href*='watch']",
+      ];
+      let thumbs = [];
+      for (const sel of selectors) {
+        thumbs = Array.from(document.querySelectorAll(sel));
+        if (thumbs.length) break;
+      }
+      if (!thumbs.length) return { clicked: false, reason: "no_thumbs" };
       const pick = thumbs[Math.floor(Math.random() * Math.min(thumbs.length, 10))];
       pick.click();
-      return true;
+      return { clicked: true, href: pick.href };
+    });
+    if (!clickResult?.clicked) {
+      console.warn("[Ecosystem] YouTube thumb click failed:", clickResult?.reason);
     }
-    return false;
+    // Wait for navigation to /watch
+    await abortableSleep(randInt(2500, 4500), checkAbort);
+    await waitForTabLoad(tabId, 15000);
+  }
+
+  // Force video to actually play — handles background-tab autoplay blocking.
+  // Verify by checking currentTime advances; retry up to 3 times.
+  const playResult = await injectInTab(tabId, async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // Dismiss any "Continue watching?" / age-gate / ad-skip overlays briefly
+    const dismissers = [
+      "button[aria-label*='Skip']",
+      "button.ytp-ad-skip-button",
+      "tp-yt-paper-button.ytd-confirm-dialog-renderer",
+    ];
+    for (const sel of dismissers) {
+      const btn = document.querySelector(sel);
+      if (btn) { try { btn.click(); } catch {} }
+    }
+    // Find the video element
+    let attempts = 0;
+    let vid = null;
+    while (attempts < 20 && !vid) {
+      vid = document.querySelector("video");
+      if (!vid) { await sleep(300); attempts++; }
+    }
+    if (!vid) return { ok: false, reason: "no_video_el" };
+    // Mute & lower quality hint
+    vid.muted = true;
+    vid.volume = 0;
+    // Try to start playback (retry up to 3 times over ~6 sec)
+    const t0 = vid.currentTime;
+    for (let i = 0; i < 3; i++) {
+      try { await vid.play(); } catch {}
+      await sleep(2000);
+      if (vid.currentTime > t0 + 0.3) {
+        return { ok: true, currentTime: vid.currentTime, duration: vid.duration };
+      }
+    }
+    return { ok: false, reason: "playback_not_advancing", currentTime: vid.currentTime };
   });
 
-  await abortableSleep(randInt(3000, 5000), checkAbort);
+  if (playResult?.ok) {
+    console.log(`[Ecosystem] YouTube video playing (t=${playResult.currentTime?.toFixed(1)}s)`);
+  } else {
+    console.warn(`[Ecosystem] YouTube video not playing: ${playResult?.reason}`);
+  }
 
-  // Mute for battery + bandwidth safety; lower quality if possible
-  await injectInTab(tabId, () => {
-    const vid = document.querySelector("video");
-    if (vid) {
-      vid.muted = true;
-      vid.volume = 0;
-      // Lower quality is controlled via player menu — skip for now
-    }
-  });
-
-  // Watch — during watch, scroll comments occasionally
+  // Watch loop — during watch, occasionally scroll comments
   const watchTime = Math.max(30000, duration - 20000);
   const start = Date.now();
   while (Date.now() - start < watchTime) {
     if (checkAbort && checkAbort()) throw new Error("aborted");
     await abortableSleep(randInt(10000, 25000), checkAbort);
-    // 40% chance to scroll comments
+    // 40% chance: scroll comments
     if (Math.random() < 0.4) {
       await injectInTab(tabId, () => {
         window.scrollBy({ top: 400 + Math.random() * 500, behavior: "smooth" });
+      });
+    }
+    // 15% chance: re-assert play if paused (YouTube may pause bg tab)
+    if (Math.random() < 0.15) {
+      await injectInTab(tabId, async () => {
+        const v = document.querySelector("video");
+        if (v && v.paused) {
+          try { await v.play(); } catch {}
+        }
       });
     }
   }
