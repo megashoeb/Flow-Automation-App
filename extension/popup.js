@@ -103,9 +103,6 @@ function updateStatus(status) {
   ecoToggle.classList.toggle("on", isOn);
 
   if (!eco.bridgeOnline && isOn) {
-    // Bridge offline but toggle ON — warmup still runs independently,
-    // just without generation-pause awareness (no generation can happen
-    // without the app anyway).
     ecoDot.className = "eco-dot active";
     ecoText.textContent = eco.running
       ? `Active (standalone) — ${eco.currentSite}`
@@ -121,6 +118,60 @@ function updateStatus(status) {
   } else {
     ecoDot.className = "eco-dot disabled";
     ecoText.textContent = "Disabled — toggle ON to build trust";
+  }
+
+  // Progress bar + ETA (while an activity is running)
+  const progWrap = document.getElementById("ecoProgress");
+  const progFill = document.getElementById("ecoProgressFill");
+  const nextEl = document.getElementById("ecoNext");
+  if (eco.running && eco.currentStartedAt && eco.currentDurationMs) {
+    const elapsed = Date.now() - eco.currentStartedAt;
+    const pct = Math.min(100, Math.round((elapsed / eco.currentDurationMs) * 100));
+    const remainSec = Math.max(0, Math.round((eco.currentDurationMs - elapsed) / 1000));
+    progWrap.style.display = "block";
+    progFill.style.width = pct + "%";
+    nextEl.textContent = `⏱ ${remainSec}s remaining on ${eco.currentSite}`;
+  } else if (isOn && eco.nextActivityAt && eco.nextActivityAt > Date.now()) {
+    const wait = Math.round((eco.nextActivityAt - Date.now()) / 1000);
+    const mins = Math.floor(wait / 60), secs = wait % 60;
+    progWrap.style.display = "none";
+    nextEl.textContent = `Next activity in ~${mins}m ${secs}s`;
+  } else {
+    progWrap.style.display = "none";
+    nextEl.textContent = "";
+  }
+
+  // Live activity feed (last 15 events)
+  const feedCard = document.getElementById("feedCard");
+  const feedList = document.getElementById("feedList");
+  const logs = (eco.log || []);
+  if (isOn && logs.length) {
+    feedCard.style.display = "block";
+    feedList.innerHTML = logs.slice().reverse().map((e) => {
+      const t = new Date(e.ts);
+      const hh = String(t.getHours()).padStart(2, "0");
+      const mm = String(t.getMinutes()).padStart(2, "0");
+      const ss = String(t.getSeconds()).padStart(2, "0");
+      const timeStr = `${hh}:${mm}:${ss}`;
+      const user = (e.account || "").split("@")[0] || "";
+      let text = "";
+      if (e.kind === "start") {
+        text = `🌱 ${user} opened <b>${e.site}</b> (~${e.duration_sec}s)`;
+      } else if (e.kind === "end") {
+        text = `✅ ${user} finished <b>${e.site}</b> (${e.duration_sec}s)`;
+      } else if (e.kind === "abort") {
+        text = `⏸ ${user} paused <b>${e.site}</b>`;
+      } else if (e.kind === "error") {
+        text = `⚠ ${user} error on <b>${e.site}</b>`;
+      } else {
+        text = `${e.kind}`;
+      }
+      return `<div class="feed-entry ${e.kind}">
+        <span class="time">${timeStr}</span>${text}
+      </div>`;
+    }).join("");
+  } else {
+    feedCard.style.display = "none";
   }
 }
 
@@ -157,4 +208,4 @@ document.getElementById("ecoToggle").addEventListener("click", () => {
 refresh();
 
 // Auto-refresh every 3s while popup is open
-setInterval(refresh, 3000);
+setInterval(refresh, 1000);

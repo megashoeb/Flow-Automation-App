@@ -64,10 +64,20 @@ const ecosystemState = {
   currentAccount: "",   // which account's tab is active
   currentSite: "",      // e.g. "youtube"
   currentTabId: null,
+  currentStartedAt: 0,  // when current activity started (timestamp)
+  currentDurationMs: 0, // how long current activity will run
   nextActivityAt: 0,    // timestamp when next activity should fire
   todayCounts: {},      // email -> int (reset daily locally)
   lastReset: 0,         // date tracker
+  log: [],              // ring buffer of recent events (see logEcosystem)
 };
+
+// Keep last 50 events so the popup can show a live activity feed.
+function logEcosystem(kind, data) {
+  const entry = { ts: Date.now(), kind, ...data };
+  ecosystemState.log.push(entry);
+  if (ecosystemState.log.length > 50) ecosystemState.log.shift();
+}
 const ECOSYSTEM_MIN_GAP_MS = 15 * 60 * 1000;   // 15 min
 const ECOSYSTEM_MAX_GAP_MS = 40 * 60 * 1000;   // 40 min
 const ECOSYSTEM_MAX_PER_DAY = 35;              // safety cap per account per day
@@ -1547,10 +1557,17 @@ async function ecosystemRunActivity() {
   ecosystemState.running = true;
   ecosystemState.currentAccount = account.email;
   ecosystemState.currentSite = activity.name;
+  ecosystemState.currentStartedAt = Date.now();
+  ecosystemState.currentDurationMs = duration;
 
   console.log(
     `[Ecosystem] ${account.email} → ${activity.name} for ${Math.round(duration / 1000)}s`
   );
+  logEcosystem("start", {
+    account: account.email,
+    site: activity.name,
+    duration_sec: Math.round(duration / 1000),
+  });
   ecosystemReportActivity(account.email, activity.name, "start", 0);
 
   let tabId = null;
@@ -1580,15 +1597,18 @@ async function ecosystemRunActivity() {
     ecosystemState.todayCounts[account.email] =
       (ecosystemState.todayCounts[account.email] || 0) + 1;
     const elapsedSec = Math.round((Date.now() - startedAtWall) / 1000);
-    ecosystemReportActivity(
-      account.email, activity.name, "end", elapsedSec
-    );
+    logEcosystem("end", {
+      account: account.email, site: activity.name, duration_sec: elapsedSec,
+    });
+    ecosystemReportActivity(account.email, activity.name, "end", elapsedSec);
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     if (msg === "aborted" || msg.startsWith("directive_")) {
       console.log(`[Ecosystem] Activity stopped: ${msg}`);
+      logEcosystem("abort", { account: account.email, site: activity.name, reason: msg });
     } else {
       console.warn(`[Ecosystem] Activity error: ${msg}`);
+      logEcosystem("error", { account: account.email, site: activity.name, error: msg });
     }
     ecosystemReportActivity(account.email, activity.name, "error", 0);
   } finally {
@@ -1730,8 +1750,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         running: ecosystemState.running,
         currentAccount: ecosystemState.currentAccount,
         currentSite: ecosystemState.currentSite,
+        currentStartedAt: ecosystemState.currentStartedAt,
+        currentDurationMs: ecosystemState.currentDurationMs,
+        nextActivityAt: ecosystemState.nextActivityAt,
         heldAccounts: ecosystemHeldAccounts,
         todayCounts: ecosystemState.todayCounts,
+        log: ecosystemState.log.slice(-15),  // last 15 events
       },
     });
     return false;

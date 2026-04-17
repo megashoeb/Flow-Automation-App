@@ -213,6 +213,60 @@
     .eco-dot.active { background: #66bb6a; }
     .eco-dot.paused { background: #ffa726; }
     .eco-dot.disabled { background: #666; }
+
+    /* Live activity progress */
+    .eco-progress-bar {
+      margin-top: 8px;
+      height: 4px;
+      background: rgba(255,255,255,0.08);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .eco-progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #66bb6a, #42a5f5);
+      width: 0%;
+      transition: width 0.8s linear;
+    }
+    .eco-next {
+      margin-top: 6px;
+      font-size: 10px;
+      color: #778;
+    }
+
+    /* Live feed */
+    .feed-card {
+      background: #0d1729;
+      border: 1px solid #1e2a47;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-top: 10px;
+      max-height: 150px;
+      overflow-y: auto;
+    }
+    .feed-title {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #788;
+      margin-bottom: 8px;
+    }
+    .feed-entry {
+      font-size: 11px;
+      color: #bcc;
+      margin: 3px 0;
+      line-height: 1.4;
+      font-family: 'Segoe UI', sans-serif;
+    }
+    .feed-entry .time {
+      color: #556;
+      font-size: 10px;
+      margin-right: 4px;
+    }
+    .feed-entry.start { color: #8dd0ff; }
+    .feed-entry.end { color: #7bd88c; }
+    .feed-entry.abort { color: #ffa726; }
+    .feed-entry.error { color: #ef5350; }
   </style>
 </head>
 <body>
@@ -238,6 +292,15 @@
       <span id="ecoDot" class="eco-dot disabled"></span>
       <span id="ecoStatusText">Disabled</span>
     </div>
+    <div id="ecoProgress" class="eco-progress-bar" style="display:none;">
+      <div id="ecoProgressFill" class="eco-progress-fill"></div>
+    </div>
+    <div id="ecoNext" class="eco-next"></div>
+  </div>
+
+  <div id="feedCard" class="feed-card" style="display:none;">
+    <div class="feed-title">🔎 Live Activity Feed</div>
+    <div id="feedList"></div>
   </div>
 
   <div class="section">
