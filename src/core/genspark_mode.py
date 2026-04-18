@@ -503,8 +503,14 @@ class GensparkModeManager:
                         continue
                     break
 
-                # Success path — save the image to output dir
-                out_path = await self._save_image(result, job_id, worker.account_email)
+                # Success path — save the image to output dir.
+                # Use queue_no / output_index for filename so it matches Flow
+                # ("1.jpg", "2.jpg", ...) and preserves numbering across retries.
+                queue_no = job.get("output_index") or job.get("queue_no")
+                out_path = await self._save_image(
+                    result, job_id, worker.account_email, queue_no=queue_no,
+                    slot_id=worker.slot_id,
+                )
                 if out_path:
                     update_job_status(job_id, "completed",
                                       account=worker.account_email)
@@ -530,37 +536,92 @@ class GensparkModeManager:
         finally:
             worker.is_busy = False
 
-    async def _save_image(self, result: Dict[str, Any], job_id: str,
-                          account: str) -> Optional[str]:
-        """Save the returned image bytes (or fetch from URL) to the output dir."""
+    async def _save_image(
+        self,
+        result: Dict[str, Any],
+        job_id: str,
+        account: str,
+        queue_no=None,
+        slot_id: str = "gs",
+    ) -> Optional[str]:
+        """Save the returned image bytes to the output dir.
+
+        Naming convention mirrors Flow / extension_mode._save_media:
+          - If queue_no / output_index is set → filename = "{queue_no}.jpg"
+            (e.g. "1.jpg", "2.jpg") — survives retries because output_index
+            stays the same on re-dispatch.
+          - Fallback → "{safe_job}_{ts}_{nonce}_generation.jpg"
+        """
         try:
             out_dir = get_output_directory() or "outputs"
             os.makedirs(out_dir, exist_ok=True)
 
             # Prefer base64 payload (already downloaded by extension)
             b64 = result.get("image_bytes_b64") or ""
-            if b64:
-                data = base64.b64decode(b64)
-                ext = "jpg"
-                filename = f"genspark_{job_id[:8]}_{int(time.time())}.{ext}"
-                path = os.path.join(out_dir, filename)
-                with open(path, "wb") as f:
-                    f.write(data)
-                return path
-
-            # Fallback: tell user the URL, mark as "completed" with a note
-            url = result.get("image_url", "")
-            if url:
+            if not b64:
+                url = result.get("image_url", "")
+                if not url:
+                    return None
+                # Extension didn't send bytes — save URL pointer so the user
+                # can still recover the file.
                 self._log(
-                    f"[GensparkMode] No bytes returned, only URL: {url[:100]}"
+                    f"[{slot_id}] No bytes returned, only URL: {url[:100]}"
                 )
-                # Write a small .txt pointer instead of a real image
-                filename = f"genspark_{job_id[:8]}_{int(time.time())}.url.txt"
-                path = os.path.join(out_dir, filename)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(url + "\n")
-                return path
-            return None
+                data = (url + "\n").encode("utf-8")
+                ext = ".url.txt"
+            else:
+                data = base64.b64decode(b64)
+                # Sniff magic bytes — Genspark usually serves JPEG, sometimes
+                # PNG. Fall back to .jpg if ambiguous.
+                if data[:3] == b"\xff\xd8\xff":
+                    ext = ".jpg"
+                elif data[:8] == b"\x89PNG\r\n\x1a\n":
+                    ext = ".png"
+                elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                    ext = ".webp"
+                else:
+                    ext = ".jpg"
+
+            # Normalise queue_no → positive integer (same rule as Flow)
+            normalized_qno = None
+            try:
+                val = int(queue_no) if queue_no is not None else None
+                if val is not None and val > 0:
+                    normalized_qno = val
+            except Exception:
+                pass
+
+            if normalized_qno is not None:
+                filename = f"{normalized_qno}{ext}"
+            else:
+                safe_job = (job_id or "job").replace("-", "")[:8]
+                ts = int(time.time() * 1000)
+                nonce = random.randint(1000, 9999)
+                filename = f"{safe_job}_{ts}_{nonce}_generation{ext}"
+
+            output_path = os.path.join(out_dir, filename)
+
+            # If a file with the numbered name already exists (manual retry
+            # on a previously-saved job), overwrite — the new attempt is
+            # the canonical version now.
+            mode = "wb" if ext != ".url.txt" else "w"
+            if mode == "wb":
+                with open(output_path, "wb") as f:
+                    f.write(data)
+            else:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(data.decode("utf-8"))
+
+            try:
+                from src.db.db_manager import update_job_runtime_state
+                update_job_runtime_state(job_id, output_path=output_path)
+            except Exception:
+                pass
+
+            self._log(
+                f"[{slot_id}] Saved: {filename} ({len(data)} bytes)"
+            )
+            return output_path
         except Exception as e:
-            self._log(f"[GensparkMode] Save failed: {e}")
+            self._log(f"[{slot_id}] Save failed: {e}")
             return None
