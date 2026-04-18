@@ -188,6 +188,32 @@ class GensparkModeManager:
             self._log(f"[GensparkMode] Total: {total_workers} worker(s) across "
                      f"{len(self._workers)} account(s).")
 
+            # Snapshot of queue at start — helps user debug "nothing happens"
+            try:
+                initial_jobs = get_all_jobs() or []
+                by_status: Dict[str, int] = {}
+                for j in initial_jobs:
+                    s = j.get("status", "unknown")
+                    by_status[s] = by_status.get(s, 0) + 1
+                self._log(
+                    f"[GensparkMode] Queue snapshot: "
+                    + ", ".join(f"{k}={v}" for k, v in by_status.items())
+                    if by_status else "[GensparkMode] Queue is empty."
+                )
+                if not by_status.get("pending", 0):
+                    self._log(
+                        "[GensparkMode] No pending jobs. "
+                        "If you re-ran after a failure, the old job is marked "
+                        "'failed' — add a fresh prompt in the Prompts box and "
+                        "click 'Add to Queue'."
+                    )
+            except Exception:
+                pass
+
+            # Idle heartbeat so logs don't go silent while we wait for jobs
+            last_heartbeat = 0.0
+            heartbeat_interval = 20.0  # seconds
+
             # Main dispatch loop
             while self.qm.is_running:
                 if self.qm.stop_requested or self.qm.force_stop_requested:
@@ -219,13 +245,31 @@ class GensparkModeManager:
                 jobs = get_all_jobs()
                 pending = [j for j in jobs if j["status"] == "pending"]
 
+                # Periodic idle heartbeat so the user sees the app is alive
+                now_ts = time.time()
+                if now_ts - last_heartbeat > heartbeat_interval:
+                    running_count = sum(1 for j in jobs if j["status"] == "running")
+                    failed_count = sum(1 for j in jobs if j["status"] == "failed")
+                    done_count = sum(1 for j in jobs if j["status"] == "completed")
+                    self._log(
+                        f"[GensparkMode] ⏱ waiting — "
+                        f"pending={len(pending)}, running={running_count}, "
+                        f"done={done_count}, failed={failed_count}, "
+                        f"active_tasks={len(self._active_tasks)}"
+                    )
+                    last_heartbeat = now_ts
+
                 if not pending:
                     if not self._active_tasks:
                         still_active = any(
                             j["status"] in ("pending", "running") for j in get_all_jobs()
                         )
                         if not still_active:
-                            self._log("[GensparkMode] All jobs completed.")
+                            self._log(
+                                "[GensparkMode] All jobs completed (or failed). "
+                                "Stopping Genspark mode. Add fresh prompts and "
+                                "click Start Automation to run more."
+                            )
                             break
                     await asyncio.sleep(self.qm.scheduler_poll_seconds)
                     continue
@@ -240,9 +284,19 @@ class GensparkModeManager:
                         break
                     worker = self._get_available_worker(busy_slots)
                     if not worker:
+                        # No free workers — log once per tick so user knows why
+                        self._log(
+                            f"[GensparkMode] All {sum(len(w) for w in self._workers.values())} "
+                            f"worker(s) busy, {len(pending)} job(s) waiting"
+                        )
                         break
 
                     job_id = job["id"]
+                    prompt_preview = str(job.get("prompt") or "")[:60]
+                    self._log(
+                        f"[GensparkMode] Dispatching job {job_id[:6]}... "
+                        f"to {worker.slot_id} | prompt: \"{prompt_preview}\""
+                    )
                     update_job_status(job_id, "running", account=worker.account_email)
                     self.qm.signals.job_updated.emit(
                         job_id, "running", worker.account_email, ""
