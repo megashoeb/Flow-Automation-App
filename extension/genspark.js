@@ -582,19 +582,33 @@ async function gensparkHandleWork(work) {
           return { error: "ask_proxy_exception: " + (e?.message || e) };
         }
       },
-      args: [{
-        model_params: model_params,
-        writingContent: null,
-        type: "image_generation_agent",
-        project_id: null,
-        messages: [{
+      args: [(() => {
+        const userMsgId = _gensparkUuid();
+        const messages = [{
           role: "user",
-          id: _gensparkUuid(),
+          id: userMsgId,
           content: prompt,
-        }],
-        user_s_input: prompt,
-        g_recaptcha_token: recaptchaToken,
-      }],
+        }];
+        // Body shape captured from a real genspark.ai POST (Nano Banana Pro).
+        // Includes is_private + push_token + session_state which the newer
+        // Pro endpoint seems to require. Nano Banana 2 worked without them
+        // because the older API accepted a leaner payload.
+        return {
+          model_params: model_params,
+          writingContent: null,
+          type: "image_generation_agent",
+          project_id: null,
+          messages: messages,
+          user_s_input: prompt,
+          g_recaptcha_token: recaptchaToken,
+          is_private: true,
+          push_token: "",
+          session_state: {
+            steps: [],
+            messages: messages,
+          },
+        };
+      })()],
     });
     taskInfo = askResult?.[0]?.result;
     if (!taskInfo || taskInfo.error) {
