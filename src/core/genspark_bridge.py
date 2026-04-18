@@ -73,7 +73,10 @@ class GensparkBridge:
 
     async def start(self) -> None:
         """Start the Genspark bridge HTTP server."""
-        self._app = web.Application()
+        # Generated images are 2-5 MB base64-encoded. Default aiohttp limit
+        # is 1 MB which silently 413s the submit_result POST. Bump to 50 MB
+        # so we can comfortably handle 4K image base64 payloads.
+        self._app = web.Application(client_max_size=50 * 1024 * 1024)
         self._app.router.add_get("/genspark/poll", self._handle_poll)
         self._app.router.add_post("/genspark/work-result", self._handle_work_result)
         self._app.router.add_post("/genspark/accounts", self._handle_accounts)

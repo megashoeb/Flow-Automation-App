@@ -244,6 +244,27 @@ async function gensparkPollBridge() {
     const data = await resp.json();
 
     if (data.work && !gensparkWorkInProgress) {
+      const rid = data.work.request_id;
+      // Dedupe — don't re-process the same request_id.
+      // If we already submitted it, notify the bridge again (in case the
+      // previous submit was lost) but don't re-generate the image.
+      if (submittedRequestIds.has(rid) || inFlightRequestIds.has(rid)) {
+        console.warn(
+          `[Genspark] Duplicate work dispatch for ${rid} — refusing to re-run. ` +
+          `(submitted=${submittedRequestIds.has(rid)}, inFlight=${inFlightRequestIds.has(rid)})`
+        );
+        // Tell bridge this request is already handled so it drops the future
+        fetch(`${GENSPARK_BRIDGE_URL}/genspark/work-result`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            request_id: rid,
+            error: "duplicate_dispatch_refused_by_extension",
+          }),
+        }).catch(() => {});
+        return;
+      }
+      inFlightRequestIds.add(rid);
       gensparkWorkInProgress = true;
       try {
         await gensparkHandleWork(data.work);
@@ -251,6 +272,7 @@ async function gensparkPollBridge() {
         console.warn("[Genspark] handleWork threw:", e.message);
       } finally {
         gensparkWorkInProgress = false;
+        inFlightRequestIds.delete(rid);
       }
     }
   } catch (e) {
@@ -265,6 +287,10 @@ async function gensparkPollBridge() {
 
 async function gensparkHandleWork(work) {
   const { request_id, account, prompt, model_params, recaptcha_site_key } = work;
+  if (submittedRequestIds.has(request_id)) {
+    console.warn(`[Genspark] already submitted, skipping ${request_id}`);
+    return;
+  }
   await gensparkReportProgress(request_id, "received_work", `account=${account}`);
 
   const info = gensparkAccounts[account];
@@ -728,16 +754,51 @@ async function gensparkHandleWork(work) {
   });
 }
 
+// Track which request_ids we've already submitted — prevents re-dispatching
+// the same work item (and wasting credits) if the submit POST fails for
+// any reason and the bridge keeps handing us the same work on subsequent
+// polls. Capped at 200 entries.
+const submittedRequestIds = new Set();
+const inFlightRequestIds = new Set();
+
 async function gensparkSubmitResult(requestId, body) {
-  try {
-    await fetch(`${GENSPARK_BRIDGE_URL}/genspark/work-result`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ request_id: requestId, ...body }),
-    });
-  } catch (e) {
-    console.warn("[Genspark] submit result failed:", e.message);
+  // Retry up to 3 times — size errors are hard-fail, others transient
+  let lastError = "";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = await fetch(`${GENSPARK_BRIDGE_URL}/genspark/work-result`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: requestId, ...body }),
+      });
+      if (resp.ok) {
+        submittedRequestIds.add(requestId);
+        // Prune cache if it grows too large
+        if (submittedRequestIds.size > 200) {
+          const first = submittedRequestIds.values().next().value;
+          submittedRequestIds.delete(first);
+        }
+        return true;
+      }
+      lastError = `HTTP ${resp.status}`;
+      const txt = await resp.text().catch(() => "");
+      console.warn(
+        `[Genspark] submit_result attempt ${attempt} rejected (${lastError}): ${txt.slice(0, 200)}`
+      );
+      // 413 means we need to drop bytes — retry without them
+      if (resp.status === 413 && body.image_bytes_b64) {
+        console.warn("[Genspark] Dropping base64 bytes and retrying URL-only");
+        delete body.image_bytes_b64;
+        continue;
+      }
+    } catch (e) {
+      lastError = e.message || "fetch failed";
+      console.warn(`[Genspark] submit_result attempt ${attempt} threw:`, lastError);
+    }
+    await new Promise(r => setTimeout(r, 500 * attempt));
   }
+  console.error(`[Genspark] submit_result FAILED after 3 attempts for ${requestId}: ${lastError}`);
+  return false;
 }
 
 async function gensparkReportProgress(requestId, step, detail) {
