@@ -1889,11 +1889,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "getStatus") {
     const accs = Object.values(connectedAccounts).filter((a) => a.logged_in);
+    const gensparkStatus = (typeof self.gensparkGetStatus === "function")
+      ? self.gensparkGetStatus()
+      : { connected: false, accounts: [], lastError: "" };
     sendResponse({
       connected: bridgeConnected,
       accounts: accs.map((a) => ({ email: a.email, name: a.name })),
       tokenCount,
       lastError: lastPollError,
+      genspark: gensparkStatus,
       ecosystem: {
         directive: ecosystemComputeDirective(),
         enabled: ecosystemEnabledLocal,

@@ -179,6 +179,47 @@ function updateStatus(status) {
   } else {
     feedCard.style.display = "none";
   }
+
+  // ─── Genspark section ───
+  const gs = status.genspark || { connected: false, accounts: [], lastError: "" };
+  const gsSection = document.getElementById("gensparkSection");
+  const gsStatusLine = document.getElementById("gensparkStatusLine");
+  const gsList = document.getElementById("gensparkAccountsList");
+  if (gsSection && gsList) {
+    // Always show the section so users know the Genspark feature exists
+    gsSection.style.display = "block";
+    if (gs.connected) {
+      gsStatusLine.textContent = "Bridge: ✅ Connected (port 18925)";
+      gsStatusLine.style.color = "#66bb6a";
+    } else if (gs.lastError) {
+      gsStatusLine.textContent = `Bridge: ⚠ ${gs.lastError} (start the app in Genspark mode)`;
+      gsStatusLine.style.color = "#ffa726";
+    } else {
+      gsStatusLine.textContent = "Bridge: offline (start app in Genspark mode)";
+      gsStatusLine.style.color = "#778";
+    }
+
+    if (gs.accounts && gs.accounts.length > 0) {
+      gsList.innerHTML = gs.accounts.map((a) => {
+        const plan = (a.plan || "free").toLowerCase();
+        const planColor = plan.includes("pro") ? "#c88aff"
+          : plan.includes("plus") ? "#66bb6a"
+          : "#888";
+        return `
+          <div class="account-card">
+            <div class="icon" style="background:#2d1a4d;">🍌</div>
+            <div class="info">
+              <div class="email">${a.email}</div>
+              <div class="name" style="color:${planColor}">
+                ${plan === "free" ? "⚠ Free plan (limited)" : `✓ ${plan.toUpperCase()} — unlimited`}
+              </div>
+            </div>
+          </div>`;
+      }).join("");
+    } else {
+      gsList.innerHTML = '<div class="no-accounts" style="font-size:11px;">No accounts detected.<br>Open genspark.ai/ai_image and log in.</div>';
+    }
+  }
 }
 
 // Get status from background
