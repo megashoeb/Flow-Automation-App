@@ -40,7 +40,6 @@ async function gensparkDetectAccounts() {
   try {
     const tabs = await chrome.tabs.query({ url: `${GENSPARK_ORIGIN}/*` });
     if (!tabs.length) {
-      // No Genspark tabs → clear local registry
       gensparkAccounts = {};
       return;
     }
@@ -52,39 +51,129 @@ async function gensparkDetectAccounts() {
           target: { tabId: tab.id },
           world: "MAIN",
           func: async () => {
-            try {
-              const r = await fetch("/api/user/me", {
-                method: "GET",
-                credentials: "include",
-                headers: { "Accept": "application/json" },
-              });
-              if (!r.ok) return { logged_in: false, status: r.status };
-              const data = await r.json();
-              // Genspark wraps responses in {status, message, data}
-              const user = data?.data || data;
-              const email = user?.email || "";
-              if (!email) return { logged_in: false, reason: "no_email" };
-              // Extract plan type — field names can vary; check common ones
-              const plan =
-                user?.subscription?.plan ||
-                user?.subscription_plan ||
-                user?.plan_type ||
-                user?.plan ||
-                "free";
-              return {
-                logged_in: true,
-                email,
-                plan_type: String(plan).toLowerCase(),
-                user_id: user?.id || user?.user_id || "",
-                display_name: user?.display_name || user?.name || "",
-              };
-            } catch (e) {
-              return { logged_in: false, error: e.message };
+            // Try multiple endpoints — Genspark's actual user endpoint
+            // name isn't documented so we probe a few common patterns.
+            const endpoints = [
+              "/api/user/me",
+              "/api/user/info",
+              "/api/user",
+              "/api/me",
+              "/api/auth/session",
+              "/api/auth/me",
+              "/api/account/info",
+              "/api/account/me",
+              "/api/v1/user",
+              "/api/v1/me",
+            ];
+            let userInfo = null;
+            let hitEndpoint = "";
+            let lastStatus = 0;
+            for (const ep of endpoints) {
+              try {
+                const r = await fetch(ep, {
+                  method: "GET",
+                  credentials: "include",
+                  headers: { "Accept": "application/json" },
+                });
+                lastStatus = r.status;
+                if (!r.ok) continue;
+                const ctype = r.headers.get("content-type") || "";
+                if (!ctype.includes("json")) continue;
+                const data = await r.json().catch(() => null);
+                if (!data) continue;
+                // Genspark wraps responses in {status, message, data}
+                const u = data?.data || data?.user || data;
+                const email =
+                  u?.email || u?.user_email || u?.userEmail ||
+                  u?.account?.email || u?.profile?.email || "";
+                if (!email) continue;
+                userInfo = {
+                  email,
+                  plan_type: String(
+                    u?.subscription?.plan || u?.subscription?.tier ||
+                    u?.subscription_plan || u?.plan_type || u?.plan ||
+                    u?.subscription?.type || u?.membership_type ||
+                    u?.membership?.plan || "free"
+                  ).toLowerCase(),
+                  user_id: String(u?.id || u?.user_id || u?.uid || ""),
+                  display_name: u?.display_name || u?.name ||
+                                u?.username || u?.nickname || "",
+                };
+                hitEndpoint = ep;
+                break;
+              } catch (_e) {
+                // Try next endpoint
+              }
             }
+
+            // Fallback 1: DOM-based detection — if the page shows the
+            // user's profile icon with initial or email in accessible
+            // attributes, treat as logged in even without an API hit.
+            if (!userInfo) {
+              // Look for user email in common DOM patterns
+              const emailFromDom = (() => {
+                // Data attributes
+                const el = document.querySelector(
+                  "[data-user-email], [data-email], [aria-label*='@']"
+                );
+                if (el) {
+                  const attrs = ["data-user-email", "data-email", "aria-label"];
+                  for (const a of attrs) {
+                    const v = el.getAttribute(a) || "";
+                    const m = v.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+                    if (m) return m[0];
+                  }
+                }
+                // Inline script / Nuxt state often has the email
+                const scripts = document.querySelectorAll("script");
+                for (const s of scripts) {
+                  const t = s.textContent || "";
+                  const m = t.match(/"email":"([\w.+-]+@[\w-]+\.[\w.-]+)"/);
+                  if (m) return m[1];
+                }
+                return "";
+              })();
+              if (emailFromDom) {
+                userInfo = {
+                  email: emailFromDom,
+                  plan_type: "unknown",
+                  user_id: "",
+                  display_name: "",
+                };
+                hitEndpoint = "dom_scrape";
+              }
+            }
+
+            // Fallback 2: cookie-only detection — if the user has any
+            // auth-looking cookie, accept them as logged in with a
+            // synthetic email so work can still be dispatched.
+            if (!userInfo) {
+              const cookieNames = (document.cookie || "")
+                .split(";").map(c => c.trim().split("=")[0]);
+              const authLike = cookieNames.some(n =>
+                /session|token|auth|sso|logged/i.test(n)
+              );
+              if (authLike) {
+                userInfo = {
+                  email: "logged_in_user@genspark.ai",  // placeholder
+                  plan_type: "unknown",
+                  user_id: "",
+                  display_name: "Genspark user",
+                };
+                hitEndpoint = "cookie_only";
+              }
+            }
+
+            return {
+              logged_in: !!userInfo,
+              ...(userInfo || {}),
+              _probe_endpoint: hitEndpoint,
+              _last_status: lastStatus,
+            };
           },
         });
         const info = result?.[0]?.result;
-        if (info && info.logged_in && info.email) {
+        if (info?.logged_in && info.email) {
           fresh[info.email] = {
             email: info.email,
             plan_type: info.plan_type,
@@ -92,11 +181,25 @@ async function gensparkDetectAccounts() {
             user_id: info.user_id,
             display_name: info.display_name,
           };
+          if (info._probe_endpoint && !fresh.__logged_endpoint_once) {
+            console.log(
+              `[Genspark] Account detected via ${info._probe_endpoint}: ${info.email} (${info.plan_type})`
+            );
+            fresh.__logged_endpoint_once = true;
+          }
+        } else if (info) {
+          console.log(
+            `[Genspark] No account on tab ${tab.id} — ` +
+            `probe endpoint: ${info._probe_endpoint || "none matched"}, ` +
+            `last status: ${info._last_status}`
+          );
         }
       } catch (e) {
-        // Tab might be closed or protected — skip silently
+        console.warn("[Genspark] detection error on tab", tab.id, e.message);
       }
     }
+    // Remove internal marker before publishing
+    delete fresh.__logged_endpoint_once;
     gensparkAccounts = fresh;
 
     // Report to bridge

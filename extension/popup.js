@@ -1,5 +1,13 @@
 // G-Labs Studio Helper — Popup UI
 
+// Show the actual extension version from the manifest
+try {
+  const m = chrome.runtime.getManifest();
+  const el = document.getElementById("versionLabel");
+  if (el && m?.version) el.textContent = "v" + m.version;
+} catch {}
+
+
 function updateStatus(status) {
   const badge = document.getElementById("statusBadge");
   const dot = document.getElementById("statusDot");
