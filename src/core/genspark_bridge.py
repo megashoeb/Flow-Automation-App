@@ -266,6 +266,19 @@ class GensparkBridge:
             return web.json_response({"ok": True, "stale": True}, headers=_cors())
 
         if data.get("error"):
+            dbg = data.get("debug")
+            if dbg:
+                try:
+                    evt_summary = dbg.get("event_types") or {}
+                    self._log(
+                        f"[GensparkBridge] SSE debug — event types: "
+                        f"{evt_summary} (project_id={dbg.get('project_id')})"
+                    )
+                    last_events = dbg.get("last_events") or []
+                    for e in last_events[-5:]:
+                        self._log(f"[GensparkBridge]   event: {e}")
+                except Exception:
+                    pass
             fut.set_result({"error": str(data["error"])})
         else:
             self._images_generated += 1

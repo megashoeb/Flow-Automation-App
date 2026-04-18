@@ -345,61 +345,202 @@ async function gensparkHandleWork(work) {
             const text = await r.text().catch(() => "");
             return { error: `ask_proxy_http_${r.status}`, body: text.slice(0, 500) };
           }
-          // Parse SSE stream to find task_id
+
+          // Parse SSE stream — aggressive task_id extraction with multiple
+          // strategies. Genspark's format uses {type, field_name, field_value}
+          // events + tool_call deltas. The task_id can appear in many places.
           const reader = r.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
           let taskId = null;
           let projectId = null;
           let msgId = null;
+          const allEvents = [];            // every parsed event for debug
+          const eventTypeCounts = {};      // summary for debug
+          const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
           const deadline = Date.now() + 120000;  // 2 min hard cap
+
+          // Tool-call argument accumulator (arguments stream as deltas)
+          const toolArgBuffer = {};  // tool_call_id -> { name, args_string }
+
+          function tryExtractTaskId(obj) {
+            if (taskId) return;
+
+            // Direct fields
+            if (obj.task_id) { taskId = obj.task_id; return; }
+            if (Array.isArray(obj.task_ids) && obj.task_ids[0]) {
+              taskId = obj.task_ids[0]; return;
+            }
+
+            const fv = obj.field_value;
+            if (fv && typeof fv === "object") {
+              // Shape 1: array of tasks
+              if (Array.isArray(fv)) {
+                for (const item of fv) {
+                  if (item && typeof item === "object" &&
+                      item.id && (item.task_type || item.task_source)) {
+                    taskId = item.id; return;
+                  }
+                }
+              } else {
+                // Shape 2: single task object
+                if (fv.id && (fv.task_type || fv.task_source || fv.queue_name)) {
+                  taskId = fv.id; return;
+                }
+                // Shape 3: { task_ids: [...] }
+                if (Array.isArray(fv.task_ids) && fv.task_ids[0]) {
+                  taskId = fv.task_ids[0]; return;
+                }
+                // Shape 4: { tasks: {task_id_string: {...}} }  (like ig_tasks_status)
+                if (fv.tasks && typeof fv.tasks === "object") {
+                  const keys = Object.keys(fv.tasks);
+                  if (keys.length) {
+                    // Prefer keys that look like UUIDs
+                    const uuidKey = keys.find((k) => UUID_RE.test(k));
+                    taskId = uuidKey || keys[0];
+                    if (taskId) { UUID_RE.lastIndex = 0; return; }
+                  }
+                }
+              }
+            }
+
+            // Shape 5: field_name mentions tasks/task_ids and field_value is string
+            const fn = (obj.field_name || "").toLowerCase();
+            if (!taskId && fv && typeof fv === "string" &&
+                (fn.includes("task") || fn.includes("generation"))) {
+              const m = fv.match(UUID_RE);
+              UUID_RE.lastIndex = 0;
+              if (m) {
+                const candidates = m.filter((u) => u !== projectId && u !== msgId);
+                if (candidates.length) {
+                  taskId = candidates[candidates.length - 1];
+                  return;
+                }
+              }
+            }
+
+            // Shape 6: tool_result messages for generate_images — content may
+            // be a JSON string with a tasks array
+            if (obj.type === "message_start" && obj.role === "tool" && obj.content) {
+              try {
+                const parsed = typeof obj.content === "string"
+                  ? JSON.parse(obj.content) : obj.content;
+                if (parsed?.tasks && Array.isArray(parsed.tasks) && parsed.tasks[0]?.id) {
+                  taskId = parsed.tasks[0].id;
+                  return;
+                }
+                if (Array.isArray(parsed?.task_ids) && parsed.task_ids[0]) {
+                  taskId = parsed.task_ids[0]; return;
+                }
+              } catch {}
+            }
+          }
+
+          function tryExtractFromToolArgs(obj) {
+            // Generate_images tool arguments accumulate as deltas; once the
+            // full JSON is valid and contains task IDs, grab them.
+            if (obj.type === "message_field_delta" &&
+                (obj.field_name || "").startsWith("tool_calls[") &&
+                (obj.field_name || "").includes("arguments")) {
+              const msg = obj.message_id || "unknown";
+              const buf = toolArgBuffer[msg] = toolArgBuffer[msg] || { args: "" };
+              buf.args += (obj.delta || "");
+              // Try parse (may fail until complete)
+              try {
+                const parsed = JSON.parse(buf.args);
+                if (!taskId && parsed) {
+                  // Try obvious places
+                  if (Array.isArray(parsed.task_ids) && parsed.task_ids[0]) {
+                    taskId = parsed.task_ids[0]; return;
+                  }
+                  if (Array.isArray(parsed.tasks) && parsed.tasks[0]?.id) {
+                    taskId = parsed.tasks[0].id; return;
+                  }
+                }
+              } catch {}
+            }
+            // Also: when a tool_call has a complete function.arguments string
+            if (obj.type === "message_field" &&
+                (obj.field_name || "").startsWith("tool_calls[")) {
+              const fv = obj.field_value;
+              if (fv?.function?.arguments && typeof fv.function.arguments === "string") {
+                try {
+                  const parsed = JSON.parse(fv.function.arguments);
+                  if (!taskId) {
+                    if (Array.isArray(parsed.task_ids) && parsed.task_ids[0]) {
+                      taskId = parsed.task_ids[0];
+                    } else if (Array.isArray(parsed.tasks) && parsed.tasks[0]?.id) {
+                      taskId = parsed.tasks[0].id;
+                    }
+                  }
+                } catch {}
+              }
+            }
+          }
 
           while (Date.now() < deadline) {
             const { value, done } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
-            buffer = lines.pop() || "";  // keep incomplete last line
+            buffer = lines.pop() || "";
             for (const line of lines) {
               if (!line.startsWith("data:")) continue;
               const payload = line.slice(5).trim();
               if (!payload) continue;
               try {
                 const obj = JSON.parse(payload);
-                // task_id appears on a message_field event for field_name "tasks"
-                // or in a field_value that's an array of tasks. Different patterns
-                // — scan liberally.
                 if (!projectId && obj.project_id) projectId = obj.project_id;
                 if (!msgId && obj.message_id) msgId = obj.message_id;
-                // Pattern 1: tasks array in field_value
-                const fv = obj.field_value;
-                if (!taskId && fv && typeof fv === "object") {
-                  if (Array.isArray(fv)) {
-                    for (const item of fv) {
-                      if (item && item.id && item.task_type) {
-                        taskId = item.id;
-                        break;
-                      }
-                    }
-                  } else if (fv.task_ids && Array.isArray(fv.task_ids)) {
-                    taskId = fv.task_ids[0];
-                  } else if (fv.id && fv.task_type) {
-                    taskId = fv.id;
+                const t = obj.type || "unknown";
+                eventTypeCounts[t] = (eventTypeCounts[t] || 0) + 1;
+                // Keep a lightweight snapshot for debugging
+                if (allEvents.length < 200) {
+                  const snap = { type: t };
+                  if (obj.field_name) snap.field_name = obj.field_name;
+                  if (obj.role) snap.role = obj.role;
+                  if (obj.field_value !== undefined) {
+                    snap.field_value =
+                      typeof obj.field_value === "string"
+                        ? obj.field_value.slice(0, 180)
+                        : obj.field_value;
                   }
+                  if (obj.delta) snap.delta = String(obj.delta).slice(0, 60);
+                  allEvents.push(snap);
                 }
-                // Pattern 2: delta contains JSON fragment — ignore, we'll find
-                // the task on a later event
-                // Pattern 3: stop when we get completion event and task_id
+                tryExtractTaskId(obj);
+                tryExtractFromToolArgs(obj);
                 if (taskId) break;
-              } catch (_e) {
-                // Not JSON — skip
-              }
+              } catch (_e) {}
             }
             if (taskId) break;
           }
           try { await reader.cancel(); } catch {}
+
           if (!taskId) {
-            return { error: "sse_no_task_id_found" };
+            // Final fallback: any UUID in any event that isn't project/msg id
+            for (const ev of allEvents) {
+              if (taskId) break;
+              const s = JSON.stringify(ev);
+              const m = s.match(UUID_RE);
+              UUID_RE.lastIndex = 0;
+              if (m) {
+                const cand = m.filter(
+                  (u) => u !== projectId && u !== msgId && u !== (ev.message_id || "")
+                );
+                if (cand.length) { taskId = cand[cand.length - 1]; break; }
+              }
+            }
+          }
+
+          if (!taskId) {
+            return {
+              error: "sse_no_task_id_found",
+              project_id: projectId,
+              msg_id: msgId,
+              debug_event_types: eventTypeCounts,
+              debug_last_events: allEvents.slice(-8),
+            };
           }
           return { task_id: taskId, project_id: projectId, msg_id: msgId };
         } catch (e) {
@@ -422,8 +563,19 @@ async function gensparkHandleWork(work) {
     });
     taskInfo = askResult?.[0]?.result;
     if (!taskInfo || taskInfo.error) {
+      // Include debug context if we got the structured error
+      const debugPayload = (taskInfo && taskInfo.debug_event_types)
+        ? { event_types: taskInfo.debug_event_types,
+            last_events: taskInfo.debug_last_events,
+            project_id: taskInfo.project_id,
+            msg_id: taskInfo.msg_id }
+        : null;
+      if (debugPayload) {
+        console.log("[Genspark] SSE debug:", JSON.stringify(debugPayload, null, 2));
+      }
       await gensparkSubmitResult(request_id, {
         error: taskInfo?.error || "ask_proxy_no_result",
+        debug: debugPayload,
       });
       return;
     }
