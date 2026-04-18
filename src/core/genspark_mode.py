@@ -109,8 +109,11 @@ class GensparkModeManager:
         await self._bridge.start()
 
         try:
+            # Default 5 matches GENSPARK_MAX_PARALLEL in the extension.
+            # Clamped to a safe 1..10 — higher than 10 per account hits the
+            # 5-hour session rate limit on Plus plan quickly.
             slots_per_account = max(
-                1, min(20, get_int_setting("genspark_slots_per_account", 3))
+                1, min(10, get_int_setting("genspark_slots_per_account", 5))
             )
 
             self._log(

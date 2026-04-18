@@ -59,9 +59,13 @@ class GensparkBridge:
         # Shape: { email: {email, plan_type, tab_id, last_seen} }
         self._connected_accounts: Dict[str, Dict[str, Any]] = {}
 
-        # Track which extension instance picked up which request
-        # request_id -> frozenset(ext_accounts)
-        self._dispatched_to: Dict[str, frozenset] = {}
+        # Track which extension instance picked up which request.
+        # Shape: request_id -> { ext_key: frozenset, ts: dispatch_timestamp }
+        # Once a request is dispatched we stop re-dispatching it for
+        # DISPATCH_LOCK_SECONDS — the extension is processing it in parallel,
+        # we don't want to hand out the same work twice.
+        self._dispatched_to: Dict[str, Dict[str, Any]] = {}
+        self.DISPATCH_LOCK_SECONDS = 300  # 5 min; longer than typical generation
 
         # Stats
         self._images_generated = 0
@@ -210,7 +214,10 @@ class GensparkBridge:
         if not ext_accounts:
             return web.json_response(response_data, headers=_cors())
 
-        # Find a pending request targeted at one of this ext's accounts
+        # Find a pending request targeted at one of this ext's accounts.
+        # Skip any request already in flight (dispatched within DISPATCH_LOCK)
+        # to support parallel processing without duplicating generations.
+        now = time.time()
         for req_id, req in list(self._pending_requests.items()):
             fut = req.get("future")
             if not fut or fut.done():
@@ -219,10 +226,14 @@ class GensparkBridge:
             failed_ext_keys = req.get("_failed_ext_keys", set())
             if ext_key and ext_key in failed_ext_keys:
                 continue
-            dispatched_key = self._dispatched_to.get(req_id)
-            if dispatched_key is not None and dispatched_key != ext_key:
-                # Another extension is already working this request
-                continue
+
+            dispatched = self._dispatched_to.get(req_id)
+            if dispatched:
+                ts = dispatched.get("ts", 0)
+                # Still within lock window → don't re-dispatch
+                if now - ts < self.DISPATCH_LOCK_SECONDS:
+                    continue
+                # Lock expired (extension likely crashed) → allow re-dispatch
 
             if target in ext_accounts or not target:
                 response_data["work"] = {
@@ -233,7 +244,7 @@ class GensparkBridge:
                     "model_params": req["model_params"],
                     "recaptcha_site_key": GENSPARK_RECAPTCHA_SITE_KEY,
                 }
-                self._dispatched_to[req_id] = ext_key
+                self._dispatched_to[req_id] = {"ext_key": ext_key, "ts": now}
                 break
 
         return web.json_response(response_data, headers=_cors())

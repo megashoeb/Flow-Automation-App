@@ -28,9 +28,14 @@ const GENSPARK_ORIGIN = "https://www.genspark.ai";
 
 // ─── State ───
 let gensparkBridgeConnected = false;
-let gensparkWorkInProgress = false;
 let gensparkAccounts = {};  // email -> { email, plan_type, tab_id, ... }
 let gensparkLastPollError = "";
+// Parallel concurrency control — how many image generations may run
+// concurrently inside this extension. Genspark's reCAPTCHA + SSE stack
+// handles ~3-5 parallel requests from the same tab well. Bumping past 5
+// starts to hit session rate limits on Plus plan.
+const GENSPARK_MAX_PARALLEL = 5;
+let gensparkActiveCount = 0;
 
 // ═══════════════════════════════════════════════════════════════════
 // Account detection
@@ -243,37 +248,30 @@ async function gensparkPollBridge() {
     gensparkLastPollError = "";
     const data = await resp.json();
 
-    if (data.work && !gensparkWorkInProgress) {
+    if (data.work && gensparkActiveCount < GENSPARK_MAX_PARALLEL) {
       const rid = data.work.request_id;
-      // Dedupe — don't re-process the same request_id.
-      // If we already submitted it, notify the bridge again (in case the
-      // previous submit was lost) but don't re-generate the image.
+      // Dedupe — if we're already processing or already submitted this id,
+      // ignore this dispatch silently (the bridge should also skip re-
+      // dispatching but belt-and-suspenders helps).
       if (submittedRequestIds.has(rid) || inFlightRequestIds.has(rid)) {
-        console.warn(
-          `[Genspark] Duplicate work dispatch for ${rid} — refusing to re-run. ` +
-          `(submitted=${submittedRequestIds.has(rid)}, inFlight=${inFlightRequestIds.has(rid)})`
-        );
-        // Tell bridge this request is already handled so it drops the future
-        fetch(`${GENSPARK_BRIDGE_URL}/genspark/work-result`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            request_id: rid,
-            error: "duplicate_dispatch_refused_by_extension",
-          }),
-        }).catch(() => {});
+        // Silent skip — no refusal POST (used to cause the valid run to be
+        // cancelled mid-flight).
         return;
       }
       inFlightRequestIds.add(rid);
-      gensparkWorkInProgress = true;
-      try {
-        await gensparkHandleWork(data.work);
-      } catch (e) {
-        console.warn("[Genspark] handleWork threw:", e.message);
-      } finally {
-        gensparkWorkInProgress = false;
-        inFlightRequestIds.delete(rid);
-      }
+      gensparkActiveCount++;
+      // Fire-and-forget — we don't await this, so the poll loop can keep
+      // picking up more work while a generation runs in parallel.
+      (async () => {
+        try {
+          await gensparkHandleWork(data.work);
+        } catch (e) {
+          console.warn("[Genspark] handleWork threw:", e.message);
+        } finally {
+          gensparkActiveCount--;
+          inFlightRequestIds.delete(rid);
+        }
+      })();
     }
   } catch (e) {
     gensparkBridgeConnected = false;
