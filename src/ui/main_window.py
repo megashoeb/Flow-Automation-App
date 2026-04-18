@@ -4733,6 +4733,48 @@ class MainWindow(QMainWindow):
         self.cmb_generation_mode.setCurrentIndex(gen_mode_idx)
         browser_form.addRow(self._settings_label("Generation Mode"), self.cmb_generation_mode)
 
+        # ─── Genspark-specific settings (only relevant when that mode is active) ───
+        self.cmb_genspark_model = QComboBox()
+        self.cmb_genspark_model.setObjectName("settingInput")
+        self.cmb_genspark_model.setMinimumHeight(38)
+        self.cmb_genspark_model.addItem("Nano Banana 2 (Plus plan — 2K max)", "nano-banana-2")
+        self.cmb_genspark_model.addItem("Nano Banana Pro (Pro plan — 4K unlimited)", "nano-banana-pro")
+        self.cmb_genspark_model.setToolTip(
+            "Genspark model selection.\n\n"
+            "Nano Banana 2: Plus plan ($24.99/mo) — unlimited 2K generations\n"
+            "Nano Banana Pro: Pro plan ($249.99/mo) — unlimited 4K generations\n\n"
+            "Plus-plan users: stick with Nano Banana 2 at 1K/2K.\n"
+            "Pro-plan users: Nano Banana Pro lets you hit 4K."
+        )
+        saved_gs_model = str(get_setting("genspark_model", "nano-banana-2") or "nano-banana-2").strip().lower()
+        gs_model_idx = self.cmb_genspark_model.findData(saved_gs_model)
+        if gs_model_idx < 0:
+            gs_model_idx = 0
+        self.cmb_genspark_model.setCurrentIndex(gs_model_idx)
+        browser_form.addRow(self._settings_label("Genspark Model"), self.cmb_genspark_model)
+
+        self.cmb_genspark_image_size = QComboBox()
+        self.cmb_genspark_image_size.setObjectName("settingInput")
+        self.cmb_genspark_image_size.setMinimumHeight(38)
+        self.cmb_genspark_image_size.addItem("Auto (let Genspark decide)", "auto")
+        self.cmb_genspark_image_size.addItem("0.5K (smallest — fastest)", "0.5k")
+        self.cmb_genspark_image_size.addItem("1K (1024px)", "1k")
+        self.cmb_genspark_image_size.addItem("2K (2048px — Plus plan max)", "2k")
+        self.cmb_genspark_image_size.addItem("4K (4096px — Pro plan only)", "4k")
+        self.cmb_genspark_image_size.setToolTip(
+            "Genspark output resolution. Each generation in the queue uses this size.\n\n"
+            "Plus plan can produce up to 2K unlimited; 4K on Plus will likely "
+            "either downgrade to 2K or fail. Pro plan unlocks true 4K.\n\n"
+            "Higher resolution = larger file + slower generation. 1K/2K are "
+            "a good balance for most workflows."
+        )
+        saved_gs_size = str(get_setting("genspark_image_size", "auto") or "auto").strip().lower()
+        gs_size_idx = self.cmb_genspark_image_size.findData(saved_gs_size)
+        if gs_size_idx < 0:
+            gs_size_idx = 0
+        self.cmb_genspark_image_size.setCurrentIndex(gs_size_idx)
+        browser_form.addRow(self._settings_label("Genspark Quality"), self.cmb_genspark_image_size)
+
         self.chk_random_fingerprint = QCheckBox("Random fingerprint per session (like GoLogin)")
         self.chk_random_fingerprint.setChecked(get_bool_setting("random_fingerprint_per_session", False))
         browser_form.addRow("", self.chk_random_fingerprint)
@@ -8030,6 +8072,8 @@ class MainWindow(QMainWindow):
             "api_humanized_wait_no_ref_max_seconds": str(no_ref_wait_max),
             "output_directory": stored_output_dir,
             "generation_mode": str(getattr(self, "cmb_generation_mode", None) and self.cmb_generation_mode.currentData() or "browser_per_slot"),
+            "genspark_model": str(getattr(self, "cmb_genspark_model", None) and self.cmb_genspark_model.currentData() or "nano-banana-2"),
+            "genspark_image_size": str(getattr(self, "cmb_genspark_image_size", None) and self.cmb_genspark_image_size.currentData() or "auto"),
         }
         self._start_background_task(
             self._persist_settings_payload,

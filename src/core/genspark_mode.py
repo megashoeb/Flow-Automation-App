@@ -27,6 +27,7 @@ from src.db.db_manager import (
     get_all_jobs,
     get_int_setting,
     get_output_directory,
+    get_setting,
     update_job_status,
 )
 
@@ -68,8 +69,27 @@ def _resolve_model(model_name: str) -> str:
         return "nano-banana-pro"
     if "nano" in low:
         return "nano-banana-2"
+    # Pass through if already a Genspark model key
+    if low in {"nano-banana-2", "nano-banana-pro"}:
+        return low
     # Fallback to nano-banana-2 for anything else
     return "nano-banana-2"
+
+
+def _resolve_image_size(size_name: str) -> str:
+    """Map UI quality label → Genspark image_size string.
+
+    Valid values: "auto", "0.5k", "1k", "2k", "4k"
+    """
+    raw = str(size_name or "").strip().lower().replace(" ", "")
+    if raw in {"auto", "0.5k", "1k", "2k", "4k"}:
+        return raw
+    # Accept common variations
+    if raw in {"0.5", "512", "512px", "halfk"}: return "0.5k"
+    if raw in {"1", "1024", "1024px"}: return "1k"
+    if raw in {"2", "2048", "2048px"}: return "2k"
+    if raw in {"4", "4096", "4096px"}: return "4k"
+    return "auto"
 
 
 class GensparkWorker:
@@ -99,6 +119,10 @@ class GensparkModeManager:
         self._bridge = GensparkBridge(self._log)
         self._workers: Dict[str, List[GensparkWorker]] = {}  # email -> [workers]
         self._active_tasks: List[asyncio.Task] = []
+        # Settings snapshot loaded at run() start — applies globally to every
+        # job dispatched in this Genspark session.
+        self._default_model: str = "nano-banana-2"
+        self._default_image_size: str = "auto"
 
     # ═══════════════════════════════════════════════════════════════
     # Main loop
@@ -109,6 +133,23 @@ class GensparkModeManager:
         await self._bridge.start()
 
         try:
+            # Load global Genspark settings once per session
+            self._default_model = _resolve_model(
+                get_setting("genspark_model", "nano-banana-2") or "nano-banana-2"
+            )
+            self._default_image_size = _resolve_image_size(
+                get_setting("genspark_image_size", "auto") or "auto"
+            )
+            self._log(
+                f"[GensparkMode] Defaults → model={self._default_model}, "
+                f"image_size={self._default_image_size}"
+            )
+            if self._default_image_size == "4k" and self._default_model != "nano-banana-pro":
+                self._log(
+                    "[GensparkMode] ⚠ 4K output is only guaranteed on Nano Banana Pro "
+                    "(Pro plan). Plus plan will likely downgrade to 2K."
+                )
+
             # Default 5 matches GENSPARK_MAX_PARALLEL in the extension.
             # Clamped to a safe 1..10 — higher than 10 per account hits the
             # 5-hour session rate limit on Plus plan quickly.
@@ -379,8 +420,16 @@ class GensparkModeManager:
                                             "empty_prompt")
             return
 
-        model = _resolve_model(job.get("model") or "nano-banana-2")
+        # Global Genspark settings take precedence over per-job model
+        # (which is typically set for Flow/Labs). If the job happens to
+        # carry an explicit Genspark model key, we use that.
+        raw_model = (job.get("model") or "").strip().lower()
+        if raw_model in {"nano-banana-2", "nano-banana-pro"}:
+            model = raw_model
+        else:
+            model = self._default_model
         ratio = _resolve_aspect_ratio(job.get("aspect_ratio") or "auto")
+        image_size = self._default_image_size
 
         max_retries = int(self.qm.max_auto_retries_per_job or 2)
         last_error = ""
@@ -397,6 +446,7 @@ class GensparkModeManager:
                         prompt=prompt,
                         model=model,
                         aspect_ratio=ratio,
+                        image_size=image_size,
                     )
                 except Exception as e:
                     last_error = f"bridge_error: {e}"
