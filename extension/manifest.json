@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "G-Labs Studio Helper",
-  "version": "1.1.4",
+  "version": "1.2.0",
   "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image generation",
   "permissions": [
     "tabs",
@@ -15,12 +15,16 @@
     "https://labs.google/*",
     "https://storage.googleapis.com/*",
     "http://127.0.0.1:18924/*",
+    "http://127.0.0.1:18925/*",
     "https://www.google.com/*",
     "https://www.youtube.com/*",
     "https://mail.google.com/*",
     "https://drive.google.com/*",
     "https://news.google.com/*",
-    "https://photos.google.com/*"
+    "https://photos.google.com/*",
+    "https://www.genspark.ai/*",
+    "https://genspark.ai/*",
+    "https://cdn1.genspark.ai/*"
   ],
   "background": {
     "service_worker": "background.js"

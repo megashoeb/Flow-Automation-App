@@ -11,6 +11,8 @@
 
 // Load persona system (ecosystem/warmup query pools)
 try { importScripts("personas.js"); } catch (e) { console.warn("personas.js not loaded:", e); }
+// Load Genspark module (standalone — uses port 18925 separately from Flow)
+try { importScripts("genspark.js"); } catch (e) { console.warn("genspark.js not loaded:", e); }
 
 const BRIDGE_URL = "http://127.0.0.1:18924";
 const POLL_INTERVAL = 1500;
@@ -1966,3 +1968,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 console.log("[G-Labs Helper] Extension started. Bridge:", BRIDGE_URL);
+
+// Start Genspark module if it loaded successfully — independent of Flow.
+// Silently stays idle when the Genspark bridge isn't running.
+try {
+  if (typeof self.gensparkStart === "function") {
+    self.gensparkStart();
+  }
+} catch (e) {
+  console.warn("[G-Labs Helper] Genspark module failed to start:", e);
+}

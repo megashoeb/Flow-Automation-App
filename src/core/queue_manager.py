@@ -103,7 +103,7 @@ class AsyncQueueManager(QThread):
         self.cloak_display = cloak_display_raw
         self.light_warmup_enabled = get_bool_setting("light_warmup", True)
         gen_mode_raw = str(get_setting("generation_mode", "browser_per_slot") or "browser_per_slot").strip().lower()
-        if gen_mode_raw not in {"browser_per_slot", "cdp_shared", "http_shared", "chrome_extension"}:
+        if gen_mode_raw not in {"browser_per_slot", "cdp_shared", "http_shared", "chrome_extension", "chrome_extension_genspark"}:
             gen_mode_raw = "browser_per_slot"
         self.generation_mode = gen_mode_raw
         self.scheduler_poll_seconds = 2
@@ -452,6 +452,29 @@ class AsyncQueueManager(QThread):
                 self.signals.log_msg.emit("[ERROR] extension_mode.py not found. Falling back to browser mode.")
             except Exception as e:
                 self.signals.log_msg.emit(f"[ERROR] Chrome Extension mode failed: {str(e)[:100]}. Falling back to browser mode.")
+            else:
+                return
+            self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
+
+        # Chrome Extension mode — Genspark.ai (parallel to Flow, separate bridge)
+        elif self.generation_mode == "chrome_extension_genspark":
+            self.signals.log_msg.emit(
+                "[SYSTEM] Generation mode: Chrome Extension — Genspark "
+                "(Genspark.ai Nano Banana 2/Pro, unlimited on Plus/Pro plans)"
+            )
+            try:
+                from src.core.genspark_mode import GensparkModeManager
+                manager = GensparkModeManager(self)
+                await manager.run()
+            except ImportError:
+                self.signals.log_msg.emit(
+                    "[ERROR] genspark_mode.py not found. Falling back to browser mode."
+                )
+            except Exception as e:
+                self.signals.log_msg.emit(
+                    f"[ERROR] Genspark mode failed: {str(e)[:150]}. "
+                    "Falling back to browser mode."
+                )
             else:
                 return
             self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
