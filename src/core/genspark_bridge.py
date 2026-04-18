@@ -78,6 +78,7 @@ class GensparkBridge:
         self._app.router.add_post("/genspark/work-result", self._handle_work_result)
         self._app.router.add_post("/genspark/accounts", self._handle_accounts)
         self._app.router.add_get("/genspark/status", self._handle_status)
+        self._app.router.add_post("/genspark/progress", self._handle_progress)
 
         self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
@@ -325,6 +326,25 @@ class GensparkBridge:
             if now - self._connected_accounts[email].get("last_seen", 0) > 30:
                 self._connected_accounts.pop(email, None)
 
+        return web.json_response({"ok": True}, headers=_cors())
+
+    async def _handle_progress(self, request: web.Request) -> web.Response:
+        """Extension posts per-step progress updates so the user can see
+        exactly where each request is in the pipeline.
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False}, status=400)
+
+        rid = str(data.get("request_id", ""))[:40]
+        step = str(data.get("step", ""))
+        detail = str(data.get("detail", ""))[:200]
+        if rid and step:
+            msg = f"[Genspark-progress] {rid}: {step}"
+            if detail:
+                msg += f" — {detail}"
+            self._log(msg)
         return web.json_response({"ok": True}, headers=_cors())
 
     async def _handle_status(self, request: web.Request) -> web.Response:

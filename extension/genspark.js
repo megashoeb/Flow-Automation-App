@@ -265,8 +265,11 @@ async function gensparkPollBridge() {
 
 async function gensparkHandleWork(work) {
   const { request_id, account, prompt, model_params, recaptcha_site_key } = work;
+  await gensparkReportProgress(request_id, "received_work", `account=${account}`);
+
   const info = gensparkAccounts[account];
   if (!info) {
+    await gensparkReportProgress(request_id, "error", "account_tab_not_found");
     await gensparkSubmitResult(request_id, { error: "account_tab_not_found" });
     return;
   }
@@ -276,11 +279,14 @@ async function gensparkHandleWork(work) {
   try {
     await chrome.tabs.get(tabId);
   } catch {
+    await gensparkReportProgress(request_id, "error", "tab_closed");
     await gensparkSubmitResult(request_id, { error: "tab_closed" });
     return;
   }
+  await gensparkReportProgress(request_id, "tab_ready", `tabId=${tabId}`);
 
   // Step 1: Get a fresh reCAPTCHA Enterprise token (in MAIN world)
+  await gensparkReportProgress(request_id, "recaptcha_start", `key=${recaptcha_site_key.slice(0, 12)}…`);
   let recaptchaToken = "";
   try {
     const tokenResult = await chrome.scripting.executeScript({
@@ -313,21 +319,26 @@ async function gensparkHandleWork(work) {
     });
     const r = tokenResult?.[0]?.result;
     if (r?.error) {
+      await gensparkReportProgress(request_id, "error", "recaptcha: " + r.error);
       await gensparkSubmitResult(request_id, { error: r.error });
       return;
     }
     recaptchaToken = r?.token || "";
   } catch (e) {
+    await gensparkReportProgress(request_id, "error", "recaptcha_injection_failed: " + e.message);
     await gensparkSubmitResult(request_id, { error: "recaptcha_injection_failed: " + e.message });
     return;
   }
   if (!recaptchaToken) {
+    await gensparkReportProgress(request_id, "error", "empty_recaptcha_token");
     await gensparkSubmitResult(request_id, { error: "empty_recaptcha_token" });
     return;
   }
+  await gensparkReportProgress(request_id, "recaptcha_ok", `token_len=${recaptchaToken.length}`);
 
   // Step 2: POST /api/agent/ask_proxy with prompt + token — SSE response.
   // We do this INSIDE the tab so cookies + same-origin rules apply correctly.
+  await gensparkReportProgress(request_id, "ask_proxy_start", `prompt="${prompt.slice(0, 40)}"`);
   let taskInfo;
   try {
     const askResult = await chrome.scripting.executeScript({
@@ -573,6 +584,10 @@ async function gensparkHandleWork(work) {
       if (debugPayload) {
         console.log("[Genspark] SSE debug:", JSON.stringify(debugPayload, null, 2));
       }
+      await gensparkReportProgress(
+        request_id, "error",
+        `ask_proxy: ${taskInfo?.error || "no_result"}`
+      );
       await gensparkSubmitResult(request_id, {
         error: taskInfo?.error || "ask_proxy_no_result",
         debug: debugPayload,
@@ -580,6 +595,7 @@ async function gensparkHandleWork(work) {
       return;
     }
   } catch (e) {
+    await gensparkReportProgress(request_id, "error", "ask_proxy_injection_failed: " + e.message);
     await gensparkSubmitResult(request_id, {
       error: "ask_proxy_injection_failed: " + e.message,
     });
@@ -587,6 +603,7 @@ async function gensparkHandleWork(work) {
   }
 
   const { task_id, project_id } = taskInfo;
+  await gensparkReportProgress(request_id, "task_created", `task_id=${task_id}`);
 
   // Step 3: Poll /api/spark/image_generation_task_detail until COMPLETED
   // (using JSON endpoint for simplicity over SSE)
@@ -628,13 +645,16 @@ async function gensparkHandleWork(work) {
     });
     const r = pollResult?.[0]?.result;
     if (!r || !r.ok) {
+      await gensparkReportProgress(request_id, "error", "poll: " + (r?.reason || "failed"));
       await gensparkSubmitResult(request_id, {
         error: r?.reason || "poll_failed",
       });
       return;
     }
     finalTask = r.task;
+    await gensparkReportProgress(request_id, "task_complete", `status=${finalTask?.status}`);
   } catch (e) {
+    await gensparkReportProgress(request_id, "error", "poll_injection_failed: " + e.message);
     await gensparkSubmitResult(request_id, {
       error: "poll_injection_failed: " + e.message,
     });
@@ -645,12 +665,14 @@ async function gensparkHandleWork(work) {
   const urls = finalTask?.image_urls_nowatermark || finalTask?.image_urls || [];
   const imageUrl = Array.isArray(urls) ? urls[0] : urls;
   if (!imageUrl) {
+    await gensparkReportProgress(request_id, "error", "no_image_url_in_completed_task");
     await gensparkSubmitResult(request_id, {
       error: "no_image_url_in_completed_task",
       task_id, project_id,
     });
     return;
   }
+  await gensparkReportProgress(request_id, "downloading", imageUrl.slice(0, 80));
 
   let imageBytesB64 = "";
   try {
@@ -694,6 +716,7 @@ async function gensparkHandleWork(work) {
   }
 
   // Step 5: Submit result to bridge
+  await gensparkReportProgress(request_id, "done", `bytes=${imageBytesB64.length}`);
   await gensparkSubmitResult(request_id, {
     image_url: imageUrl,
     image_bytes_b64: imageBytesB64,
@@ -714,6 +737,23 @@ async function gensparkSubmitResult(requestId, body) {
     });
   } catch (e) {
     console.warn("[Genspark] submit result failed:", e.message);
+  }
+}
+
+async function gensparkReportProgress(requestId, step, detail) {
+  console.log(`[Genspark] ${requestId.slice(0, 20)} → ${step}${detail ? ": " + detail : ""}`);
+  try {
+    await fetch(`${GENSPARK_BRIDGE_URL}/genspark/progress`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        request_id: requestId,
+        step,
+        detail: detail || "",
+      }),
+    });
+  } catch {
+    // Progress reporting is best-effort; failures don't abort work
   }
 }
 
