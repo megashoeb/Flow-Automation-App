@@ -3273,6 +3273,20 @@ class MainWindow(QMainWindow):
             ("Tall Portrait (9:16)", "Tall Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
         self.img_cmb_outputs = self._create_setting_combo([("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1)
+        # Genspark-only: output resolution. Ignored in Flow mode.
+        self.img_cmb_quality = self._create_setting_combo([
+            ("Auto (default)", "auto"),
+            ("0.5K (fast)", "0.5k"),
+            ("1K (1024px)", "1k"),
+            ("2K (2048px)", "2k"),
+            ("4K (4096px)", "4k"),
+        ], current_data="auto")
+        self.img_cmb_quality.setToolTip(
+            "Output resolution for Genspark mode.\n\n"
+            "Per-job setting — every prompt added after changing this uses the\n"
+            "new resolution. Ignored in Flow mode (Flow picks its own size).\n\n"
+            "Plus plan: 2K max. Pro plan: unlimited 4K with Nano Banana Pro."
+        )
         self.img_cmb_parallel = self._create_parallel_combo(saved_slots)
 
         form.addRow(self._make_setting_label("Model:"), self.img_cmb_model)
@@ -3284,6 +3298,7 @@ class MainWindow(QMainWindow):
                 self.img_cmb_outputs,
             ),
         )
+        form.addRow(self._make_setting_label("Quality:"), self.img_cmb_quality)
         form.addRow(self._make_setting_label("Parallel:"), self.img_cmb_parallel)
         layout.addLayout(form)
 
@@ -4733,47 +4748,8 @@ class MainWindow(QMainWindow):
         self.cmb_generation_mode.setCurrentIndex(gen_mode_idx)
         browser_form.addRow(self._settings_label("Generation Mode"), self.cmb_generation_mode)
 
-        # ─── Genspark-specific settings (only relevant when that mode is active) ───
-        self.cmb_genspark_model = QComboBox()
-        self.cmb_genspark_model.setObjectName("settingInput")
-        self.cmb_genspark_model.setMinimumHeight(38)
-        self.cmb_genspark_model.addItem("Nano Banana 2 (Plus plan — 2K max)", "nano-banana-2")
-        self.cmb_genspark_model.addItem("Nano Banana Pro (Pro plan — 4K unlimited)", "nano-banana-pro")
-        self.cmb_genspark_model.setToolTip(
-            "Genspark model selection.\n\n"
-            "Nano Banana 2: Plus plan ($24.99/mo) — unlimited 2K generations\n"
-            "Nano Banana Pro: Pro plan ($249.99/mo) — unlimited 4K generations\n\n"
-            "Plus-plan users: stick with Nano Banana 2 at 1K/2K.\n"
-            "Pro-plan users: Nano Banana Pro lets you hit 4K."
-        )
-        saved_gs_model = str(get_setting("genspark_model", "nano-banana-2") or "nano-banana-2").strip().lower()
-        gs_model_idx = self.cmb_genspark_model.findData(saved_gs_model)
-        if gs_model_idx < 0:
-            gs_model_idx = 0
-        self.cmb_genspark_model.setCurrentIndex(gs_model_idx)
-        browser_form.addRow(self._settings_label("Genspark Model"), self.cmb_genspark_model)
-
-        self.cmb_genspark_image_size = QComboBox()
-        self.cmb_genspark_image_size.setObjectName("settingInput")
-        self.cmb_genspark_image_size.setMinimumHeight(38)
-        self.cmb_genspark_image_size.addItem("Auto (let Genspark decide)", "auto")
-        self.cmb_genspark_image_size.addItem("0.5K (smallest — fastest)", "0.5k")
-        self.cmb_genspark_image_size.addItem("1K (1024px)", "1k")
-        self.cmb_genspark_image_size.addItem("2K (2048px — Plus plan max)", "2k")
-        self.cmb_genspark_image_size.addItem("4K (4096px — Pro plan only)", "4k")
-        self.cmb_genspark_image_size.setToolTip(
-            "Genspark output resolution. Each generation in the queue uses this size.\n\n"
-            "Plus plan can produce up to 2K unlimited; 4K on Plus will likely "
-            "either downgrade to 2K or fail. Pro plan unlocks true 4K.\n\n"
-            "Higher resolution = larger file + slower generation. 1K/2K are "
-            "a good balance for most workflows."
-        )
-        saved_gs_size = str(get_setting("genspark_image_size", "auto") or "auto").strip().lower()
-        gs_size_idx = self.cmb_genspark_image_size.findData(saved_gs_size)
-        if gs_size_idx < 0:
-            gs_size_idx = 0
-        self.cmb_genspark_image_size.setCurrentIndex(gs_size_idx)
-        browser_form.addRow(self._settings_label("Genspark Quality"), self.cmb_genspark_image_size)
+        # Note: Genspark Model and Quality dropdowns live on the
+        # Image Generation tab (per-job control) rather than here.
 
         self.chk_random_fingerprint = QCheckBox("Random fingerprint per session (like GoLogin)")
         self.chk_random_fingerprint.setChecked(get_bool_setting("random_fingerprint_per_session", False))
@@ -8072,8 +8048,6 @@ class MainWindow(QMainWindow):
             "api_humanized_wait_no_ref_max_seconds": str(no_ref_wait_max),
             "output_directory": stored_output_dir,
             "generation_mode": str(getattr(self, "cmb_generation_mode", None) and self.cmb_generation_mode.currentData() or "browser_per_slot"),
-            "genspark_model": str(getattr(self, "cmb_genspark_model", None) and self.cmb_genspark_model.currentData() or "nano-banana-2"),
-            "genspark_image_size": str(getattr(self, "cmb_genspark_image_size", None) and self.cmb_genspark_image_size.currentData() or "auto"),
         }
         self._start_background_task(
             self._persist_settings_payload,
@@ -9634,9 +9608,20 @@ class MainWindow(QMainWindow):
         if idx == 0:
             output_count = int(self.img_cmb_outputs.currentData() or 1)
             ref_paths = list(self.current_ref_paths)
+            model_text = str(self.img_cmb_model.currentText() or "Imagen 4")
+            # Encode Genspark-only quality (if non-auto) into the model string
+            # as "Model Name:<size>". Flow's model resolver ignores the suffix
+            # and matches on the prefix, so this is a no-op for Flow jobs but
+            # carries per-job resolution for Genspark.
+            quality = "auto"
+            try:
+                quality = str(self.img_cmb_quality.currentData() or "auto").strip().lower()
+            except Exception:
+                pass
+            encoded_model = f"{model_text}:{quality}" if quality and quality != "auto" else model_text
             return {
                 "job_type": "image",
-                "model": str(self.img_cmb_model.currentText() or "Imagen 4"),
+                "model": encoded_model,
                 "aspect_ratio": str(self.img_cmb_ratio.currentData() or self.img_cmb_ratio.currentText() or "Landscape (16:9)"),
                 "output_count": output_count,
                 "ref_path": ref_paths[0] if ref_paths else None,

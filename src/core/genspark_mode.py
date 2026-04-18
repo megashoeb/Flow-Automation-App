@@ -420,16 +420,36 @@ class GensparkModeManager:
                                             "empty_prompt")
             return
 
-        # Global Genspark settings take precedence over per-job model
-        # (which is typically set for Flow/Labs). If the job happens to
-        # carry an explicit Genspark model key, we use that.
-        raw_model = (job.get("model") or "").strip().lower()
-        if raw_model in {"nano-banana-2", "nano-banana-pro"}:
-            model = raw_model
+        # Per-job model + quality parsing. The UI encodes quality into the
+        # model field as "Model Name:<size>" when the user picks a non-auto
+        # quality on the Image Generation tab. Flow's model resolver ignores
+        # the suffix (it matches on the prefix), so this is safe for both
+        # modes.
+        raw_model_str = str(job.get("model") or "").strip()
+        size_from_job = ""
+        if ":" in raw_model_str:
+            base, _, size_hint = raw_model_str.rpartition(":")
+            candidate = size_hint.strip().lower()
+            if candidate in {"auto", "0.5k", "1k", "2k", "4k"}:
+                size_from_job = candidate
+                raw_model_str = base.strip()
+
+        # Resolve model — _resolve_model handles "Nano Banana 2",
+        # "nano-banana-pro" etc. and falls back to the default when empty.
+        low = raw_model_str.lower()
+        if low in {"nano-banana-2", "nano-banana-pro"}:
+            model = low
+        elif "nano" in low:
+            model = _resolve_model(raw_model_str)
         else:
             model = self._default_model
+
         ratio = _resolve_aspect_ratio(job.get("aspect_ratio") or "auto")
-        image_size = self._default_image_size
+        image_size = size_from_job or self._default_image_size
+        self._log(
+            f"[GensparkMode] Job {job_id[:6]}… settings: "
+            f"model={model}, ratio={ratio}, size={image_size}"
+        )
 
         max_retries = int(self.qm.max_auto_retries_per_job or 2)
         last_error = ""
