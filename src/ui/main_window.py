@@ -10164,15 +10164,22 @@ class MainWindow(QMainWindow):
             self.ui_throttler.schedule("live_grid_resize", self._refresh_live_grid)
 
     def _on_account_auth_status(self, account_name, status, message):
-        """Handle auth status changes from queue manager (logged_in / expired)."""
+        """Handle auth status changes from queue manager
+        (logged_in / expired / rate_limited)."""
         if not hasattr(self, "_runtime_auth_status"):
             self._runtime_auth_status = {}
 
         if status == "expired":
             self._runtime_auth_status[account_name] = "expired"
             self.append_log(f"[{account_name}] Session expired: {message}")
+        elif status == "rate_limited":
+            # 429 hard pause — surface as a distinct state so the user
+            # knows it's a temporary cooldown, not a session expiry.
+            # Live countdown is shown via the account_runtime detail cell.
+            self._runtime_auth_status[account_name] = "rate_limited"
+            self.append_log(f"[{account_name}] ⏸ Rate limited: {message}")
         elif status == "logged_in":
-            # Clear expired status on successful generation
+            # Clear expired/rate_limited status on successful generation
             self._runtime_auth_status.pop(account_name, None)
 
         # Trigger immediate status refresh

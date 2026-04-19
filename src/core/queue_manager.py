@@ -224,9 +224,16 @@ class AsyncQueueManager(QThread):
             active_slots = sum(1 for slot in slots if slot.get("is_busy"))
             hold_until_candidates = [self.account_recaptcha_until.get(account_name, 0.0)]
             hold_until_candidates.extend(slot.get("disabled_until", 0.0) for slot in slots)
+            # 429 hard-pause cooldown — surface it on the account card so
+            # the user sees a live countdown when an account is in
+            # Google's penalty box, not silent black-holed work.
+            pause_429_until = self.account_429_pause_until.get(account_name, 0.0)
+            if pause_429_until > now:
+                hold_until_candidates.append(pause_429_until)
             cooldown_until = max(hold_until_candidates) if hold_until_candidates else 0.0
             on_recap_cooldown = self.account_recaptcha_until.get(account_name, 0.0) > now
             on_slot_cooldown = any(slot.get("disabled_until", 0.0) > now for slot in slots)
+            on_429_pause = pause_429_until > now
 
             status = "idle"
             detail = "Idle"
@@ -238,6 +245,14 @@ class AsyncQueueManager(QThread):
                 detail = f"Running {active_slots} job(s)"
                 if any(slot.get("pending_browser_restart") or slot.get("is_restarting") for slot in slots):
                     detail = f"Running {active_slots} job(s) + restarting failing slot"
+            elif on_429_pause:
+                # Highest-priority idle reason — show the 429 strike +
+                # remaining minutes so the user understands why this
+                # account isn't picking up work.
+                status = "cooldown"
+                streak = int(self.account_429_streak.get(account_name, 0))
+                mins_left = max(1, int((pause_429_until - now) / 60))
+                detail = f"⏸ 429 paused (strike {streak}) — {mins_left} min left"
             elif self.account_restart_pending.get(account_name) or account_name in self.account_restart_running:
                 status = "cooldown"
                 detail = "Restarting failing slot"
@@ -1503,6 +1518,44 @@ class AsyncQueueManager(QThread):
             f"paused for {label}. ALL workers blocked from this account "
             f"until {time.strftime('%H:%M:%S', time.localtime(pause_until))}."
         )
+
+        # Mark the account row in the UI (yellow "rate-limited" status) so
+        # the user can SEE that this account is in cooldown — not just buried
+        # in scrolling logs. Live countdown shows in the account card via the
+        # account_runtime snapshot (cooldown_until carries pause_until).
+        try:
+            self.signals.account_auth_status.emit(
+                account_name,
+                "rate_limited",
+                f"429 paused {label} (strike {streak})",
+            )
+        except Exception:
+            pass
+
+        # Popup notification on first strike + on the permanent-hold strike.
+        # Skip 2nd / 3rd because at that point the user already knows what's
+        # happening and we don't want to spam modal dialogs every 15 min.
+        try:
+            if streak == 1:
+                self.signals.show_warning.emit(
+                    f"⏸ Rate limit hit on {account_name}\n\n"
+                    f"Google returned 429 (too many video requests).\n"
+                    f"Account paused for {label}. Workers will resume "
+                    f"automatically at {time.strftime('%H:%M:%S', time.localtime(pause_until))}.\n\n"
+                    f"💡 Tip: add more accounts in Account Manager — "
+                    f"queue can keep moving on the others while this one cools off."
+                )
+            elif streak >= 4:
+                self.signals.show_warning.emit(
+                    f"⛔ Account {account_name} HELD\n\n"
+                    f"Hit 429 four times in a row. Google has likely flagged this\n"
+                    f"account for the day (or longer). Held for 24h to prevent\n"
+                    f"further damage to its trust score.\n\n"
+                    f"Use a different account — this one needs to cool off."
+                )
+        except Exception:
+            pass
+
         return pause_until
 
     def is_account_429_paused(self, account_name):
@@ -1518,9 +1571,22 @@ class AsyncQueueManager(QThread):
 
     def clear_429_streak(self, account_name):
         """Reset the 429 streak when a successful job confirms the account
-        is back to normal. Called from extension_mode on each completed job."""
-        if account_name in self.account_429_streak:
+        is back to normal. Called from extension_mode on each completed job.
+        Also emits a logged_in signal if there was an active streak so the
+        UI badge clears its yellow "rate-limited" marker."""
+        had_streak = account_name in self.account_429_streak
+        if had_streak:
             self.account_429_streak.pop(account_name, None)
+            try:
+                self.signals.account_auth_status.emit(
+                    account_name, "logged_in", "Recovered after 429 cooldown"
+                )
+            except Exception:
+                pass
+        # Also clear any expired pause record so the next snapshot doesn't
+        # keep treating this account as paused.
+        if self.account_429_pause_until.get(account_name, 0) <= time.time():
+            self.account_429_pause_until.pop(account_name, None)
 
     def get_job_429_attempts(self, job_id):
         return self.job_429_attempts.get(job_id, 0)
