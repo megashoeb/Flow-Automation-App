@@ -1363,6 +1363,14 @@ class ExtensionModeManager:
                 if busy_count >= throttle_max:
                     continue  # This account is at its throttled limit
 
+            # Hard 429 pause — Google flagged this account with
+            # PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC. Block ALL
+            # workers (not just reduce slots) until cooldown expires.
+            # Without this, the surviving slot keeps hammering and Google
+            # extends the lock.
+            if self.qm.is_account_429_paused(account_email):
+                continue
+
             # Check account disabled (hard hold for auth errors etc.)
             # If account was reCAPTCHA-held AND user force-enabled it, bridge
             # returns is_account_held=False — allow dispatch despite qm flag.
@@ -1766,6 +1774,8 @@ class ExtensionModeManager:
                         self.qm._record_throttle_success(worker.account_email)
                         # Reset reCAPTCHA streak on success
                         self._recaptcha_streak.pop(worker.account_email, None)
+                        # Reset 429 streak — account is back to normal
+                        self.qm.clear_429_streak(worker.account_email)
                         # Track generation count for auto cleanup
                         self._check_auto_cleanup(worker.account_email)
                         self._log(f"[{worker.slot_id}] Job {job_id[:6]}... completed! ({output_path})")
@@ -1788,11 +1798,43 @@ class ExtensionModeManager:
                     await asyncio.sleep(8)  # wait for tab reload + reCAPTCHA init
                     continue
 
-                # 429 Rate limit — throttle account slots (reduce, don't block) and re-queue job
+                # 429 Rate limit — Google's hard rate cap (PUBLIC_ERROR_
+                # UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC). The previous soft
+                # throttle just lowered slot count but the surviving slot
+                # kept hammering, producing 30+ retries per job in a tight
+                # loop and amplifying Google's lock. Now we:
+                #   1. HARD pause the whole account (exponential backoff:
+                #      5min → 15min → 1h → 24h+HOLD)
+                #   2. Cap per-job 429 attempts at 1 — same prompt won't
+                #      re-queue forever, it gets marked failed instead so
+                #      the queue moves on to other prompts.
                 err_lower = last_error.lower()
                 if any(p in err_lower for p in ("429", "rate limit", "too many requests")):
+                    # Keep the legacy slot throttle running too — it provides
+                    # the gradual ramp-up if the pause expires successfully.
                     self.qm._throttle_account_for_429(worker.account_email)
-                    self._log(f"[{worker.slot_id}] 429 detected — slots reduced, re-queuing job.")
+                    # Hard pause the account (exponential backoff per strike)
+                    self.qm.pause_account_for_429(worker.account_email)
+                    # Per-job 429 attempt cap — fail this job after 1 strike
+                    job_429_attempts = self.qm.increment_job_429_attempts(job_id)
+                    if job_429_attempts >= 1:
+                        self._log(
+                            f"[{worker.slot_id}] 429 — job {job_id[:6]}… already "
+                            f"hit rate-limit; marking failed (account paused, "
+                            f"queue moves on)."
+                        )
+                        update_job_status(
+                            job_id, "failed", account=worker.account_email,
+                            error="429 rate-limit (account paused, see logs)",
+                        )
+                        self.qm.signals.job_updated.emit(
+                            job_id, "failed", worker.account_email,
+                            "429 rate-limit (account paused)",
+                        )
+                        return
+                    # First 429 on this job — re-queue once for a different
+                    # account / after pause expires.
+                    self._log(f"[{worker.slot_id}] 429 detected — re-queuing job once.")
                     update_job_status(job_id, "pending", account="")
                     self.qm.signals.job_updated.emit(job_id, "pending", "", "")
                     return

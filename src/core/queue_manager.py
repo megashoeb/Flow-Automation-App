@@ -188,6 +188,20 @@ class AsyncQueueManager(QThread):
         self.account_recaptcha_until = {}
         self.account_recaptcha_streak = {}
         self.account_recap_cooldown_announced = {}
+
+        # Hard 429 pause — when labs.google returns
+        # PUBLIC_ERROR_UNUSUAL_ACTIVITY_TOO_MUCH_TRAFFIC, the account is in
+        # Google's penalty box. Existing soft throttle (just lowering slot
+        # count) lets the surviving slot keep hammering the API in a tight
+        # loop, which both wastes the user's session and amplifies Google's
+        # block. This pause is hard: dispatch loop refuses to send any work
+        # to a paused account until the timestamp expires.
+        # Streak tracks consecutive 429s — used for exponential backoff and
+        # eventually permanent hold. Per-job attempt cap prevents one
+        # losing prompt from re-queueing forever.
+        self.account_429_pause_until = {}     # email -> epoch seconds
+        self.account_429_streak = {}          # email -> consecutive 429 count
+        self.job_429_attempts = {}            # job_id -> int
         self.queue_summary_emitted = False
         self.queue_had_jobs = False
 
@@ -1450,6 +1464,70 @@ class AsyncQueueManager(QThread):
                 self.signals.log_msg.emit(
                     f"[SYSTEM] Account {account_name}: 429 throttle expired. Full speed restored."
                 )
+
+    def pause_account_for_429(self, account_name):
+        """HARD pause an account that just got 429 PUBLIC_ERROR_UNUSUAL_
+        ACTIVITY_TOO_MUCH_TRAFFIC. Returns the new pause-until timestamp.
+
+        Exponential backoff per consecutive 429:
+          1st  →  5 min      (Google's hourly soft cap, often clears fast)
+          2nd  → 15 min      (still in same hour window)
+          3rd  → 60 min      (now we're hitting the hour wall hard)
+          4th+ → 24h + HOLD  (account is genuinely flagged, stop trying)
+
+        Streak resets on the next successful job from that account.
+        """
+        now = time.time()
+        streak = self.account_429_streak.get(account_name, 0) + 1
+        self.account_429_streak[account_name] = streak
+
+        if streak == 1:
+            cooldown_seconds = 5 * 60
+            label = "5 min"
+        elif streak == 2:
+            cooldown_seconds = 15 * 60
+            label = "15 min"
+        elif streak == 3:
+            cooldown_seconds = 60 * 60
+            label = "1 hour"
+        else:
+            # 4+ → flag account permanently for the session, 24h pause
+            cooldown_seconds = 24 * 60 * 60
+            label = "24h + HOLD"
+            self.account_disabled[account_name] = True
+
+        pause_until = now + cooldown_seconds
+        self.account_429_pause_until[account_name] = pause_until
+        self.signals.log_msg.emit(
+            f"[SYSTEM] ⏸ Account {account_name}: 429 strike #{streak} — "
+            f"paused for {label}. ALL workers blocked from this account "
+            f"until {time.strftime('%H:%M:%S', time.localtime(pause_until))}."
+        )
+        return pause_until
+
+    def is_account_429_paused(self, account_name):
+        """True iff dispatch loop should skip this account due to 429 pause."""
+        until = self.account_429_pause_until.get(account_name, 0)
+        if not until:
+            return False
+        if until <= time.time():
+            # Pause expired — clear the entry so log doesn't keep mentioning it
+            self.account_429_pause_until.pop(account_name, None)
+            return False
+        return True
+
+    def clear_429_streak(self, account_name):
+        """Reset the 429 streak when a successful job confirms the account
+        is back to normal. Called from extension_mode on each completed job."""
+        if account_name in self.account_429_streak:
+            self.account_429_streak.pop(account_name, None)
+
+    def get_job_429_attempts(self, job_id):
+        return self.job_429_attempts.get(job_id, 0)
+
+    def increment_job_429_attempts(self, job_id):
+        self.job_429_attempts[job_id] = self.get_job_429_attempts(job_id) + 1
+        return self.job_429_attempts[job_id]
 
     def _throttle_account_for_429(self, account_name):
         """On 429: reduce allowed slots to 2, set a 60s throttle window.
