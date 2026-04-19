@@ -791,18 +791,20 @@ class ExtensionWorker:
             except Exception as e:
                 return None, f"Image upload failed: {str(e)[:200]}"
 
-            # Build request body
+            # Build request body. Token left empty — extension mints a fresh
+            # one and writes it into the path below at dispatch time. Doing
+            # this inside Chrome (not aiohttp) is what keeps the browser
+            # fingerprint headers Google's anti-abuse demands.
             client_context = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
-                "userPaygateTier": "PAYGATE_TIER_ONE",
+                "userPaygateTier": _paygate_tier_for_plan(get_setting("flow_account_plan", "ultra")),
                 "sessionId": f";{int(time.time() * 1000)}",
-            }
-            if token:
-                client_context["recaptchaContext"] = {
-                    "token": token,
+                "recaptchaContext": {
+                    "token": "",  # extension fills this in
                     "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                }
+                },
+            }
 
             request_obj = {
                 "aspectRatio": api_ratio,
@@ -832,35 +834,51 @@ class ExtensionWorker:
                 }
 
             body = {
-                "mediaGenerationContext": {"batchId": batch_id},
+                "mediaGenerationContext": {
+                    "batchId": batch_id,
+                    # Real labs.google requests carry this — Google's anti-
+                    # abuse uses request shape as a fingerprint, so we match.
+                    "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
+                },
                 "clientContext": client_context,
                 "requests": [request_obj],
                 "useV2ModelConfig": True,
             }
 
-            # Submit video generation request
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    endpoint,
-                    headers={
-                        "content-type": "text/plain;charset=UTF-8",
-                        "authorization": f"Bearer {access_token}",
-                        "origin": "https://labs.google",
-                        "referer": "https://labs.google/",
-                    },
-                    data=json.dumps(body),
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    resp_text = await resp.text()
+            # Route through extension's native fetch — Chrome auto-adds the
+            # signed browser headers (x-browser-validation, x-client-data,
+            # sec-fetch-*) that Google's anti-abuse demands. aiohttp can't
+            # produce these, which is why a perfect reCAPTCHA token still
+            # got rejected with PUBLIC_ERROR_UNUSUAL_ACTIVITY.
+            fetch_result = await self._bridge.request_api_fetch(
+                account=self.account_email,
+                url=endpoint,
+                method="POST",
+                body=json.dumps(body),
+                headers={
+                    "content-type": "text/plain;charset=UTF-8",
+                    "authorization": f"Bearer {access_token}",
+                },
+                recaptcha_action="VIDEO_GENERATION",
+                inject_recaptcha_path="clientContext.recaptchaContext.token",
+                timeout=180,
+            )
 
-                    if not resp.ok:
-                        self._log(f"[{self.slot_id}] Video API {resp.status}: {resp_text[:300]}")
-                        return None, _parse_api_error(resp.status, resp_text)
+            if fetch_result.get("error"):
+                err = fetch_result["error"]
+                self._log(f"[{self.slot_id}] Video API bridge error: {err}")
+                return None, f"Bridge error: {err}"
 
-                    try:
-                        data = json.loads(resp_text)
-                    except json.JSONDecodeError:
-                        return None, f"Invalid JSON: {resp_text[:200]}"
+            status = fetch_result.get("status") or 0
+            resp_text = fetch_result.get("body", "")
+            if status < 200 or status >= 300:
+                self._log(f"[{self.slot_id}] Video API {status}: {resp_text[:300]}")
+                return None, _parse_api_error(status, resp_text)
+
+            try:
+                data = json.loads(resp_text)
+            except json.JSONDecodeError:
+                return None, f"Invalid JSON: {resp_text[:200]}"
 
             # Extract media_id for polling
             media_list = data.get("media", []) if isinstance(data, dict) else []

@@ -178,6 +178,148 @@ async function pollBridge() {
 async function handleWork(work) {
   const { request_id, account, action } = work;
 
+  // ─── EXECUTE_FETCH: run an HTTP request from inside the labs.google.com
+  //     tab using native window.fetch(). Chrome auto-adds all browser
+  //     fingerprint headers (sec-fetch-*, x-browser-validation,
+  //     x-client-data) which Google's anti-abuse check requires — that's
+  //     why a Python aiohttp request with a valid reCAPTCHA token still
+  //     gets rejected with PUBLIC_ERROR_UNUSUAL_ACTIVITY. ───
+  if (action === "EXECUTE_FETCH") {
+    try {
+      const tabId = await findLabsTab(account);
+      if (!tabId) {
+        await submitResult(request_id, { error: "no_labs_tab" });
+        return;
+      }
+      const fetchUrl = work.fetch_url;
+      const fetchMethod = work.fetch_method || "POST";
+      const fetchBody = work.fetch_body || "";
+      const fetchHeaders = work.fetch_headers || {};
+      const recaptchaAction = work.recaptcha_action || null;
+      const injectPath = work.inject_recaptcha_path || null;
+
+      const result = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: async (url, method, bodyStr, headers, captchaAction, injectPath) => {
+          // 1. Optionally mint a fresh reCAPTCHA token + inject into body
+          let bodyToSend = bodyStr;
+          if (captchaAction && injectPath) {
+            try {
+              const enterprise = window.grecaptcha && window.grecaptcha.enterprise;
+              if (!enterprise || typeof enterprise.execute !== "function") {
+                return { error: "no_recaptcha_enterprise" };
+              }
+              // Resolve site key (same logic as token request handler)
+              let siteKey = null;
+              try {
+                const clients = window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients;
+                if (clients) {
+                  for (const id of Object.keys(clients)) {
+                    const c = clients[id];
+                    if (!c || typeof c !== "object") continue;
+                    const walk = (obj, depth) => {
+                      if (depth > 5 || !obj || typeof obj !== "object") return null;
+                      for (const k of Object.keys(obj)) {
+                        const v = obj[k];
+                        if (typeof v === "string" && v.length >= 20 && v.length <= 50
+                          && /^[A-Za-z0-9_-]+$/.test(v)) {
+                          if (document.querySelector('script[src*="render=' + v + '"]')) return v;
+                        }
+                        if (typeof v === "object" && v !== null) {
+                          const r = walk(v, depth + 1);
+                          if (r) return r;
+                        }
+                      }
+                      return null;
+                    };
+                    siteKey = walk(c, 0);
+                    if (siteKey) break;
+                  }
+                }
+              } catch {}
+              if (!siteKey) {
+                for (const s of document.querySelectorAll('script[src*="recaptcha"][src*="render="]')) {
+                  try {
+                    const r = new URL(s.src).searchParams.get("render");
+                    if (r && r !== "explicit") { siteKey = r; break; }
+                  } catch {}
+                }
+              }
+              if (!siteKey) return { error: "no_sitekey" };
+              if (typeof enterprise.ready === "function") {
+                await new Promise((r) => enterprise.ready(r));
+              }
+              const token = await enterprise.execute(siteKey, { action: captchaAction });
+              if (!token) return { error: "recaptcha_returned_null" };
+
+              // Inject the fresh token into the JSON body at injectPath
+              // (e.g. "clientContext.recaptchaContext.token").
+              try {
+                const obj = JSON.parse(bodyStr);
+                const parts = String(injectPath).split(".");
+                let cur = obj;
+                for (let i = 0; i < parts.length - 1; i++) {
+                  if (cur[parts[i]] === undefined || cur[parts[i]] === null) {
+                    cur[parts[i]] = {};
+                  }
+                  cur = cur[parts[i]];
+                }
+                cur[parts[parts.length - 1]] = token;
+                bodyToSend = JSON.stringify(obj);
+              } catch (e) {
+                return { error: "body_inject_failed: " + e.message };
+              }
+            } catch (e) {
+              return { error: "recaptcha_failed: " + (e?.message || e) };
+            }
+          }
+
+          // 2. Native fetch — Chrome adds the magic browser headers
+          //    (sec-fetch-*, x-browser-validation, x-client-data) here.
+          //    DON'T set them manually — let Chrome do its thing.
+          try {
+            const resp = await fetch(url, {
+              method,
+              credentials: "include",
+              headers: headers || {},
+              body: method === "GET" || method === "HEAD" ? undefined : bodyToSend,
+            });
+            const respBody = await resp.text();
+            // Collect a few useful headers to return
+            const respHeaders = {};
+            try {
+              for (const h of ["content-type", "x-goog-request-id"]) {
+                const v = resp.headers.get(h);
+                if (v) respHeaders[h] = v;
+              }
+            } catch {}
+            return {
+              status: resp.status,
+              body: respBody,
+              headers: respHeaders,
+            };
+          } catch (e) {
+            return { error: "fetch_failed: " + (e?.message || e) };
+          }
+        },
+        args: [fetchUrl, fetchMethod, fetchBody, fetchHeaders, recaptchaAction, injectPath],
+      });
+
+      const r = result?.[0]?.result;
+      if (!r) {
+        await submitResult(request_id, { error: "no_script_result" });
+        return;
+      }
+      // Forward whatever the page returned (success or error)
+      await submitResult(request_id, r);
+      return;
+    } catch (e) {
+      await submitResult(request_id, { error: "execute_fetch_threw: " + (e?.message || e) });
+      return;
+    }
+  }
+
   // ─── GET_COOKIES: return all cookies for labs.google (including .google.com parent) ───
   if (action === "GET_COOKIES") {
     try {

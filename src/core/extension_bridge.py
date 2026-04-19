@@ -221,6 +221,72 @@ class ExtensionBridge:
             self._dispatched_to.pop(request_id, None)
             return {"error": "timeout"}
 
+    async def request_api_fetch(
+        self,
+        account: str,
+        url: str,
+        method: str = "POST",
+        body: str = "",
+        headers: Optional[Dict[str, str]] = None,
+        recaptcha_action: Optional[str] = None,
+        inject_recaptcha_path: Optional[str] = None,
+        timeout: float = 180.0,
+    ) -> Dict[str, Any]:
+        """Have the Chrome extension execute an HTTP request from inside the
+        labs.google.com tab using native window.fetch().
+
+        Why bother routing through the extension instead of aiohttp? Google's
+        anti-abuse system checks for cryptographically-signed Chrome headers
+        (x-browser-validation, x-client-data) that aiohttp can't produce.
+        Even with a perfectly-valid reCAPTCHA token, requests originating
+        from outside Chrome get flagged with PUBLIC_ERROR_UNUSUAL_ACTIVITY.
+        Native fetch() inside the page makes Chrome auto-add all the right
+        headers.
+
+        If recaptcha_action is set, the extension will mint a fresh
+        reCAPTCHA token with that action and write it into the JSON body
+        at inject_recaptcha_path (e.g. "clientContext.recaptchaContext.token").
+        Pass None to send the body as-is (caller has already attached a
+        token, or none is needed).
+
+        Returns: {status: int, body: str, error: str | None}
+        """
+        if self.is_account_held(account):
+            info = self.get_hold_info(account)
+            return {
+                "error": f"account_held:{info['seconds_remaining']}s_remaining",
+                "held": True,
+            }
+
+        self._request_counter += 1
+        request_id = f"fetch_{self._request_counter}_{int(time.time())}"
+
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+
+        self._pending_requests[request_id] = {
+            "account": account,
+            "action": "EXECUTE_FETCH",
+            "fetch_url": url,
+            "fetch_method": method,
+            "fetch_body": body,
+            "fetch_headers": dict(headers or {}),
+            "recaptcha_action": recaptcha_action,
+            "inject_recaptcha_path": inject_recaptcha_path,
+            "future": future,
+            "created": time.time(),
+            "_failed_ext_keys": set(),
+            "_reroute_count": 0,
+        }
+
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(request_id, None)
+            self._dispatched_to.pop(request_id, None)
+            return {"error": "timeout"}
+
     def send_command(self, command_type: str, account: str = "", data: Any = None):
         """Queue a command for the extension (cookie clear, reload, etc.)."""
         self._pending_commands.append({
@@ -303,11 +369,22 @@ class ExtensionBridge:
 
                 # Only give work if this extension has the target account
                 if target_account in ext_accounts or not target_account:
-                    response_data["work"] = {
+                    work = {
                         "request_id": req_id,
                         "account": target_account,
                         "action": req["action"],
                     }
+                    # EXECUTE_FETCH carries extra fetch parameters that
+                    # the extension needs to actually perform the request
+                    # (URL, body, headers, optional reCAPTCHA injection).
+                    if req["action"] == "EXECUTE_FETCH":
+                        work["fetch_url"] = req.get("fetch_url", "")
+                        work["fetch_method"] = req.get("fetch_method", "POST")
+                        work["fetch_body"] = req.get("fetch_body", "")
+                        work["fetch_headers"] = req.get("fetch_headers", {})
+                        work["recaptcha_action"] = req.get("recaptcha_action")
+                        work["inject_recaptcha_path"] = req.get("inject_recaptcha_path")
+                    response_data["work"] = work
                     # Track that this request is now dispatched to this extension
                     self._dispatched_to[req_id] = ext_key
                     break
@@ -421,11 +498,20 @@ class ExtensionBridge:
                 # If too many reroutes (all extensions tried), give up
                 if req["_reroute_count"] >= 6:
                     self._pending_requests.pop(request_id, None)
-                    req["future"].set_result({
-                        "token": None, "access_token": None,
-                        "email": None, "project_id": None,
-                        "error": f"all_extensions_failed: {error}",
-                    })
+                    # Shape the failure response based on what the caller
+                    # was expecting — fetch caller wants status/body, token
+                    # caller wants token/access_token.
+                    if req.get("action") == "EXECUTE_FETCH":
+                        req["future"].set_result({
+                            "status": None, "body": "", "headers": {},
+                            "error": f"all_extensions_failed: {error}",
+                        })
+                    else:
+                        req["future"].set_result({
+                            "token": None, "access_token": None,
+                            "email": None, "project_id": None,
+                            "error": f"all_extensions_failed: {error}",
+                        })
                     self._log(f"[Bridge] Request {request_id} FAILED after {req['_reroute_count']} reroutes: {error}")
                 else:
                     # Leave request in _pending_requests — DON'T pop, DON'T resolve
@@ -452,6 +538,15 @@ class ExtensionBridge:
             elif action == "GET_COOKIES":
                 result = {
                     "cookies": data.get("cookies"),
+                    "error": data.get("error"),
+                }
+            elif action == "EXECUTE_FETCH":
+                # Extension forwarded the labs.google API response back.
+                # status / body / headers / error fields all flow through.
+                result = {
+                    "status": data.get("status"),
+                    "body": data.get("body", ""),
+                    "headers": data.get("headers", {}),
                     "error": data.get("error"),
                 }
             else:
