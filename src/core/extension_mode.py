@@ -209,9 +209,19 @@ def _normalize_video_sub_mode(video_sub_mode="", ref_path=None, start_image_path
     return "text_to_video"
 
 
-def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", ratio=""):
-    """Pick the correct video model key based on sub-mode and quality tier."""
+def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", ratio="", plan="ultra"):
+    """Pick the correct video model key based on sub-mode, quality tier, and plan.
+
+    Pro and Ultra accounts use DIFFERENT model name suffixes — verified
+    against a real Ultra-account HAR capture (sku=WS_ULTRA, tier=
+    PAYGATE_TIER_TWO). Sending a Pro-style model name on an Ultra account
+    returns 403 PUBLIC_ERROR_MODEL_ACCESS_DENIED.
+
+    plan: "ultra" → veo_3_1_*_ultra (PAYGATE_TIER_TWO)
+          "pro"   → veo_3_1_*       (PAYGATE_TIER_ONE)
+    """
     source = str(video_model or model or "").strip().lower()
+    plan_lower = str(plan or "ultra").strip().lower()
     # Determine quality tier
     if "lite" in source:
         tier = "lite"
@@ -222,8 +232,8 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
     else:
         tier = "fast"
 
-    # Model key lookup table — non-ultra keys work for all account tiers
-    model_keys = {
+    # Pro tier model keys — work on PAYGATE_TIER_ONE accounts
+    pro_keys = {
         ("text_to_video", "fast"): "veo_3_1_t2v_fast",
         ("text_to_video", "lite"): "veo_3_1_t2v_lite",
         ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_relaxed",
@@ -234,26 +244,64 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lite"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
+        ("frames_start", "quality"): "veo_3_1_i2v_s",
         ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_fl",
         ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_fl",
         ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_relaxed",
+        ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
     }
+
+    # Ultra tier model keys — work on PAYGATE_TIER_TWO accounts.
+    # Pattern verified: _ultra inserts BEFORE _relaxed and BEFORE _fl
+    # (e.g. veo_3_1_i2v_s_fast_ultra_fl, NOT veo_3_1_i2v_s_fast_fl_ultra).
+    ultra_keys = {
+        ("text_to_video", "fast"): "veo_3_1_t2v_fast_ultra",
+        ("text_to_video", "lite"): "veo_3_1_t2v_lite",
+        ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_ultra_relaxed",
+        ("text_to_video", "quality"): "veo_3_1_t2v",
+        ("ingredients", "fast"): "veo_3_1_r2v_fast_landscape_ultra",
+        ("ingredients", "lite"): "veo_3_1_r2v_fast_landscape_ultra",
+        ("ingredients", "lower_pri"): "veo_3_1_r2v_fast_landscape_ultra_relaxed",
+        ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
+        ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
+        ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
+        ("frames_start", "quality"): "veo_3_1_i2v_s",
+        ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_ultra_fl",
+        ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_ultra_fl",
+        ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
+        ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
+    }
+
+    model_keys = ultra_keys if plan_lower == "ultra" else pro_keys
 
     key = model_keys.get((video_sub_mode, tier))
     if key:
         return key
 
-    # For reference with aspect-ratio-specific models
+    # Aspect-ratio-specific fallback for ingredients
     if video_sub_mode == "ingredients":
         api_ratio = _resolve_video_ratio(ratio)
-        ratio_map = {
-            "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape",
-            "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait",
-            "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square",
-        }
-        return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape")
+        if plan_lower == "ultra":
+            ratio_map = {
+                "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape_ultra",
+                "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait_ultra",
+                "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square_ultra",
+            }
+            return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape_ultra")
+        else:
+            ratio_map = {
+                "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape",
+                "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait",
+                "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square",
+            }
+            return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape")
 
-    return "veo_3_1_t2v_fast"
+    return "veo_3_1_t2v_fast_ultra" if plan_lower == "ultra" else "veo_3_1_t2v_fast"
+
+
+def _paygate_tier_for_plan(plan):
+    """Map plan name to API paygate tier string."""
+    return "PAYGATE_TIER_TWO" if str(plan or "ultra").strip().lower() == "ultra" else "PAYGATE_TIER_ONE"
 
 
 # Video endpoint lookup
@@ -519,7 +567,7 @@ class ExtensionWorker:
         client_context = {
             "projectId": project_id,
             "tool": "PINHOLE",
-            "userPaygateTier": "PAYGATE_TIER_ONE",
+            "userPaygateTier": _paygate_tier_for_plan(get_setting("flow_account_plan", "ultra")),
             "sessionId": f";{int(time.time() * 1000)}",
         }
         if token:
@@ -691,7 +739,8 @@ class ExtensionWorker:
             )
 
             api_ratio = _resolve_video_ratio(ratio)
-            api_model = _resolve_video_model_for_sub_mode(sub_mode, model, model, ratio)
+            plan = get_setting("flow_account_plan", "ultra")
+            api_model = _resolve_video_model_for_sub_mode(sub_mode, model, model, ratio, plan=plan)
             endpoint = VIDEO_ENDPOINTS.get(sub_mode, VIDEO_API_URL)
             seed = random.randint(100000, 999999)
             batch_id = str(uuid.uuid4())
@@ -1380,7 +1429,8 @@ class ExtensionModeManager:
             # Use the generated image media ID as reference or start image
             # We pass it directly as a media ID (not file path) — need to build generate_video call manually
             api_ratio = _resolve_video_ratio(video_ratio)
-            api_model = _resolve_video_model_for_sub_mode(sub_mode, video_model, video_model, video_ratio)
+            plan = get_setting("flow_account_plan", "ultra")
+            api_model = _resolve_video_model_for_sub_mode(sub_mode, video_model, video_model, video_ratio, plan=plan)
             endpoint = VIDEO_ENDPOINTS.get(sub_mode, VIDEO_API_URL)
             seed = random.randint(100000, 999999)
             batch_id = str(uuid.uuid4())

@@ -4764,6 +4764,29 @@ class MainWindow(QMainWindow):
         self.cmb_generation_mode.setCurrentIndex(gen_mode_idx)
         browser_form.addRow(self._settings_label("Generation Mode"), self.cmb_generation_mode)
 
+        # Flow account plan — Pro vs Ultra use different Veo model names
+        # AND different paygate tiers. Sending the wrong combo returns
+        # 403 PUBLIC_ERROR_MODEL_ACCESS_DENIED. Default Ultra (latest plan).
+        self.cmb_flow_plan = QComboBox()
+        self.cmb_flow_plan.setObjectName("settingInput")
+        self.cmb_flow_plan.setMinimumHeight(38)
+        self.cmb_flow_plan.addItem("Ultra (Google AI Ultra — recommended)", "ultra")
+        self.cmb_flow_plan.addItem("Pro (Google AI Pro — older plan)", "pro")
+        self.cmb_flow_plan.setToolTip(
+            "Which Google AI plan the labs.google.com account is on.\n\n"
+            "Ultra: uses veo_3_1_*_ultra model keys + PAYGATE_TIER_TWO.\n"
+            "Pro:   uses veo_3_1_* model keys + PAYGATE_TIER_ONE.\n\n"
+            "Wrong setting → 403 PUBLIC_ERROR_MODEL_ACCESS_DENIED on every\n"
+            "video request. Free Gmail accounts have NO Veo access (image\n"
+            "only) regardless of this setting."
+        )
+        saved_plan = str(get_setting("flow_account_plan", "ultra") or "ultra").strip().lower()
+        plan_idx = self.cmb_flow_plan.findData(saved_plan)
+        if plan_idx < 0:
+            plan_idx = 0
+        self.cmb_flow_plan.setCurrentIndex(plan_idx)
+        browser_form.addRow(self._settings_label("Flow Account Plan"), self.cmb_flow_plan)
+
         # Note: Genspark Model and Quality dropdowns live on the
         # Image Generation tab (per-job control) rather than here.
 
@@ -8065,6 +8088,7 @@ class MainWindow(QMainWindow):
             "output_directory": stored_output_dir,
             "generation_mode": str(getattr(self, "cmb_generation_mode", None) and self.cmb_generation_mode.currentData() or "browser_per_slot"),
             "genspark_auto_prompt": "1" if (getattr(self, "img_chk_auto_prompt", None) and self.img_chk_auto_prompt.isChecked()) else "0",
+            "flow_account_plan": str(getattr(self, "cmb_flow_plan", None) and self.cmb_flow_plan.currentData() or "ultra"),
         }
         self._start_background_task(
             self._persist_settings_payload,
