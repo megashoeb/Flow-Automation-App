@@ -81,6 +81,12 @@ def _parse_api_error(status_code: int, resp_text: str) -> str:
             return "⛔ reCAPTCHA Score Too Low — Google rejected the token (score below threshold). Tab may need reload."
         if "quota" in text_lower or "rate" in text_lower:
             return "⛔ Rate Limited (403) — Account quota exceeded or too many requests."
+        # MODEL_ACCESS_DENIED → account is logged in but doesn't have access
+        # to this specific model (typically Veo video on a free-tier account).
+        # Prefix is matched downstream to fail-fast (no retry, no reCAPTCHA
+        # burn) and skip remaining jobs of the same model on this account.
+        if "model_access_denied" in text_lower or "model access denied" in text_lower:
+            return "MODEL_ACCESS_DENIED: ⛔ Account lacks access to this model — Veo video usually requires Google AI Premium / paid plan. Free accounts only get image generation."
         if "permission" in text_lower or "forbidden" in text_lower:
             return f"⛔ Access Denied (403) — Account doesn't have permission. {detail[:100]}"
         return f"⛔ Forbidden (403) — {detail[:150] or 'Google rejected the request.'}"
@@ -1730,6 +1736,36 @@ class ExtensionModeManager:
                 # Moderation / content blocked — don't retry, same prompt won't pass
                 if last_error.startswith("MODERATION:"):
                     self._log(f"[{worker.slot_id}] Content blocked by moderation — not retrying.")
+                    break
+
+                # MODEL_ACCESS_DENIED — account just doesn't have access to
+                # this model (e.g. Veo video on a free Gmail). Retrying is
+                # pointless and burns reCAPTCHA score, which then trips
+                # PUBLIC_ERROR_UNUSUAL_ACTIVITY on subsequent jobs from the
+                # same account. Mark the account as no-access for this
+                # model so we skip the rest of the queue's video jobs on it.
+                if last_error.startswith("MODEL_ACCESS_DENIED"):
+                    self._log(
+                        f"[{worker.slot_id}] No access to model — not retrying. "
+                        f"Skipping all remaining {job_type} jobs on {worker.account_email}."
+                    )
+                    # Disable account for future jobs of this type
+                    self.qm.account_disabled[worker.account_email] = True
+                    self.qm.signals.account_auth_status.emit(
+                        worker.account_email, "expired",
+                        f"No access to {job_type} model (likely needs paid plan)"
+                    )
+                    # Reassign account's pending jobs to other accounts
+                    try:
+                        from src.db.db_manager import reassign_account_jobs
+                        count = reassign_account_jobs(worker.account_email)
+                        if count > 0:
+                            self._log(
+                                f"[ExtMode] Reassigned {count} job(s) from "
+                                f"{worker.account_email} (no model access)."
+                            )
+                    except Exception:
+                        pass
                     break
 
                 # 400 "invalid argument" — same prompt won't fix on retry, fail after 2 attempts
