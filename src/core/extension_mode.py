@@ -222,15 +222,35 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
     """
     source = str(video_model or model or "").strip().lower()
     plan_lower = str(plan or "ultra").strip().lower()
-    # Determine quality tier
+    # Determine quality tier — match both "lower pri" (UI label) and
+    # "lower_pri" (internal key). "relaxed" is the API-level synonym.
     if "lite" in source:
         tier = "lite"
-    elif "lower pri" in source or "relaxed" in source:
+    elif "lower pri" in source or "lower_pri" in source or "relaxed" in source:
         tier = "lower_pri"
     elif "quality" in source:
         tier = "quality"
     else:
         tier = "fast"
+
+    # Ingredients (R2V) is special — model name encodes aspect ratio
+    # (landscape/portrait/square) AND has its own tier suffix rules.
+    # Resolved via dedicated helper before the generic table lookup.
+    if video_sub_mode == "ingredients":
+        api_ratio = _resolve_video_ratio(ratio)
+        if "PORTRAIT" in api_ratio:
+            ratio_short = "portrait"
+        elif "SQUARE" in api_ratio:
+            ratio_short = "square"
+        else:
+            ratio_short = "landscape"
+        ultra_suffix = "_ultra" if plan_lower == "ultra" else ""
+        # lower_pri appends _relaxed AFTER the ultra marker
+        # (e.g. veo_3_1_r2v_fast_landscape_ultra_relaxed)
+        relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
+        # fast / lite / quality all map to the same fast variant —
+        # there is no R2V quality model, only the fast/relaxed pair.
+        return f"veo_3_1_r2v_fast_{ratio_short}{ultra_suffix}{relaxed_suffix}"
 
     # Pro tier model keys — work on PAYGATE_TIER_ONE accounts
     pro_keys = {
@@ -238,9 +258,6 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
         ("text_to_video", "lite"): "veo_3_1_t2v_lite",
         ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_relaxed",
         ("text_to_video", "quality"): "veo_3_1_t2v",
-        ("ingredients", "fast"): "veo_3_1_r2v_fast_landscape",
-        ("ingredients", "lite"): "veo_3_1_r2v_fast_landscape",
-        ("ingredients", "lower_pri"): "veo_3_1_r2v_fast_landscape_relaxed",
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lite"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
@@ -259,9 +276,6 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
         ("text_to_video", "lite"): "veo_3_1_t2v_lite",
         ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_ultra_relaxed",
         ("text_to_video", "quality"): "veo_3_1_t2v",
-        ("ingredients", "fast"): "veo_3_1_r2v_fast_landscape_ultra",
-        ("ingredients", "lite"): "veo_3_1_r2v_fast_landscape_ultra",
-        ("ingredients", "lower_pri"): "veo_3_1_r2v_fast_landscape_ultra_relaxed",
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
         ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
@@ -273,29 +287,11 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
     }
 
     model_keys = ultra_keys if plan_lower == "ultra" else pro_keys
-
     key = model_keys.get((video_sub_mode, tier))
     if key:
         return key
 
-    # Aspect-ratio-specific fallback for ingredients
-    if video_sub_mode == "ingredients":
-        api_ratio = _resolve_video_ratio(ratio)
-        if plan_lower == "ultra":
-            ratio_map = {
-                "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape_ultra",
-                "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait_ultra",
-                "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square_ultra",
-            }
-            return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape_ultra")
-        else:
-            ratio_map = {
-                "VIDEO_ASPECT_RATIO_LANDSCAPE": "veo_3_1_r2v_fast_landscape",
-                "VIDEO_ASPECT_RATIO_PORTRAIT": "veo_3_1_r2v_fast_portrait",
-                "VIDEO_ASPECT_RATIO_SQUARE": "veo_3_1_r2v_fast_square",
-            }
-            return ratio_map.get(api_ratio, "veo_3_1_r2v_fast_landscape")
-
+    # Last-resort fallback for unknown sub_mode/tier combos
     return "veo_3_1_t2v_fast_ultra" if plan_lower == "ultra" else "veo_3_1_t2v_fast"
 
 
