@@ -1191,10 +1191,19 @@ class ExtensionModeManager:
                     busy_slots.add(worker.slot_id)
                     dispatched += 1
 
-                    stagger = random.uniform(
-                        self.qm.global_stagger_min_seconds,
-                        self.qm.global_stagger_max_seconds,
-                    )
+                    # Stagger between dispatches. Video jobs get a longer
+                    # gap because labs.google.com's video endpoint (Veo)
+                    # is much more abuse-sensitive than the image one —
+                    # a burst of 5 video requests in <2s reliably trips
+                    # PUBLIC_ERROR_UNUSUAL_ACTIVITY even on warm accounts.
+                    # Image jobs keep the user's configured fast stagger.
+                    if str(job.get("job_type") or "image").lower() == "video":
+                        stagger = random.uniform(3.0, 5.0)
+                    else:
+                        stagger = random.uniform(
+                            self.qm.global_stagger_min_seconds,
+                            self.qm.global_stagger_max_seconds,
+                        )
                     if stagger > 0:
                         await asyncio.sleep(stagger)
 
