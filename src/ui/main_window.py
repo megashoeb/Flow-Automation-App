@@ -3407,6 +3407,7 @@ class MainWindow(QMainWindow):
         self.ref_cmb_quality = self._create_setting_combo([
             ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
             ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
+            ("Veo 3.1 - Quality", "Veo 3.1 - Quality"),
             ("Veo 3.1 - Fast [Lower Pri]", "Veo 3.1 - Fast [Lower Pri]"),
             ("Veo 3.1 - Lite [Lower Pri]", "Veo 3.1 - Lite [Lower Pri]"),
         ], current_data="Veo 3.1 - Fast")
@@ -3829,7 +3830,14 @@ class MainWindow(QMainWindow):
         prompts_input.setPlaceholderText("Prompts, one per line. Line 1 pairs with image 1.")
         prompts_input.setMinimumHeight(84)
         prompts_input.verticalScrollBar().setSingleStep(6)
-        prompts_input.textChanged.connect(lambda key=mode_key: self._refresh_bulk_pairing_preview(key))
+        # Debounced refresh: textChanged fires on every keystroke, and the
+        # preview rebuild walks every image to draw thumbnails (~30ms each
+        # on disk). 200 prompts × 200 images = the UI was hanging for 5-10s
+        # mid-paste. Delay the actual rebuild by 300ms after the last change
+        # so a paste of 400 lines triggers ONE refresh instead of 400.
+        prompts_input.textChanged.connect(
+            lambda key=mode_key: self._schedule_bulk_pairing_refresh(key)
+        )
         panel_layout.addWidget(prompts_input)
 
         pairs_table = QTableWidget(0, 3)
@@ -8977,7 +8985,13 @@ class MainWindow(QMainWindow):
                 entries.append({"path": resolved, "filename": item.name, "modified_time": modified_time})
 
         panel["entries"] = entries
-        self._refresh_bulk_pairing_preview(mode_key)
+        # Debounced refresh — for 200+ image loads, the synchronous
+        # thumbnail rebuild was freezing the UI for several seconds
+        # right after the file dialog closed. The 50ms delay here lets
+        # the dialog finish dismissing and the UI repaint before the
+        # rebuild starts; subsequent rebuilds (typing in prompts) are
+        # also coalesced via the same debounce.
+        self._schedule_bulk_pairing_refresh(mode_key, delay_ms=50)
 
     def clear_bulk_panel(self, mode_key):
         panel = self._bulk_panel(mode_key)
@@ -8985,7 +8999,7 @@ class MainWindow(QMainWindow):
             return
         panel["entries"] = []
         panel["prompts_input"].clear()
-        self._refresh_bulk_pairing_preview(mode_key)
+        self._schedule_bulk_pairing_refresh(mode_key, delay_ms=50)
 
     def select_bulk_image_folder(self, mode_key):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder With Images", "")
@@ -9019,11 +9033,52 @@ class MainWindow(QMainWindow):
         return images
 
     def _build_thumbnail_icon(self, image_path, size=56):
-        pixmap = QPixmap(str(image_path or ""))
+        # Cached so the same icon isn't decoded from disk every time the
+        # bulk pairing preview rebuilds (which happens on every keystroke
+        # in the prompts box). Without this, 200 images × every textChanged
+        # = 200 disk reads + decodes per keystroke.
+        if not hasattr(self, "_thumbnail_cache"):
+            self._thumbnail_cache = {}
+        path_str = str(image_path or "")
+        cache_key = (path_str, size)
+        cached = self._thumbnail_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        pixmap = QPixmap(path_str)
         if pixmap.isNull():
-            return QIcon(), QSize(size, size)
-        scaled = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        return QIcon(scaled), scaled.size()
+            result = (QIcon(), QSize(size, size))
+        else:
+            scaled = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            result = (QIcon(scaled), scaled.size())
+
+        # Bound the cache so it can't grow unbounded across long sessions.
+        # Most bulk runs use < 1000 images; older entries are evicted FIFO.
+        if len(self._thumbnail_cache) > 2000:
+            for k in list(self._thumbnail_cache.keys())[:500]:
+                self._thumbnail_cache.pop(k, None)
+        self._thumbnail_cache[cache_key] = result
+        return result
+
+    def _schedule_bulk_pairing_refresh(self, mode_key, delay_ms=300):
+        """Coalesce rapid bulk-preview refresh requests into a single
+        update after `delay_ms` of quiet. Without this, pasting 400
+        prompt lines into the bulk text box fires textChanged 400 times,
+        each rebuilding the thumbnail tables — UI hangs for seconds.
+        """
+        if not hasattr(self, "_bulk_refresh_timers"):
+            self._bulk_refresh_timers = {}
+        timer = self._bulk_refresh_timers.get(mode_key)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(
+                lambda key=mode_key: self._refresh_bulk_pairing_preview(key)
+            )
+            self._bulk_refresh_timers[mode_key] = timer
+        # Re-arming an active timer pushes the firing further out — that's
+        # exactly the debounce we want.
+        timer.start(delay_ms)
 
     _NATURAL_SORT_RE = re.compile(r"(\d+)")
 
