@@ -3205,14 +3205,17 @@ class MainWindow(QMainWindow):
         self.pipe_cmb_vid_quality.blockSignals(True)
         self.pipe_cmb_vid_quality.clear()
 
+        # Match labs.google.com Quality dropdown — Quality is available
+        # for ALL video sub-modes (ingredients, frames_start, etc.), not
+        # just frames_start. Previously only frames_start got the Quality
+        # entry which left Image→Video (ingredients) without it.
         items = [
             ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
             ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
+            ("Veo 3.1 - Quality", "Veo 3.1 - Quality"),
             ("Veo 3.1 - Fast [Lower Pri]", "Veo 3.1 - Fast [Lower Pri]"),
             ("Veo 3.1 - Lite [Lower Pri]", "Veo 3.1 - Lite [Lower Pri]"),
         ]
-        if normalized_mode == "frames_start":
-            items.append(("Veo 3.1 - Quality", "Veo 3.1 - Quality"))
 
         for label, value in items:
             self.pipe_cmb_vid_quality.addItem(label, value)
