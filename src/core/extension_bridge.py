@@ -56,12 +56,21 @@ class ExtensionBridge:
         self._dispatched_to: Dict[str, frozenset] = {}
 
         # ─── Token Pool (pre-fetched reCAPTCHA tokens) ───
-        # Keeps N tokens per account ready so 15 parallel slots don't
-        # all wait in line for serial extension token generation.
-        self._token_pool: Dict[str, deque] = {}       # account -> deque of {token, access_token, project_id, ts}
-        self._prefetch_accounts: Dict[str, str] = {}  # prefetch_request_id -> account
-        self.TOKEN_POOL_TARGET = 10  # target pre-fetched tokens per account
+        # Keyed by (account, action) — reCAPTCHA Enterprise tokens carry the
+        # action they were minted for, and Google rejects them with
+        # PUBLIC_ERROR_UNUSUAL_ACTIVITY if the action doesn't match the
+        # endpoint they're submitted to. So image and video jobs need
+        # separate pools — serving an IMAGE_GENERATION token to the video
+        # endpoint was the root cause of "videos fail, images succeed" on
+        # the same warm account.
+        self._token_pool: Dict[tuple, deque] = {}     # (account, action) -> deque of {token, access_token, project_id, ts}
+        self._prefetch_requests: Dict[str, tuple] = {}  # prefetch_request_id -> (account, action)
+        self.TOKEN_POOL_TARGET = 10  # target pre-fetched tokens per (account, action)
         self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
+        # Which actions to keep prefetched. Both image and video are common
+        # enough to benefit from a hot pool; less-common actions fall through
+        # to live token requests.
+        self.PREFETCH_ACTIONS = ("IMAGE_GENERATION", "VIDEO_GENERATION")
 
         # Stats
         self._tokens_received = 0
@@ -128,7 +137,7 @@ class ExtensionBridge:
         self._pending_requests.clear()
         self._dispatched_to.clear()
         self._token_pool.clear()
-        self._prefetch_accounts.clear()
+        self._prefetch_requests.clear()
         # Ecosystem state cleanup
         self._generation_running = False
         # Keep _ecosystem_enabled + _ecosystem_held_accounts across restarts —
@@ -167,7 +176,9 @@ class ExtensionBridge:
             }
 
         # ─── Check token pool first ───
-        pool = self._token_pool.get(account)
+        # Action-scoped lookup — IMAGE_GENERATION and VIDEO_GENERATION
+        # tokens live in separate pools so we never serve the wrong type.
+        pool = self._token_pool.get((account, action))
         if pool:
             now = time.time()
             while pool:
@@ -176,7 +187,7 @@ class ExtensionBridge:
                 if age < self.TOKEN_MAX_AGE:
                     self._log(
                         f"[Bridge] Pool hit for {account} "
-                        f"(age {age:.0f}s, {len(pool)} left in pool)"
+                        f"(action={action}, age {age:.0f}s, {len(pool)} left in pool)"
                     )
                     return {
                         "token": cached["token"],
@@ -302,26 +313,36 @@ class ExtensionBridge:
                     break
 
         # ─── Token Pool Pre-fetch ───
-        # If no real work pending, pre-fetch tokens to keep the pool topped up.
-        # This ensures 15 parallel slots can grab cached tokens instantly.
+        # If no real work pending, pre-fetch tokens to keep the pool topped
+        # up. Loop over both image and video actions per account so the
+        # video pool isn't permanently empty (which would force every video
+        # job through a slow live token request).
         if response_data["work"] is None:
             now = time.time()
+            picked = False
             for account in ext_accounts:
-                pool = self._token_pool.get(account, deque())
-                # Count valid (non-expired) tokens in pool
-                valid_count = sum(1 for t in pool if (now - t["ts"]) < self.TOKEN_MAX_AGE)
-                # Count prefetch requests already in flight for this account
-                in_flight = sum(1 for a in self._prefetch_accounts.values() if a == account)
-                if valid_count + in_flight < self.TOKEN_POOL_TARGET:
-                    self._request_counter += 1
-                    prefetch_id = f"prefetch_{self._request_counter}_{int(time.time())}"
-                    self._prefetch_accounts[prefetch_id] = account
-                    response_data["work"] = {
-                        "request_id": prefetch_id,
-                        "account": account,
-                        "action": "IMAGE_GENERATION",
-                    }
+                if picked:
                     break
+                for action in self.PREFETCH_ACTIONS:
+                    pool = self._token_pool.get((account, action), deque())
+                    valid_count = sum(
+                        1 for t in pool if (now - t["ts"]) < self.TOKEN_MAX_AGE
+                    )
+                    in_flight = sum(
+                        1 for v in self._prefetch_requests.values()
+                        if v == (account, action)
+                    )
+                    if valid_count + in_flight < self.TOKEN_POOL_TARGET:
+                        self._request_counter += 1
+                        prefetch_id = f"prefetch_{self._request_counter}_{int(time.time())}"
+                        self._prefetch_requests[prefetch_id] = (account, action)
+                        response_data["work"] = {
+                            "request_id": prefetch_id,
+                            "account": account,
+                            "action": action,
+                        }
+                        picked = True
+                        break
 
         # Check for pending commands
         if self._pending_commands:
@@ -363,21 +384,25 @@ class ExtensionBridge:
 
         # ─── Handle pre-fetch results (token pool) ───
         if request_id.startswith("prefetch_"):
-            account = self._prefetch_accounts.pop(request_id, "")
-            if data.get("token") and account and not error:
-                pool = self._token_pool.setdefault(account, deque())
+            info = self._prefetch_requests.pop(request_id, None)
+            if info and data.get("token") and not error:
+                account, action = info
+                pool = self._token_pool.setdefault((account, action), deque())
                 pool.append({
                     "token": data["token"],
                     "access_token": data.get("access_token"),
                     "project_id": data.get("project_id"),
                     "ts": time.time(),
                 })
-                # Also cache project ID
+                # Also cache project ID (account-scoped, action-independent)
                 pid = data.get("project_id")
                 if account and pid:
                     self._project_ids[account] = pid
                 self._tokens_received += 1
-                self._log(f"[Bridge] Pool: cached token for {account} (pool size: {len(pool)})")
+                self._log(
+                    f"[Bridge] Pool: cached token for {account} "
+                    f"(action={action}, pool size: {len(pool)})"
+                )
             return web.json_response({"ok": True}, headers={"Access-Control-Allow-Origin": "*"})
 
         # ─── Re-route on no_labs_tab errors ───
@@ -687,8 +712,10 @@ class ExtensionBridge:
         """Hold ecosystem activity for an account (called when reCAPTCHA flags it).
         Default 48 hours. Also blocks token dispatch unless force-enabled."""
         self._ecosystem_held_accounts[account] = time.time() + duration_seconds
-        # Clear any cached tokens for held account so stale ones aren't served
-        self._token_pool.pop(account, None)
+        # Clear any cached tokens (across all actions) for the held account
+        # so stale ones aren't served once the hold expires.
+        for key in [k for k in self._token_pool if k[0] == account]:
+            self._token_pool.pop(key, None)
         # Reset force_enable when a new hold is applied (safety)
         self._force_enabled_accounts.discard(account)
 
