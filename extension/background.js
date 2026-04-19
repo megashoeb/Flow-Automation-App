@@ -1856,6 +1856,136 @@ async function ecosystemTick() {
 // Lifecycle
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+// Flow reCAPTCHA Warmup
+// ═══════════════════════════════════════════════════════════════════
+//
+// Real users on labs.google.com trigger grecaptcha.enterprise.execute()
+// hundreds of times per minute (verified by wrapping execute in the
+// console — labs.google.com itself fires ~200-1000 calls/min in the
+// background, presumably to keep the v3 trust score high).
+//
+// Without this warmup, our extension only calls execute() ~once per
+// dispatched job. That isolated/bursty pattern looked enough like a bot
+// to Google that even a fresh paid Ultra account got rejected with
+// PUBLIC_ERROR_UNUSUAL_ACTIVITY on every video request — while the same
+// account succeeded instantly when generating manually from the page.
+//
+// The warmup installs a self-running loop INSIDE each labs.google.com
+// tab (one-time injection per tab, marker on window) that calls
+// execute() on a 1.5–3.5s jittered interval and discards the resulting
+// tokens. Mimics the natural site behaviour so our "real" execute()
+// calls land with a healthy score.
+
+async function installFlowRecaptchaWarmup() {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ url: `${LABS_ORIGIN}/*` });
+  } catch {
+    return;
+  }
+  for (const tab of tabs) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: () => {
+          // Idempotent — only one warmup loop per tab.
+          if (window.__glabsRecaptchaWarmupActive) return;
+          window.__glabsRecaptchaWarmupActive = true;
+
+          const ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
+          const MIN_DELAY_MS = 1500;
+          const MAX_DELAY_MS = 3500;
+
+          // Resolve the site key the same way our token code does, but
+          // lazy — don't crash if the page hasn't fully loaded yet.
+          function findSiteKey() {
+            try {
+              const clients = window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients;
+              if (clients) {
+                for (const id of Object.keys(clients)) {
+                  const c = clients[id];
+                  if (!c || typeof c !== "object") continue;
+                  const walk = (obj, depth) => {
+                    if (depth > 5 || !obj || typeof obj !== "object") return null;
+                    for (const k of Object.keys(obj)) {
+                      const v = obj[k];
+                      if (typeof v === "string" && v.length >= 20 && v.length <= 50
+                        && /^[A-Za-z0-9_-]+$/.test(v)) {
+                        if (document.querySelector('script[src*="render=' + v + '"]')) return v;
+                      }
+                      if (typeof v === "object" && v !== null) {
+                        const r = walk(v, depth + 1);
+                        if (r) return r;
+                      }
+                    }
+                    return null;
+                  };
+                  const k = walk(c, 0);
+                  if (k) return k;
+                }
+              }
+            } catch {}
+            for (const s of document.querySelectorAll('script[src*="recaptcha"][src*="render="]')) {
+              try {
+                const r = new URL(s.src).searchParams.get("render");
+                if (r && r !== "explicit") return r;
+              } catch {}
+            }
+            return null;
+          }
+
+          let consecutiveFailures = 0;
+          async function tick() {
+            try {
+              const enterprise = window.grecaptcha && window.grecaptcha.enterprise;
+              if (enterprise && typeof enterprise.execute === "function") {
+                const siteKey = findSiteKey();
+                if (siteKey) {
+                  const action = ACTIONS[Math.floor(Math.random() * ACTIONS.length)];
+                  if (typeof enterprise.ready === "function") {
+                    await new Promise((r) => enterprise.ready(r));
+                  }
+                  // Generate + discard. Goal is the score-keeping side
+                  // effect, not the token itself.
+                  await enterprise.execute(siteKey, { action });
+                  consecutiveFailures = 0;
+                }
+              }
+            } catch {
+              consecutiveFailures++;
+              // Back off on persistent failure (page broken / not ready)
+              if (consecutiveFailures > 5) {
+                window.__glabsRecaptchaWarmupActive = false;
+                return;  // stop loop
+              }
+            }
+            const delay = MIN_DELAY_MS + Math.random() * (MAX_DELAY_MS - MIN_DELAY_MS);
+            setTimeout(tick, delay);
+          }
+
+          // First tick after a short randomized delay so multi-tab
+          // warmups don't all fire on the same instant.
+          setTimeout(tick, 500 + Math.random() * 1500);
+        },
+      });
+    } catch {
+      // Tab not scriptable (chrome:// URL, closed mid-call, etc.) — skip
+    }
+  }
+}
+
+// Re-run the installer every 30s so newly opened labs tabs pick up the
+// warmup. Idempotent because of the window.__glabsRecaptchaWarmupActive
+// flag — re-injecting an already-warm tab is a no-op.
+setInterval(installFlowRecaptchaWarmup, 30000);
+// First run after 5s so Chrome finishes loading the tab + reCAPTCHA SDK
+setTimeout(installFlowRecaptchaWarmup, 5000);
+
+// Also install warmup right after a labs.google tab finishes loading
+// (caught by the existing onUpdated listener below — see line ~1875).
+
 // Start polling bridge — 500ms interval, but _workInProgress lock
 // prevents concurrent handleWork calls. This ensures fast pickup
 // of queued work (important when 6+ jobs are pending).
@@ -1876,6 +2006,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab.url && tab.url.startsWith(LABS_ORIGIN)) {
     invalidateRecaptchaCache(tabId);  // force fresh check after reload
     setTimeout(() => detectAccounts(), 3000);
+    // Re-install warmup loop after reload (window flag was wiped).
+    // Wait 4s for grecaptcha SDK to finish loading on the fresh page.
+    setTimeout(installFlowRecaptchaWarmup, 4000);
   }
 });
 
