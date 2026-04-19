@@ -564,17 +564,19 @@ class ExtensionWorker:
         batch_id = str(uuid.uuid4())
         seed = random.randint(100000, 999999)
 
+        # Token left empty — extension EXECUTE_FETCH mints fresh at
+        # dispatch time. Routes through Chrome native fetch for the
+        # signed browser fingerprint headers Google's anti-abuse demands.
         client_context = {
             "projectId": project_id,
             "tool": "PINHOLE",
             "userPaygateTier": _paygate_tier_for_plan(get_setting("flow_account_plan", "ultra")),
             "sessionId": f";{int(time.time() * 1000)}",
-        }
-        if token:
-            client_context["recaptchaContext"] = {
-                "token": token,
+            "recaptchaContext": {
+                "token": "",  # extension fills this in
                 "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-            }
+            },
+        }
 
         body = {
             "mediaGenerationContext": {"batchId": batch_id},
@@ -591,22 +593,26 @@ class ExtensionWorker:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    UPSCALE_URL,
-                    headers={
-                        "content-type": "text/plain;charset=UTF-8",
-                        "authorization": f"Bearer {access_token}",
-                        "origin": "https://labs.google",
-                        "referer": "https://labs.google/",
-                    },
-                    data=json.dumps(body),
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    resp_text = await resp.text()
-                    if not resp.ok:
-                        return None, f"Upscale API {resp.status}: {resp_text[:200]}"
-                    data = json.loads(resp_text)
+            fetch_result = await self._bridge.request_api_fetch(
+                account=self.account_email,
+                url=UPSCALE_URL,
+                method="POST",
+                body=json.dumps(body),
+                headers={
+                    "content-type": "text/plain;charset=UTF-8",
+                    "authorization": f"Bearer {access_token}",
+                },
+                recaptcha_action="VIDEO_GENERATION",
+                inject_recaptcha_path="clientContext.recaptchaContext.token",
+                timeout=60,
+            )
+            if fetch_result.get("error"):
+                return None, f"Upscale bridge error: {fetch_result['error']}"
+            status = fetch_result.get("status") or 0
+            resp_text = fetch_result.get("body", "")
+            if status < 200 or status >= 300:
+                return None, f"Upscale API {status}: {resp_text[:200]}"
+            data = json.loads(resp_text)
 
             media_list = data.get("media", []) if isinstance(data, dict) else []
             if media_list and isinstance(media_list[0], dict):
@@ -661,17 +667,20 @@ class ExtensionWorker:
                 except Exception as e:
                     return None, f"Reference upload failed: {str(e)[:200]}"
 
-            # Build request body
+            # Build request body. Token left empty — extension mints fresh
+            # at dispatch time via EXECUTE_FETCH (with 3-call pre-warmup).
+            # Same signed-Chrome-headers fix as video — Python aiohttp can't
+            # produce x-browser-validation, so requests get rejected with
+            # PUBLIC_ERROR_UNUSUAL_ACTIVITY even with a valid token.
             client_context = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
                 "sessionId": f";{int(time.time() * 1000)}",
-            }
-            if token:
-                client_context["recaptchaContext"] = {
-                    "token": token,
+                "recaptchaContext": {
+                    "token": "",  # extension fills this in
                     "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                }
+                },
+            }
 
             body = {
                 "clientContext": client_context,
@@ -691,27 +700,42 @@ class ExtensionWorker:
                 }],
             }
 
-            # Direct API call from Python
+            # Route through extension's native fetch — same architecture as
+            # video. clientContext.recaptchaContext.token gets filled in
+            # inside the labs.google tab by the EXECUTE_FETCH handler.
             url = IMAGE_API_URL.format(project_id=project_id)
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers={
-                        "content-type": "text/plain;charset=UTF-8",
-                        "authorization": f"Bearer {access_token}",
-                    },
-                    data=json.dumps(body),
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    resp_text = await resp.text()
+            fetch_result = await self._bridge.request_api_fetch(
+                account=self.account_email,
+                url=url,
+                method="POST",
+                body=json.dumps(body),
+                headers={
+                    "content-type": "text/plain;charset=UTF-8",
+                    "authorization": f"Bearer {access_token}",
+                },
+                recaptcha_action="IMAGE_GENERATION",
+                # Image body has clientContext duplicated inside requests[0]
+                # — token must be present in both locations for Google to
+                # accept it (matches the manual UI's request shape).
+                inject_recaptcha_path=(
+                    "clientContext.recaptchaContext.token;"
+                    "requests.0.clientContext.recaptchaContext.token"
+                ),
+                timeout=180,
+            )
 
-                    if not resp.ok:
-                        return None, _parse_api_error(resp.status, resp_text)
+            if fetch_result.get("error"):
+                return None, f"Bridge error: {fetch_result['error']}"
 
-                    try:
-                        data = json.loads(resp_text)
-                    except json.JSONDecodeError:
-                        return None, f"Invalid JSON response: {resp_text[:200]}"
+            status = fetch_result.get("status") or 0
+            resp_text = fetch_result.get("body", "")
+            if status < 200 or status >= 300:
+                return None, _parse_api_error(status, resp_text)
+
+            try:
+                data = json.loads(resp_text)
+            except json.JSONDecodeError:
+                return None, f"Invalid JSON response: {resp_text[:200]}"
 
             self.jobs_completed += 1
             return data, None
@@ -1474,17 +1498,19 @@ class ExtensionModeManager:
             if not project_id:
                 project_id = await worker._resolve_project_id(access_token)
 
+            # Token left empty — extension EXECUTE_FETCH mints fresh at
+            # dispatch time with 3-call pre-warmup. Routes through Chrome
+            # native fetch for x-browser-validation / x-client-data headers.
             client_context = {
                 "projectId": project_id or "",
                 "tool": "PINHOLE",
-                "userPaygateTier": "PAYGATE_TIER_ONE",
+                "userPaygateTier": _paygate_tier_for_plan(get_setting("flow_account_plan", "ultra")),
                 "sessionId": f";{int(time.time() * 1000)}",
-            }
-            if token:
-                client_context["recaptchaContext"] = {
-                    "token": token,
+                "recaptchaContext": {
+                    "token": "",  # extension fills this in
                     "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                }
+                },
+            }
 
             request_obj = {
                 "aspectRatio": api_ratio,
@@ -1508,31 +1534,41 @@ class ExtensionModeManager:
                 }
 
             body = {
-                "mediaGenerationContext": {"batchId": batch_id},
+                "mediaGenerationContext": {
+                    "batchId": batch_id,
+                    "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
+                },
                 "clientContext": client_context,
                 "requests": [request_obj],
                 "useV2ModelConfig": True,
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    endpoint,
-                    headers={
-                        "content-type": "text/plain;charset=UTF-8",
-                        "authorization": f"Bearer {access_token}",
-                        "origin": "https://labs.google",
-                        "referer": "https://labs.google/",
-                    },
-                    data=json.dumps(body),
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    resp_text = await resp.text()
-                    if not resp.ok:
-                        err = _parse_api_error(resp.status, resp_text)
-                        update_job_status(job_id, "failed", account=worker.account_email, error=f"Pipeline Step 2: {err}")
-                        self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, f"Pipeline Step 2: {err}")
-                        return
-                    data = json.loads(resp_text)
+            fetch_result = await worker._bridge.request_api_fetch(
+                account=worker.account_email,
+                url=endpoint,
+                method="POST",
+                body=json.dumps(body),
+                headers={
+                    "content-type": "text/plain;charset=UTF-8",
+                    "authorization": f"Bearer {access_token}",
+                },
+                recaptcha_action="VIDEO_GENERATION",
+                inject_recaptcha_path="clientContext.recaptchaContext.token",
+                timeout=180,
+            )
+            if fetch_result.get("error"):
+                err = f"Bridge error: {fetch_result['error']}"
+                update_job_status(job_id, "failed", account=worker.account_email, error=f"Pipeline Step 2: {err}")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, f"Pipeline Step 2: {err}")
+                return
+            status = fetch_result.get("status") or 0
+            resp_text = fetch_result.get("body", "")
+            if status < 200 or status >= 300:
+                err = _parse_api_error(status, resp_text)
+                update_job_status(job_id, "failed", account=worker.account_email, error=f"Pipeline Step 2: {err}")
+                self.qm.signals.job_updated.emit(job_id, "failed", worker.account_email, f"Pipeline Step 2: {err}")
+                return
+            data = json.loads(resp_text)
 
             # Extract video media_id
             vid_media_list = data.get("media", []) if isinstance(data, dict) else []

@@ -274,19 +274,38 @@ async function handleWork(work) {
               const token = await enterprise.execute(siteKey, { action: captchaAction });
               if (!token) return { error: "recaptcha_returned_null" };
 
-              // Inject the fresh token into the JSON body at injectPath
-              // (e.g. "clientContext.recaptchaContext.token").
+              // Inject the fresh token into the JSON body. Path can be a
+              // single dotted path (e.g. "clientContext.recaptchaContext.token")
+              // or multiple paths separated by ";" — needed for image
+              // requests where Google expects the token both at top-level
+              // clientContext.recaptchaContext.token AND duplicated inside
+              // requests[].clientContext.recaptchaContext.token.
               try {
                 const obj = JSON.parse(bodyStr);
-                const parts = String(injectPath).split(".");
-                let cur = obj;
-                for (let i = 0; i < parts.length - 1; i++) {
-                  if (cur[parts[i]] === undefined || cur[parts[i]] === null) {
-                    cur[parts[i]] = {};
+                const setAtPath = (root, path) => {
+                  const parts = String(path).split(".");
+                  let cur = root;
+                  for (let i = 0; i < parts.length - 1; i++) {
+                    const key = parts[i];
+                    // Numeric segment = array index
+                    const isIdx = /^\d+$/.test(key);
+                    const ref = isIdx ? Number(key) : key;
+                    if (cur[ref] === undefined || cur[ref] === null) {
+                      // Don't create if next path step doesn't exist —
+                      // means the target sub-object isn't in this body.
+                      // Skip silently (e.g. requests[0] doesn't have a
+                      // clientContext for video bodies).
+                      return;
+                    }
+                    cur = cur[ref];
                   }
-                  cur = cur[parts[i]];
+                  const last = parts[parts.length - 1];
+                  const lastIsIdx = /^\d+$/.test(last);
+                  cur[lastIsIdx ? Number(last) : last] = token;
+                };
+                for (const p of String(injectPath).split(";")) {
+                  if (p.trim()) setAtPath(obj, p.trim());
                 }
-                cur[parts[parts.length - 1]] = token;
                 bodyToSend = JSON.stringify(obj);
               } catch (e) {
                 return { error: "body_inject_failed: " + e.message };
