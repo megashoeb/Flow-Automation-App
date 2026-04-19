@@ -222,11 +222,24 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
     """
     source = str(video_model or model or "").strip().lower()
     plan_lower = str(plan or "ultra").strip().lower()
-    # Determine quality tier — match both "lower pri" (UI label) and
-    # "lower_pri" (internal key). "relaxed" is the API-level synonym.
-    if "lite" in source:
+    # Determine quality tier. labs.google.com exposes 5 distinct tiers
+    # for Veo (verified against the Ultra UI screenshot):
+    #   1. Fast                    → "fast"
+    #   2. Lite                    → "lite"
+    #   3. Quality                 → "quality"
+    #   4. Fast [Lower Priority]   → "lower_pri"      (= fast + relaxed)
+    #   5. Lite [Lower Priority]   → "lite_lower_pri" (= lite + relaxed)
+    # Detection has to check the COMBINATION first, otherwise the bare
+    # "lite" keyword would absorb option 5 and drop the lower-priority
+    # bit. Same for "fast" + "lower" → option 4.
+    has_lite = "lite" in source
+    has_lower = ("lower pri" in source or "lower_pri" in source
+                 or "relaxed" in source)
+    if has_lite and has_lower:
+        tier = "lite_lower_pri"
+    elif has_lite:
         tier = "lite"
-    elif "lower pri" in source or "lower_pri" in source or "relaxed" in source:
+    elif has_lower:
         tier = "lower_pri"
     elif "quality" in source:
         tier = "quality"
@@ -245,44 +258,55 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
         else:
             ratio_short = "landscape"
         ultra_suffix = "_ultra" if plan_lower == "ultra" else ""
-        # lower_pri appends _relaxed AFTER the ultra marker
-        # (e.g. veo_3_1_r2v_fast_landscape_ultra_relaxed)
-        relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
+        # Both lower_pri AND lite_lower_pri use the same _relaxed
+        # variant — R2V has no separate Lite model, so lite + lower
+        # collapses to the same relaxed Fast model.
+        relaxed_suffix = "_relaxed" if tier in ("lower_pri", "lite_lower_pri") else ""
         # fast / lite / quality all map to the same fast variant —
         # there is no R2V quality model, only the fast/relaxed pair.
         return f"veo_3_1_r2v_fast_{ratio_short}{ultra_suffix}{relaxed_suffix}"
 
-    # Pro tier model keys — work on PAYGATE_TIER_ONE accounts
+    # Pro tier model keys — work on PAYGATE_TIER_ONE accounts.
+    # Note: Lite is plan-agnostic (no _ultra variant) — same model name
+    # on both Pro and Ultra accounts.
     pro_keys = {
         ("text_to_video", "fast"): "veo_3_1_t2v_fast",
         ("text_to_video", "lite"): "veo_3_1_t2v_lite",
         ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_relaxed",
+        ("text_to_video", "lite_lower_pri"): "veo_3_1_t2v_lite_relaxed",
         ("text_to_video", "quality"): "veo_3_1_t2v",
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lite"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
+        ("frames_start", "lite_lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
         ("frames_start", "quality"): "veo_3_1_i2v_s",
         ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_fl",
         ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_fl",
         ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_relaxed",
+        ("frames_start_end", "lite_lower_pri"): "veo_3_1_i2v_s_fast_fl_relaxed",
         ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
     }
 
     # Ultra tier model keys — work on PAYGATE_TIER_TWO accounts.
     # Pattern verified: _ultra inserts BEFORE _relaxed and BEFORE _fl
     # (e.g. veo_3_1_i2v_s_fast_ultra_fl, NOT veo_3_1_i2v_s_fast_fl_ultra).
+    # Lite stays plan-agnostic (same name as Pro) per labs.google's
+    # observed behaviour — only Fast variants get the _ultra marker.
     ultra_keys = {
         ("text_to_video", "fast"): "veo_3_1_t2v_fast_ultra",
         ("text_to_video", "lite"): "veo_3_1_t2v_lite",
         ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_ultra_relaxed",
+        ("text_to_video", "lite_lower_pri"): "veo_3_1_t2v_lite_relaxed",
         ("text_to_video", "quality"): "veo_3_1_t2v",
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
         ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
+        ("frames_start", "lite_lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
         ("frames_start", "quality"): "veo_3_1_i2v_s",
         ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_ultra_fl",
         ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_ultra_fl",
         ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
+        ("frames_start_end", "lite_lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
         ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
     }
 

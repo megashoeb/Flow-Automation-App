@@ -3209,6 +3209,7 @@ class MainWindow(QMainWindow):
             ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
             ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
             ("Veo 3.1 - Fast [Lower Pri]", "Veo 3.1 - Fast [Lower Pri]"),
+            ("Veo 3.1 - Lite [Lower Pri]", "Veo 3.1 - Lite [Lower Pri]"),
         ]
         if normalized_mode == "frames_start":
             items.append(("Veo 3.1 - Quality", "Veo 3.1 - Quality"))
@@ -3358,6 +3359,7 @@ class MainWindow(QMainWindow):
             ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
             ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
             ("Veo 3.1 - Fast [Lower Pri]", "Veo 3.1 - Fast [Lower Pri]"),
+            ("Veo 3.1 - Lite [Lower Pri]", "Veo 3.1 - Lite [Lower Pri]"),
             ("Veo 3.1 - Quality", "Veo 3.1 - Quality"),
         ], current_data="Veo 3.1 - Fast")
         self.t2v_cmb_ratio = self._create_setting_combo([
@@ -3406,6 +3408,7 @@ class MainWindow(QMainWindow):
             ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
             ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
             ("Veo 3.1 - Fast [Lower Pri]", "Veo 3.1 - Fast [Lower Pri]"),
+            ("Veo 3.1 - Lite [Lower Pri]", "Veo 3.1 - Lite [Lower Pri]"),
         ], current_data="Veo 3.1 - Fast")
         self.ref_cmb_ratio = self._create_setting_combo([
             ("Landscape (16:9)", "Landscape (16:9)"),
@@ -3469,6 +3472,7 @@ class MainWindow(QMainWindow):
             ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
             ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
             ("Veo 3.1 - Fast [Lower Pri]", "Veo 3.1 - Fast [Lower Pri]"),
+            ("Veo 3.1 - Lite [Lower Pri]", "Veo 3.1 - Lite [Lower Pri]"),
             ("Veo 3.1 - Quality", "Veo 3.1 - Quality"),
         ], current_data="Veo 3.1 - Fast")
         self.frm_cmb_ratio = self._create_setting_combo([
