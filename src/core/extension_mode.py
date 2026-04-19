@@ -687,20 +687,27 @@ class ExtensionWorker:
                 except Exception as e:
                     return None, f"Reference upload failed: {str(e)[:200]}"
 
-            # Build request body. Token left empty — extension mints fresh
-            # at dispatch time via EXECUTE_FETCH (with 3-call pre-warmup).
-            # Same signed-Chrome-headers fix as video — Python aiohttp can't
-            # produce x-browser-validation, so requests get rejected with
-            # PUBLIC_ERROR_UNUSUAL_ACTIVITY even with a valid token.
+            # Image gen stays on the original aiohttp + pool-token path.
+            # The video EXECUTE_FETCH migration was needed because the
+            # video endpoint enforced cryptographic Chrome headers (causing
+            # 403 PUBLIC_ERROR_UNUSUAL_ACTIVITY); the image endpoint never
+            # had that check. Routing image through EXECUTE_FETCH funnels
+            # all 36-parallel slots through the single Chrome scripting
+            # channel + reCAPTCHA tab, which choked at ~6 simultaneous
+            # requests and produced "Bridge error: timeout" for the
+            # remaining 30. Pool tokens + parallel aiohttp recovers the
+            # original throughput. If image ever starts hitting 403 too,
+            # we'll add a properly throttled EXECUTE_FETCH route instead.
             client_context = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
                 "sessionId": f";{int(time.time() * 1000)}",
-                "recaptchaContext": {
-                    "token": "",  # extension fills this in
-                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                },
             }
+            if token:
+                client_context["recaptchaContext"] = {
+                    "token": token,
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                }
 
             body = {
                 "clientContext": client_context,
@@ -720,42 +727,27 @@ class ExtensionWorker:
                 }],
             }
 
-            # Route through extension's native fetch — same architecture as
-            # video. clientContext.recaptchaContext.token gets filled in
-            # inside the labs.google tab by the EXECUTE_FETCH handler.
+            # Direct API call from Python — parallel-safe, no extension bottleneck.
             url = IMAGE_API_URL.format(project_id=project_id)
-            fetch_result = await self._bridge.request_api_fetch(
-                account=self.account_email,
-                url=url,
-                method="POST",
-                body=json.dumps(body),
-                headers={
-                    "content-type": "text/plain;charset=UTF-8",
-                    "authorization": f"Bearer {access_token}",
-                },
-                recaptcha_action="IMAGE_GENERATION",
-                # Image body has clientContext duplicated inside requests[0]
-                # — token must be present in both locations for Google to
-                # accept it (matches the manual UI's request shape).
-                inject_recaptcha_path=(
-                    "clientContext.recaptchaContext.token;"
-                    "requests.0.clientContext.recaptchaContext.token"
-                ),
-                timeout=180,
-            )
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    headers={
+                        "content-type": "text/plain;charset=UTF-8",
+                        "authorization": f"Bearer {access_token}",
+                    },
+                    data=json.dumps(body),
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    resp_text = await resp.text()
 
-            if fetch_result.get("error"):
-                return None, f"Bridge error: {fetch_result['error']}"
+                    if not resp.ok:
+                        return None, _parse_api_error(resp.status, resp_text)
 
-            status = fetch_result.get("status") or 0
-            resp_text = fetch_result.get("body", "")
-            if status < 200 or status >= 300:
-                return None, _parse_api_error(status, resp_text)
-
-            try:
-                data = json.loads(resp_text)
-            except json.JSONDecodeError:
-                return None, f"Invalid JSON response: {resp_text[:200]}"
+                    try:
+                        data = json.loads(resp_text)
+                    except json.JSONDecodeError:
+                        return None, f"Invalid JSON response: {resp_text[:200]}"
 
             self.jobs_completed += 1
             return data, None
