@@ -250,6 +250,27 @@ async function handleWork(work) {
               if (typeof enterprise.ready === "function") {
                 await new Promise((r) => enterprise.ready(r));
               }
+
+              // Pre-warmup: fire 3 quick execute() calls with random
+              // actions before minting the real token. Real labs.google
+              // pages cluster execute() calls (we've measured 6000+/min)
+              // — a single isolated call statistically scores lower than
+              // one inside a natural cluster. The warmup tokens are
+              // discarded; only the real token gets injected. This
+              // dramatically cuts the random-variance reCAPTCHA failures
+              // that happened ~1-in-7 even with the EXECUTE_FETCH route.
+              const WARMUP_ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
+              for (let i = 0; i < 3; i++) {
+                try {
+                  const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
+                  // Fire-and-forget — don't await each one fully, but do
+                  // wait a tiny jittered gap so the cluster looks natural.
+                  enterprise.execute(siteKey, { action: wAction }).catch(() => {});
+                  await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+                } catch {}
+              }
+
+              // Now mint the REAL token — fresh + with warm score
               const token = await enterprise.execute(siteKey, { action: captchaAction });
               if (!token) return { error: "recaptcha_returned_null" };
 
