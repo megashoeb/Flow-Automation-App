@@ -266,15 +266,42 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
         # there is no R2V quality model, only the fast/relaxed pair.
         return f"veo_3_1_r2v_fast_{ratio_short}{ultra_suffix}{relaxed_suffix}"
 
-    # Pro tier model keys — work on PAYGATE_TIER_ONE accounts.
-    # Note: Lite is plan-agnostic (no _ultra variant) — same model name
-    # on both Pro and Ultra accounts.
+    # Text-to-video — verified via real labs.google.com Ultra captures
+    # (DevTools fetch wrapper). Pattern:
+    #   • Lite / Quality / Lite [Lower Pri] = single model, NO aspect-ratio
+    #     encoding, NO _ultra suffix. Same model serves landscape/portrait/square.
+    #   • Fast / Fast [Lower Pri] = aspect ratio encoded for portrait/square
+    #     (landscape is the default and is NOT named in the model key).
+    #     Has the _ultra suffix on Ultra plans.
+    #   • Lite [Lower Pri] uses "_low_priority" suffix, NOT "_relaxed"
+    #     like the Fast variant does. (Discovered the hard way.)
+    if video_sub_mode == "text_to_video":
+        is_ultra = (plan_lower == "ultra")
+        ultra_suffix = "_ultra" if is_ultra else ""
+        if tier == "lite":
+            return "veo_3_1_t2v_lite"
+        if tier == "lite_lower_pri":
+            return "veo_3_1_t2v_lite_low_priority"
+        if tier == "quality":
+            return "veo_3_1_t2v"
+        # Fast / Fast Lower Pri — ratio encoded for non-landscape
+        api_ratio = _resolve_video_ratio(ratio)
+        if "PORTRAIT" in api_ratio:
+            ratio_part = "_portrait"
+        elif "SQUARE" in api_ratio:
+            # Not yet captured from real traffic — guessed from the
+            # portrait pattern. Update if a square test reveals different.
+            ratio_part = "_square"
+        else:
+            ratio_part = ""  # landscape is the unnamed default
+        relaxed_part = "_relaxed" if tier == "lower_pri" else ""
+        return f"veo_3_1_t2v_fast{ratio_part}{ultra_suffix}{relaxed_part}"
+
+    # Pro tier model keys for the I2V (image-to-video) sub-modes.
+    # NOT YET VERIFIED against real Pro traffic — inherited from existing
+    # code + competitor's bot_engine.py mappings. Replace with captured
+    # values when a Pro account becomes available.
     pro_keys = {
-        ("text_to_video", "fast"): "veo_3_1_t2v_fast",
-        ("text_to_video", "lite"): "veo_3_1_t2v_lite",
-        ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_relaxed",
-        ("text_to_video", "lite_lower_pri"): "veo_3_1_t2v_lite_relaxed",
-        ("text_to_video", "quality"): "veo_3_1_t2v",
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lite"): "veo_3_1_i2v_s_fast",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
@@ -287,17 +314,11 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
         ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
     }
 
-    # Ultra tier model keys — work on PAYGATE_TIER_TWO accounts.
-    # Pattern verified: _ultra inserts BEFORE _relaxed and BEFORE _fl
-    # (e.g. veo_3_1_i2v_s_fast_ultra_fl, NOT veo_3_1_i2v_s_fast_fl_ultra).
-    # Lite stays plan-agnostic (same name as Pro) per labs.google's
-    # observed behaviour — only Fast variants get the _ultra marker.
+    # Ultra tier model keys — partial verification only (the Ultra HAR
+    # confirmed veo_3_1_i2v_s_fast_ultra). Other entries follow the
+    # same _ultra-before-_relaxed / _ultra-before-_fl pattern but need
+    # frames_start / frames_start_end captures to confirm.
     ultra_keys = {
-        ("text_to_video", "fast"): "veo_3_1_t2v_fast_ultra",
-        ("text_to_video", "lite"): "veo_3_1_t2v_lite",
-        ("text_to_video", "lower_pri"): "veo_3_1_t2v_fast_ultra_relaxed",
-        ("text_to_video", "lite_lower_pri"): "veo_3_1_t2v_lite_relaxed",
-        ("text_to_video", "quality"): "veo_3_1_t2v",
         ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
         ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
         ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
