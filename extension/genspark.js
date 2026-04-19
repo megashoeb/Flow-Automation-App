@@ -31,10 +31,13 @@ let gensparkBridgeConnected = false;
 let gensparkAccounts = {};  // email -> { email, plan_type, tab_id, ... }
 let gensparkLastPollError = "";
 // Parallel concurrency control — how many image generations may run
-// concurrently inside this extension. Genspark's reCAPTCHA + SSE stack
-// handles ~3-5 parallel requests from the same tab well. Bumping past 5
-// starts to hit session rate limits on Plus plan.
-const GENSPARK_MAX_PARALLEL = 5;
+// concurrently inside this extension. The Python side (genspark_mode.py)
+// already gates on the UI "Parallel" dropdown (1..40); this cap is a
+// defence-in-depth ceiling so a runaway Python side can't blow past what
+// Genspark itself can sustain. 40 matches the UI maximum. Plus-plan users
+// who pick a high value may still hit the 5-hour session rate limit —
+// genspark_mode.py logs a warning when that risk applies.
+const GENSPARK_MAX_PARALLEL = 40;
 let gensparkActiveCount = 0;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -397,6 +400,10 @@ async function gensparkHandleWork(work) {
 
           // Tool-call argument accumulator (arguments stream as deltas)
           const toolArgBuffer = {};  // tool_call_id -> { name, args_string }
+          // High-value events (message_result, message_field, tool message_start)
+          // — captured FULL (no truncation) so we can debug task_id extraction.
+          // Deltas are noisy and excluded.
+          const richEvents = [];
 
           function tryExtractTaskId(obj) {
             if (taskId) return;
@@ -468,6 +475,54 @@ async function gensparkHandleWork(work) {
                   taskId = parsed.task_ids[0]; return;
                 }
               } catch {}
+            }
+
+            // Shape 7: message_result events. These carry tool execution
+            // results — including the image-generation task_id. The shape
+            // varies; we look in many candidate locations and also do a
+            // recursive UUID scan as a final safety net.
+            if (obj.type === "message_result" || obj.type === "message_end") {
+              // Common direct fields
+              const candidates = [
+                obj.result, obj.tool_result, obj.content,
+                obj.field_value, obj.value, obj.data,
+              ];
+              for (const c of candidates) {
+                if (taskId) return;
+                if (!c) continue;
+                let parsed = c;
+                if (typeof c === "string") {
+                  // Quick UUID scan first (cheap)
+                  const m = c.match(UUID_RE);
+                  UUID_RE.lastIndex = 0;
+                  if (m) {
+                    const cand = m.filter(
+                      (u) => u !== projectId && u !== msgId
+                    );
+                    if (cand.length) { taskId = cand[0]; return; }
+                  }
+                  try { parsed = JSON.parse(c); } catch { continue; }
+                }
+                if (parsed && typeof parsed === "object") {
+                  if (parsed.task_id) { taskId = parsed.task_id; return; }
+                  if (Array.isArray(parsed.task_ids) && parsed.task_ids[0]) {
+                    taskId = parsed.task_ids[0]; return;
+                  }
+                  if (Array.isArray(parsed.tasks) && parsed.tasks[0]?.id) {
+                    taskId = parsed.tasks[0].id; return;
+                  }
+                  // Recursive UUID hunt
+                  const s = JSON.stringify(parsed);
+                  const m = s.match(UUID_RE);
+                  UUID_RE.lastIndex = 0;
+                  if (m) {
+                    const cand = m.filter(
+                      (u) => u !== projectId && u !== msgId
+                    );
+                    if (cand.length) { taskId = cand[0]; return; }
+                  }
+                }
+              }
             }
           }
 
@@ -543,6 +598,20 @@ async function gensparkHandleWork(work) {
                   if (obj.delta) snap.delta = String(obj.delta).slice(0, 60);
                   allEvents.push(snap);
                 }
+                // Capture FULL content of high-value events. Deltas are
+                // excluded (too noisy); message_result / message_field /
+                // tool message_start carry the actual answers.
+                const isRich = (
+                  t === "message_result" ||
+                  t === "message_end" ||
+                  t === "message_field" ||
+                  (t === "message_start" && obj.role === "tool")
+                );
+                if (isRich && richEvents.length < 30) {
+                  // Deep clone via JSON to avoid leaking references
+                  try { richEvents.push(JSON.parse(JSON.stringify(obj))); }
+                  catch { richEvents.push({ type: t, _serialize_failed: true }); }
+                }
                 tryExtractTaskId(obj);
                 tryExtractFromToolArgs(obj);
                 if (taskId) break;
@@ -553,8 +622,21 @@ async function gensparkHandleWork(work) {
           try { await reader.cancel(); } catch {}
 
           if (!taskId) {
-            // Final fallback: any UUID in any event that isn't project/msg id
-            for (const ev of allEvents) {
+            // Fallback A: re-run the rich-event extractor on the full
+            // captured set (Shape 7 etc. — in case stream ended before
+            // task_id was located in the streaming pass).
+            for (const ev of richEvents) {
+              if (taskId) break;
+              tryExtractTaskId(ev);
+            }
+          }
+
+          if (!taskId) {
+            // Fallback B: any UUID in any captured event that isn't a
+            // project/msg id. richEvents first (full content), then
+            // allEvents (truncated lightweight snapshots).
+            const scan = [...richEvents, ...allEvents];
+            for (const ev of scan) {
               if (taskId) break;
               const s = JSON.stringify(ev);
               const m = s.match(UUID_RE);
@@ -575,6 +657,7 @@ async function gensparkHandleWork(work) {
               msg_id: msgId,
               debug_event_types: eventTypeCounts,
               debug_last_events: allEvents.slice(-8),
+              debug_rich_events: richEvents,
             };
           }
           return { task_id: taskId, project_id: projectId, msg_id: msgId };
@@ -616,6 +699,7 @@ async function gensparkHandleWork(work) {
       const debugPayload = (taskInfo && taskInfo.debug_event_types)
         ? { event_types: taskInfo.debug_event_types,
             last_events: taskInfo.debug_last_events,
+            rich_events: taskInfo.debug_rich_events,
             project_id: taskInfo.project_id,
             msg_id: taskInfo.msg_id }
         : null;

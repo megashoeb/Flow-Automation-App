@@ -25,9 +25,8 @@ from typing import Any, Dict, List, Optional
 from src.core.genspark_bridge import GensparkBridge
 from src.db.db_manager import (
     get_all_jobs,
-    get_int_setting,
+    get_bool_setting,
     get_output_directory,
-    get_setting,
     update_job_status,
 )
 
@@ -123,6 +122,7 @@ class GensparkModeManager:
         # job dispatched in this Genspark session.
         self._default_model: str = "nano-banana-2"
         self._default_image_size: str = "auto"
+        self._auto_prompt: bool = False
 
     # ═══════════════════════════════════════════════════════════════
     # Main loop
@@ -133,28 +133,54 @@ class GensparkModeManager:
         await self._bridge.start()
 
         try:
-            # Load global Genspark settings once per session
-            self._default_model = _resolve_model(
-                get_setting("genspark_model", "nano-banana-2") or "nano-banana-2"
-            )
-            self._default_image_size = _resolve_image_size(
-                get_setting("genspark_image_size", "auto") or "auto"
-            )
+            # Model + quality are per-job now (encoded into the job's model
+            # field as "Name:size" by the Image Generation tab). The legacy
+            # global "genspark_model" / "genspark_image_size" settings are no
+            # longer written by the UI — reading them here would surface a
+            # stale value from a previous app version, which confused users
+            # whose DB still had "nano-banana-pro" left over.
+            self._default_model = "nano-banana-2"
+            self._default_image_size = "auto"
             self._log(
-                f"[GensparkMode] Defaults → model={self._default_model}, "
-                f"image_size={self._default_image_size}"
+                f"[GensparkMode] Fallback defaults → model={self._default_model}, "
+                f"image_size={self._default_image_size} (each job carries its own "
+                "Model + Quality from the Image Generation tab)"
             )
-            if self._default_image_size == "4k" and self._default_model != "nano-banana-pro":
+
+            # Honor the UI "Parallel" dropdown (Image Generation tab) — same
+            # value every other generation mode uses. Clamped to 1..40 to
+            # match the dropdown's range. Note: Plus-plan users above ~5–10
+            # parallel may hit the 5-hour session rate limit; the warning
+            # below makes that explicit so it isn't surprising.
+            slots_per_account = max(1, min(40, int(self.qm.account_parallel_slots or 5)))
+            if slots_per_account > 10:
                 self._log(
-                    "[GensparkMode] ⚠ 4K output is only guaranteed on Nano Banana Pro "
-                    "(Pro plan). Plus plan will likely downgrade to 2K."
+                    f"[GensparkMode] ⚠ Parallel={slots_per_account}/account is high — "
+                    "Plus plan may hit the 5-hour session rate limit. Pro plan handles it better."
                 )
 
-            # Default 5 matches GENSPARK_MAX_PARALLEL in the extension.
-            # Clamped to a safe 1..10 — higher than 10 per account hits the
-            # 5-hour session rate limit on Plus plan quickly.
-            slots_per_account = max(
-                1, min(10, get_int_setting("genspark_slots_per_account", 5))
+            # Auto Prompt toggle from Image Generation tab. When OFF, raw
+            # prompt goes straight to image generation — bypasses Genspark's
+            # LLM agent (ask_proxy), which avoids both the 429 rate limit
+            # and the SSE-parsing bug that the agent path triggers.
+            self._auto_prompt = get_bool_setting("genspark_auto_prompt", False)
+            self._log(
+                f"[GensparkMode] Auto Prompt: {'ON (LLM agent rewrites)' if self._auto_prompt else 'OFF (raw prompt → image gen)'}"
+            )
+
+            # Dispatch stagger. With Auto Prompt OFF the request goes
+            # straight to the image endpoint (much higher rate limit), so
+            # a small 1.5–2.5s gap is plenty. With Auto Prompt ON the LLM
+            # ask_proxy endpoint caps at ~0.4 req/s, so we space further.
+            if self._auto_prompt:
+                self._stagger_min = 5.0
+                self._stagger_max = 7.0
+            else:
+                self._stagger_min = 1.5
+                self._stagger_max = 2.5
+            self._log(
+                f"[GensparkMode] Dispatch stagger: "
+                f"{self._stagger_min:.1f}s–{self._stagger_max:.1f}s"
             )
 
             self._log(
@@ -353,10 +379,7 @@ class GensparkModeManager:
                     busy_slots.add(worker.slot_id)
                     dispatched += 1
 
-                    stagger = random.uniform(
-                        self.qm.global_stagger_min_seconds,
-                        self.qm.global_stagger_max_seconds,
-                    )
+                    stagger = random.uniform(self._stagger_min, self._stagger_max)
                     if stagger > 0:
                         await asyncio.sleep(stagger)
 
@@ -467,6 +490,7 @@ class GensparkModeManager:
                         model=model,
                         aspect_ratio=ratio,
                         image_size=image_size,
+                        auto_prompt=self._auto_prompt,
                     )
                 except Exception as e:
                     last_error = f"bridge_error: {e}"

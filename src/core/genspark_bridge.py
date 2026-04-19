@@ -133,7 +133,13 @@ class GensparkBridge:
         aspect_ratio: str = "auto",
         style: str = "auto",
         image_size: str = "auto",
-        auto_prompt: bool = True,
+        # auto_prompt sends the user's prompt through Genspark's LLM agent
+        # (ask_proxy) which rewrites/enriches it before generation. That
+        # endpoint rate-limits hard (~10 req per 25s) and its SSE stream
+        # was returning prompt-rewrite text instead of an image task_id —
+        # both bugs evaporate when this is False, since we then bypass the
+        # agent and hit the image endpoint directly with the raw prompt.
+        auto_prompt: bool = False,
         background_mode: bool = True,
         timeout: float = 300.0,
     ) -> Dict[str, Any]:
@@ -289,9 +295,21 @@ class GensparkBridge:
                         f"[GensparkBridge] SSE debug — event types: "
                         f"{evt_summary} (project_id={dbg.get('project_id')})"
                     )
-                    last_events = dbg.get("last_events") or []
-                    for e in last_events[-5:]:
-                        self._log(f"[GensparkBridge]   event: {e}")
+                    # The "rich" events (message_result, message_field, tool
+                    # message_start) are far more useful than rolling deltas
+                    # — they're where task_id actually lives. Log them in
+                    # full so we can see what Genspark is returning.
+                    rich = dbg.get("rich_events") or []
+                    if rich:
+                        self._log(
+                            f"[GensparkBridge] SSE debug — {len(rich)} rich event(s):"
+                        )
+                        for i, e in enumerate(rich):
+                            self._log(f"[GensparkBridge]   rich[{i}]: {e}")
+                    else:
+                        last_events = dbg.get("last_events") or []
+                        for e in last_events[-5:]:
+                            self._log(f"[GensparkBridge]   event: {e}")
                 except Exception:
                     pass
             fut.set_result({"error": str(data["error"])})

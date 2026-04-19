@@ -3289,6 +3289,21 @@ class MainWindow(QMainWindow):
         )
         self.img_cmb_parallel = self._create_parallel_combo(saved_slots)
 
+        # Genspark-only: Auto Prompt toggle. When OFF (default) the raw
+        # prompt is sent straight to image generation, bypassing Genspark's
+        # LLM agent (ask_proxy). The agent path was hitting 429 rate limits
+        # and an SSE-parsing bug, so OFF is the working configuration.
+        self.img_chk_auto_prompt = QCheckBox("Auto Prompt (let Genspark rewrite)")
+        self.img_chk_auto_prompt.setChecked(get_bool_setting("genspark_auto_prompt", False))
+        self.img_chk_auto_prompt.setToolTip(
+            "When ON: Genspark's LLM agent rewrites your prompt before generating "
+            "(adds 'no text/letters/symbols' style guards, etc).\n\n"
+            "When OFF (default): your prompt goes directly to the image model.\n\n"
+            "Recommended OFF — the agent path rate-limits hard (~10 requests "
+            "before HTTP 429) and currently has an SSE-parsing bug. Genspark "
+            "mode only."
+        )
+
         form.addRow(self._make_setting_label("Model:"), self.img_cmb_model)
         form.addRow(
             self._make_setting_label("Ratio:"),
@@ -3300,6 +3315,7 @@ class MainWindow(QMainWindow):
         )
         form.addRow(self._make_setting_label("Quality:"), self.img_cmb_quality)
         form.addRow(self._make_setting_label("Parallel:"), self.img_cmb_parallel)
+        form.addRow("", self.img_chk_auto_prompt)
         layout.addLayout(form)
 
         refs_header = QHBoxLayout()
@@ -8048,6 +8064,7 @@ class MainWindow(QMainWindow):
             "api_humanized_wait_no_ref_max_seconds": str(no_ref_wait_max),
             "output_directory": stored_output_dir,
             "generation_mode": str(getattr(self, "cmb_generation_mode", None) and self.cmb_generation_mode.currentData() or "browser_per_slot"),
+            "genspark_auto_prompt": "1" if (getattr(self, "img_chk_auto_prompt", None) and self.img_chk_auto_prompt.isChecked()) else "0",
         }
         self._start_background_task(
             self._persist_settings_payload,
@@ -8964,13 +8981,13 @@ class MainWindow(QMainWindow):
         images = list(panel.get("entries") or [])
         sort_mode = str(panel["sort_selector"].currentData() or "name_asc")
         if sort_mode == "name_desc":
-            images.sort(key=lambda item: str(item.get("filename") or "").lower(), reverse=True)
+            images.sort(key=lambda item: self._natural_key(item.get("filename")), reverse=True)
         elif sort_mode == "time_old":
             images.sort(key=lambda item: float(item.get("modified_time") or 0.0))
         elif sort_mode == "time_new":
             images.sort(key=lambda item: float(item.get("modified_time") or 0.0), reverse=True)
         else:
-            images.sort(key=lambda item: str(item.get("filename") or "").lower())
+            images.sort(key=lambda item: self._natural_key(item.get("filename")))
         return images
 
     def _build_thumbnail_icon(self, image_path, size=56):
@@ -8979,6 +8996,19 @@ class MainWindow(QMainWindow):
             return QIcon(), QSize(size, size)
         scaled = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         return QIcon(scaled), scaled.size()
+
+    _NATURAL_SORT_RE = re.compile(r"(\d+)")
+
+    @classmethod
+    def _natural_key(cls, value):
+        """Sort key that orders '1, 2, 10, 100' instead of '1, 10, 100, 2'.
+
+        Splits the string into runs of digits and non-digits; digit runs are
+        compared as ints, the rest case-insensitively. Used for filename
+        sort so '10.jpg' comes after '2.jpg', not before it.
+        """
+        parts = cls._NATURAL_SORT_RE.split(str(value or ""))
+        return [int(p) if p.isdigit() else p.lower() for p in parts]
 
     def _filename_to_prompt(self, filename):
         name_no_ext = Path(str(filename or "")).stem
@@ -9236,8 +9266,8 @@ class MainWindow(QMainWindow):
         if normalized in self.current_ref_paths:
             return False
         self.current_ref_paths.append(normalized)
-        # Sort A-Z by filename
-        self.current_ref_paths.sort(key=lambda p: os.path.basename(p).lower())
+        # Sort A-Z by filename (natural — '10.jpg' after '2.jpg', not before)
+        self.current_ref_paths.sort(key=lambda p: self._natural_key(os.path.basename(p)))
         self._update_reference_image_ui()
         return True
 
@@ -9327,8 +9357,8 @@ class MainWindow(QMainWindow):
         if normalized in self.current_pipe_ref_paths:
             return False
         self.current_pipe_ref_paths.append(normalized)
-        # Sort A-Z by filename
-        self.current_pipe_ref_paths.sort(key=lambda p: os.path.basename(p).lower())
+        # Sort A-Z by filename (natural — '10.jpg' after '2.jpg', not before)
+        self.current_pipe_ref_paths.sort(key=lambda p: self._natural_key(os.path.basename(p)))
         self._update_pipeline_reference_ui()
         return True
 
