@@ -1226,6 +1226,12 @@ class ExtensionModeManager:
         self._bridge = ExtensionBridge(self._log)
         self._workers: Dict[str, list] = {}  # account_email -> [ExtensionWorker, ...]
         self._active_tasks = []
+        # Per-account dispatch stagger — tracks when we last fired a job
+        # to each account so we can enforce a 0.8-1.5s minimum gap
+        # between same-account dispatches. Prevents the "8 requests in
+        # 1 second" burst pattern that Google rate-limits even when
+        # every individual request is valid.
+        self._last_dispatch_ts: Dict[str, float] = {}  # account -> last dispatch timestamp
         # reCAPTCHA streak tracking — auto-hold after consecutive failures
         self._recaptcha_streak: Dict[str, int] = {}  # account -> consecutive recaptcha failures
         self.RECAPTCHA_HOLD_THRESHOLD = 3  # hold account after this many consecutive failures
@@ -1395,6 +1401,23 @@ class ExtensionModeManager:
                     worker = self._get_available_worker(busy_slots)
                     if not worker:
                         break
+
+                    # Per-account dispatch stagger — Google 429s a same-IP
+                    # burst of 8-16 requests landing inside a 1-second
+                    # window even when each request is individually clean
+                    # (valid token + signed Chrome headers). Manual users
+                    # can't click Generate 8 times per second; rate limit
+                    # kicks in on the pattern alone. We enforce a 0.8-1.5s
+                    # minimum gap between dispatches to the SAME account
+                    # so the request stream looks like a human's. Cross-
+                    # account dispatches still fire in parallel — their
+                    # sessions are independent.
+                    last_ts = self._last_dispatch_ts.get(worker.account_email, 0.0)
+                    elapsed = time.time() - last_ts
+                    min_gap = 0.8 + random.random() * 0.7  # 0.8–1.5s jittered
+                    if last_ts and elapsed < min_gap:
+                        await asyncio.sleep(min_gap - elapsed)
+                    self._last_dispatch_ts[worker.account_email] = time.time()
 
                     job_id = job["id"]
                     update_job_status(job_id, "running", account=worker.account_email)
