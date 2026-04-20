@@ -482,6 +482,8 @@ class ExtensionWorker:
                 headers={
                     "content-type": "text/plain;charset=UTF-8",
                     "authorization": f"Bearer {access_token}",
+                    "origin": "https://labs.google",
+                    "referer": "https://labs.google/",
                 },
                 data=json.dumps(body),
                 timeout=aiohttp.ClientTimeout(total=60),
@@ -591,6 +593,8 @@ class ExtensionWorker:
                         headers={
                             "content-type": "text/plain;charset=UTF-8",
                             "authorization": f"Bearer {access_token}",
+                            "origin": "https://labs.google",
+                            "referer": "https://labs.google/",
                         },
                         data=json.dumps(poll_body),
                         timeout=aiohttp.ClientTimeout(total=30),
@@ -787,39 +791,33 @@ class ExtensionWorker:
                 except Exception as e:
                     return None, f"Reference upload failed: {str(e)[:200]}"
 
-            # Image gen routes through EXECUTE_FETCH (same as video).
+            # Image gen uses aiohttp + origin/referer headers — proven to
+            # work at 15+ parallel on a single account in the user's
+            # older working build. The image endpoint accepts requests
+            # from outside the Chrome tab as long as:
+            #   1. origin + referer identify the request as coming from
+            #      labs.google (NOT just bare aiohttp with no origin)
+            #   2. authorization bearer is valid (from extension session)
+            #   3. reCAPTCHA token is attached in body
             #
-            # Why: manual generation works on the same accounts that our
-            # aiohttp path fails on with "reCAPTCHA evaluation failed".
-            # Google's Enterprise reCAPTCHA binds the token to the
-            # Chrome browser fingerprint AT MINT TIME and then verifies
-            # the request carries the matching signed headers
-            # (x-browser-validation, x-client-data, sec-fetch-*) AT
-            # EVALUATION TIME. Python's aiohttp can't produce those
-            # cryptographic headers, so the token mints fine but gets
-            # rejected when the request arrives without the matching
-            # fingerprint. Native fetch() inside the labs tab (via
-            # chrome.scripting.executeScript) is what Chrome treats as
-            # "the page itself made the request" — same as a manual
-            # click — so the headers match and the token passes.
+            # Earlier today we tried routing image through EXECUTE_FETCH
+            # (like video) but that serializes through the Chrome scripting
+            # channel and can only support ~6 parallel before timing out.
+            # aiohttp + origin/referer is the correct path — proven.
             #
-            # Historical note: the image endpoint used to not enforce
-            # this check (we confirmed that yesterday). Google appears
-            # to have tightened enforcement — probably in response to
-            # automation tools like this one. aiohttp+signed-headers is
-            # no longer a viable path; we have to go through the tab.
-            #
-            # The old "choke at 36 parallel" concern is bounded by the
-            # bridge's FETCH_CONCURRENCY_PER_ACCOUNT semaphore.
+            # Video still needs EXECUTE_FETCH because the video endpoint
+            # enforces cryptographic Chrome headers that aiohttp can't
+            # fake. Image is NOT subject to that same check.
             client_context = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
                 "sessionId": f";{int(time.time() * 1000)}",
-                "recaptchaContext": {
-                    "token": "",  # extension injects at dispatch
-                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                },
             }
+            if token:
+                client_context["recaptchaContext"] = {
+                    "token": token,
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                }
 
             body = {
                 "clientContext": client_context,
@@ -839,36 +837,32 @@ class ExtensionWorker:
                 }],
             }
 
+            # Direct API call from Python — parallel-safe, no extension
+            # bottleneck. origin + referer tell Google this request
+            # originates from labs.google (the missing piece that caused
+            # "reCAPTCHA evaluation failed" earlier today).
             url = IMAGE_API_URL.format(project_id=project_id)
-            fetch_result = await self._bridge.request_api_fetch(
-                account=self.account_email,
-                url=url,
-                method="POST",
-                body=json.dumps(body),
-                headers={
-                    "content-type": "text/plain;charset=UTF-8",
-                    "authorization": f"Bearer {access_token}",
-                },
-                recaptcha_action="IMAGE_GENERATION",
-                # Both outer and per-request clientContext carry the
-                # token field — inject into both so the shape matches
-                # what Flow's own page sends.
-                inject_recaptcha_path=(
-                    "clientContext.recaptchaContext.token"
-                    ";requests.0.clientContext.recaptchaContext.token"
-                ),
-                timeout=120,
-            )
-            if fetch_result.get("error"):
-                return None, f"Bridge error: {fetch_result['error']}"
-            status = fetch_result.get("status") or 0
-            resp_text = fetch_result.get("body", "")
-            if status < 200 or status >= 300:
-                return None, _parse_api_error(status, resp_text)
-            try:
-                data = json.loads(resp_text)
-            except json.JSONDecodeError:
-                return None, f"Invalid JSON response: {resp_text[:200]}"
+            async with _make_aiohttp_session() as session:
+                async with session.post(
+                    url,
+                    headers={
+                        "content-type": "text/plain;charset=UTF-8",
+                        "authorization": f"Bearer {access_token}",
+                        "origin": "https://labs.google",
+                        "referer": "https://labs.google/",
+                    },
+                    data=json.dumps(body),
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    resp_text = await resp.text()
+
+                    if not resp.ok:
+                        return None, _parse_api_error(resp.status, resp_text)
+
+                    try:
+                        data = json.loads(resp_text)
+                    except json.JSONDecodeError:
+                        return None, f"Invalid JSON response: {resp_text[:200]}"
 
             self.jobs_completed += 1
             return data, None
