@@ -164,7 +164,15 @@ def _parse_api_error(status_code: int, resp_text: str) -> str:
 
     # ── 429 Rate Limit ──
     if status_code == 429:
-        return "🕐 Rate Limited (429) — Too many requests. Account needs cooldown."
+        # Surface whatever detail Google sends alongside the 429 so we can
+        # tell apart: "burst rate limit" (recovers in ~60s), "quota used
+        # up" (recovers at midnight PT), "account flagged" (persistent),
+        # and "reCAPTCHA-derived throttle" (need score recovery). Without
+        # the detail every 429 looks the same and we chase the wrong fix.
+        body_preview = resp_text[:300] if resp_text else ""
+        detail_preview = detail[:200] if detail else ""
+        shown = detail_preview or body_preview or "no body"
+        return f"🕐 Rate Limited (429) — {shown}"
 
     # ── 500+ Server Errors ──
     if status_code >= 500:
