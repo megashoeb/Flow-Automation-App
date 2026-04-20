@@ -95,6 +95,18 @@ class ExtensionBridge:
         # their own risk. Generation allowed, warmup still blocked.
         self._force_enabled_accounts: set = set()
 
+        # ─── EXECUTE_FETCH concurrency limiter ───────────────────────
+        # Each EXECUTE_FETCH routes through the extension's MAIN-world
+        # script injection + native fetch, which is serialized per tab
+        # on the Chrome scripting channel. If we let 40 image-gen jobs
+        # fire simultaneously they all pile up on one channel and time
+        # out. Cap concurrent in-flight EXECUTE_FETCH per account to
+        # something the extension can comfortably drain (~6 keeps the
+        # channel saturated without starving anyone). Jobs beyond the
+        # cap wait their turn via the semaphore — they don't fail.
+        self._fetch_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self.FETCH_CONCURRENCY_PER_ACCOUNT = 6
+
     # ═══════════════════════════════════════════════════════════════
     # Lifecycle
     # ═══════════════════════════════════════════════════════════════
@@ -258,34 +270,44 @@ class ExtensionBridge:
                 "held": True,
             }
 
-        self._request_counter += 1
-        request_id = f"fetch_{self._request_counter}_{int(time.time())}"
+        # Acquire the per-account EXECUTE_FETCH slot — prevents burst
+        # traffic from choking the single Chrome scripting channel per
+        # tab. Extra callers block on the semaphore (no timeout here),
+        # and the outer `timeout` below still bounds total wait time.
+        semaphore = self._fetch_semaphores.get(account)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(self.FETCH_CONCURRENCY_PER_ACCOUNT)
+            self._fetch_semaphores[account] = semaphore
 
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
+        async with semaphore:
+            self._request_counter += 1
+            request_id = f"fetch_{self._request_counter}_{int(time.time())}"
 
-        self._pending_requests[request_id] = {
-            "account": account,
-            "action": "EXECUTE_FETCH",
-            "fetch_url": url,
-            "fetch_method": method,
-            "fetch_body": body,
-            "fetch_headers": dict(headers or {}),
-            "recaptcha_action": recaptcha_action,
-            "inject_recaptcha_path": inject_recaptcha_path,
-            "future": future,
-            "created": time.time(),
-            "_failed_ext_keys": set(),
-            "_reroute_count": 0,
-        }
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
 
-        try:
-            result = await asyncio.wait_for(future, timeout=timeout)
-            return result
-        except asyncio.TimeoutError:
-            self._pending_requests.pop(request_id, None)
-            self._dispatched_to.pop(request_id, None)
-            return {"error": "timeout"}
+            self._pending_requests[request_id] = {
+                "account": account,
+                "action": "EXECUTE_FETCH",
+                "fetch_url": url,
+                "fetch_method": method,
+                "fetch_body": body,
+                "fetch_headers": dict(headers or {}),
+                "recaptcha_action": recaptcha_action,
+                "inject_recaptcha_path": inject_recaptcha_path,
+                "future": future,
+                "created": time.time(),
+                "_failed_ext_keys": set(),
+                "_reroute_count": 0,
+            }
+
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout)
+                return result
+            except asyncio.TimeoutError:
+                self._pending_requests.pop(request_id, None)
+                self._dispatched_to.pop(request_id, None)
+                return {"error": "timeout"}
 
     def send_command(self, command_type: str, account: str = "", data: Any = None):
         """Queue a command for the extension (cookie clear, reload, etc.)."""
