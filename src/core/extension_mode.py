@@ -984,6 +984,18 @@ class ExtensionWorker:
                     "cropCoordinates": {"top": 0, "left": 0, "bottom": 1, "right": 1},
                 }
 
+            # Loud log showing EXACTLY what's about to be submitted — one
+            # line per POST so we can correlate tool output to Flow
+            # dashboard 1:1. If user sees N videos in dashboard but only
+            # N/15 of these lines in the log, that's server-side (pre-
+            # existing Google queue) rather than tool-side duplication.
+            self._log(
+                f"[{self.slot_id}] 📤 POST #1 to video API — "
+                f"batchId={batch_id[:8]}… seed={seed} "
+                f"model={api_model} ref={ref_media_id or start_media_id or end_media_id or '(none)'} "
+                f"prompt={prompt[:40]!r}"
+            )
+
             body = {
                 "mediaGenerationContext": {
                     "batchId": batch_id,
