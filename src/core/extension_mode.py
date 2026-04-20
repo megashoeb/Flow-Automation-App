@@ -2045,6 +2045,37 @@ class ExtensionModeManager:
                     self._log(f"[{worker.slot_id}] Content blocked by moderation — not retrying.")
                     break
 
+                # Network-level failure ("Bridge error: fetch_failed",
+                # "timeout", "network error"). We CANNOT know whether
+                # Google actually received the request — the fetch may
+                # have completed server-side but our connection dropped
+                # before the response came back. Retrying would re-upload
+                # the reference image AND re-submit the video request,
+                # creating a duplicate video on Google's side and a
+                # duplicate reference asset in the Flow project. Fail
+                # the job fast instead so the user can decide to retry
+                # once they confirm Google didn't process the first try.
+                if any(marker in last_error for marker in (
+                    "fetch_failed",
+                    "Bridge error: timeout",
+                    "Failed to fetch",
+                    "Bridge error: no_labs_tab",
+                )):
+                    self._log(
+                        f"[{worker.slot_id}] Network-level failure — not retrying "
+                        f"(Google may have received the first request). "
+                        f"Marking failed; use Retry Failed to re-queue manually."
+                    )
+                    update_job_status(
+                        job_id, "failed", account=worker.account_email,
+                        error=f"Network error (unsafe to retry): {last_error[:150]}",
+                    )
+                    self.qm.signals.job_updated.emit(
+                        job_id, "failed", worker.account_email,
+                        f"Network error: {last_error[:100]}",
+                    )
+                    return
+
                 # MODEL_ACCESS_DENIED — account just doesn't have access to
                 # this model (e.g. Veo video on a free Gmail). Retrying is
                 # pointless and burns reCAPTCHA score, which then trips
