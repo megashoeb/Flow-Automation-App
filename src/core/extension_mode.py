@@ -787,34 +787,27 @@ class ExtensionWorker:
                 except Exception as e:
                     return None, f"Reference upload failed: {str(e)[:200]}"
 
-            # Image gen now routes through the extension's EXECUTE_FETCH
-            # path (same as video). Direct aiohttp was the original path
-            # for throughput reasons, but Google's anti-abuse system on
-            # the image endpoint also now requires the cryptographically
-            # signed Chrome headers (x-browser-validation, x-client-data,
-            # sec-fetch-*) that aiohttp can't produce — manifesting as
-            # reCAPTCHA score-too-low + 429 bursts even on a fresh,
-            # properly-warmed account. Native fetch() inside the labs
-            # tab picks up all the right headers automatically.
-            #
-            # The old choke-at-36-parallel problem is now bounded by the
-            # bridge's per-account EXECUTE_FETCH semaphore (see
-            # extension_bridge.FETCH_CONCURRENCY_PER_ACCOUNT). Extra jobs
-            # wait their turn instead of timing out.
-            #
-            # The reCAPTCHA token is minted FRESH inside the labs tab by
-            # the extension (pre-warmup cluster + MAIN-world execute) and
-            # injected at dispatch time — empty `token` below is filled
-            # in by the bridge via `inject_recaptcha_path`.
+            # Image gen uses the original aiohttp + pool-token path.
+            # The video EXECUTE_FETCH migration was needed because the
+            # video endpoint enforced cryptographic Chrome headers (causing
+            # 403 PUBLIC_ERROR_UNUSUAL_ACTIVITY); the image endpoint never
+            # had that check. Routing image through EXECUTE_FETCH funnels
+            # all parallel slots through the single Chrome scripting
+            # channel + reCAPTCHA tab, which chokes at ~6 simultaneous
+            # requests and produces "Bridge error: timeout" for the rest.
+            # Pool tokens + parallel aiohttp recovers the original
+            # 15-20 parallel throughput. Warmup aggression is already
+            # dialed back elsewhere to keep reCAPTCHA scores healthy.
             client_context = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
                 "sessionId": f";{int(time.time() * 1000)}",
-                "recaptchaContext": {
-                    "token": "",  # extension fills this in
-                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                },
             }
+            if token:
+                client_context["recaptchaContext"] = {
+                    "token": token,
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                }
 
             body = {
                 "clientContext": client_context,
@@ -834,35 +827,29 @@ class ExtensionWorker:
                 }],
             }
 
+            # Direct API call from Python — parallel-safe, no extension bottleneck.
+            # Uses the certifi-backed SSL context helper so Windows bundled
+            # Python verifies Google's cert chain correctly.
             url = IMAGE_API_URL.format(project_id=project_id)
-            fetch_result = await self._bridge.request_api_fetch(
-                account=self.account_email,
-                url=url,
-                method="POST",
-                body=json.dumps(body),
-                headers={
-                    "content-type": "text/plain;charset=UTF-8",
-                    "authorization": f"Bearer {access_token}",
-                },
-                recaptcha_action="IMAGE_GENERATION",
-                # Two paths so both the outer and the per-request
-                # recaptchaContext.token fields get the fresh token.
-                inject_recaptcha_path=(
-                    "clientContext.recaptchaContext.token"
-                    ";requests.0.clientContext.recaptchaContext.token"
-                ),
-                timeout=120,
-            )
-            if fetch_result.get("error"):
-                return None, f"Bridge error: {fetch_result['error']}"
-            status = fetch_result.get("status") or 0
-            resp_text = fetch_result.get("body", "")
-            if status < 200 or status >= 300:
-                return None, _parse_api_error(status, resp_text)
-            try:
-                data = json.loads(resp_text)
-            except json.JSONDecodeError:
-                return None, f"Invalid JSON response: {resp_text[:200]}"
+            async with _make_aiohttp_session() as session:
+                async with session.post(
+                    url,
+                    headers={
+                        "content-type": "text/plain;charset=UTF-8",
+                        "authorization": f"Bearer {access_token}",
+                    },
+                    data=json.dumps(body),
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    resp_text = await resp.text()
+
+                    if not resp.ok:
+                        return None, _parse_api_error(resp.status, resp_text)
+
+                    try:
+                        data = json.loads(resp_text)
+                    except json.JSONDecodeError:
+                        return None, f"Invalid JSON response: {resp_text[:200]}"
 
             self.jobs_completed += 1
             return data, None
