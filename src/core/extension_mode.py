@@ -787,27 +787,39 @@ class ExtensionWorker:
                 except Exception as e:
                     return None, f"Reference upload failed: {str(e)[:200]}"
 
-            # Image gen uses the original aiohttp + pool-token path.
-            # The video EXECUTE_FETCH migration was needed because the
-            # video endpoint enforced cryptographic Chrome headers (causing
-            # 403 PUBLIC_ERROR_UNUSUAL_ACTIVITY); the image endpoint never
-            # had that check. Routing image through EXECUTE_FETCH funnels
-            # all parallel slots through the single Chrome scripting
-            # channel + reCAPTCHA tab, which chokes at ~6 simultaneous
-            # requests and produces "Bridge error: timeout" for the rest.
-            # Pool tokens + parallel aiohttp recovers the original
-            # 15-20 parallel throughput. Warmup aggression is already
-            # dialed back elsewhere to keep reCAPTCHA scores healthy.
+            # Image gen routes through EXECUTE_FETCH (same as video).
+            #
+            # Why: manual generation works on the same accounts that our
+            # aiohttp path fails on with "reCAPTCHA evaluation failed".
+            # Google's Enterprise reCAPTCHA binds the token to the
+            # Chrome browser fingerprint AT MINT TIME and then verifies
+            # the request carries the matching signed headers
+            # (x-browser-validation, x-client-data, sec-fetch-*) AT
+            # EVALUATION TIME. Python's aiohttp can't produce those
+            # cryptographic headers, so the token mints fine but gets
+            # rejected when the request arrives without the matching
+            # fingerprint. Native fetch() inside the labs tab (via
+            # chrome.scripting.executeScript) is what Chrome treats as
+            # "the page itself made the request" — same as a manual
+            # click — so the headers match and the token passes.
+            #
+            # Historical note: the image endpoint used to not enforce
+            # this check (we confirmed that yesterday). Google appears
+            # to have tightened enforcement — probably in response to
+            # automation tools like this one. aiohttp+signed-headers is
+            # no longer a viable path; we have to go through the tab.
+            #
+            # The old "choke at 36 parallel" concern is bounded by the
+            # bridge's FETCH_CONCURRENCY_PER_ACCOUNT semaphore.
             client_context = {
                 "projectId": project_id,
                 "tool": "PINHOLE",
                 "sessionId": f";{int(time.time() * 1000)}",
-            }
-            if token:
-                client_context["recaptchaContext"] = {
-                    "token": token,
+                "recaptchaContext": {
+                    "token": "",  # extension injects at dispatch
                     "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
-                }
+                },
+            }
 
             body = {
                 "clientContext": client_context,
@@ -827,29 +839,36 @@ class ExtensionWorker:
                 }],
             }
 
-            # Direct API call from Python — parallel-safe, no extension bottleneck.
-            # Uses the certifi-backed SSL context helper so Windows bundled
-            # Python verifies Google's cert chain correctly.
             url = IMAGE_API_URL.format(project_id=project_id)
-            async with _make_aiohttp_session() as session:
-                async with session.post(
-                    url,
-                    headers={
-                        "content-type": "text/plain;charset=UTF-8",
-                        "authorization": f"Bearer {access_token}",
-                    },
-                    data=json.dumps(body),
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    resp_text = await resp.text()
-
-                    if not resp.ok:
-                        return None, _parse_api_error(resp.status, resp_text)
-
-                    try:
-                        data = json.loads(resp_text)
-                    except json.JSONDecodeError:
-                        return None, f"Invalid JSON response: {resp_text[:200]}"
+            fetch_result = await self._bridge.request_api_fetch(
+                account=self.account_email,
+                url=url,
+                method="POST",
+                body=json.dumps(body),
+                headers={
+                    "content-type": "text/plain;charset=UTF-8",
+                    "authorization": f"Bearer {access_token}",
+                },
+                recaptcha_action="IMAGE_GENERATION",
+                # Both outer and per-request clientContext carry the
+                # token field — inject into both so the shape matches
+                # what Flow's own page sends.
+                inject_recaptcha_path=(
+                    "clientContext.recaptchaContext.token"
+                    ";requests.0.clientContext.recaptchaContext.token"
+                ),
+                timeout=120,
+            )
+            if fetch_result.get("error"):
+                return None, f"Bridge error: {fetch_result['error']}"
+            status = fetch_result.get("status") or 0
+            resp_text = fetch_result.get("body", "")
+            if status < 200 or status >= 300:
+                return None, _parse_api_error(status, resp_text)
+            try:
+                data = json.loads(resp_text)
+            except json.JSONDecodeError:
+                return None, f"Invalid JSON response: {resp_text[:200]}"
 
             self.jobs_completed += 1
             return data, None

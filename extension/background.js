@@ -278,22 +278,28 @@ async function handleWork(work) {
                 await new Promise((r) => enterprise.ready(r));
               }
 
-              // Pre-warmup cluster for VIDEO_GENERATION. The video
-              // endpoint runs a stricter score check than image — a
-              // tight 3×80-200ms cluster used to be enough, but logs
-              // show it's back to rejecting cluster-boosted tokens.
-              // Beefing it up to mimic natural "user opens generate
-              // dialog, mouses over options, clicks" timing:
-              //   - 500-1000ms think time before any warmup fires
-              //   - 5 warmup calls (was 3)
-              //   - 200-500ms jittered gap between (was 80-200ms)
-              //   - 200-400ms settle before real mint
-              // Total cluster window: ~1.8-3.5s vs the old ~0.6s.
+              // Pre-warmup cluster for BOTH image and video now.
+              // Google tightened reCAPTCHA enforcement on the image
+              // endpoint (previously lax) — "reCAPTCHA evaluation
+              // failed" 429s appeared on aiohttp-image once account
+              // trust degraded slightly. Moving image to EXECUTE_FETCH
+              // means image requests also need the cluster-boost so
+              // the token scores well at mint time.
               //
-              // Image skips the cluster — image endpoint passes fine
-              // with just the pool-mint cluster, and adding more here
-              // would only inflate the grecaptcha call rate.
-              const NEEDS_WARMUP_CLUSTER = captchaAction === "VIDEO_GENERATION";
+              // Pattern mimics natural "user opens dialog, mouses over
+              // options, clicks" timing instead of a 500ms burst:
+              //   - 500-1000ms think time before any warmup fires
+              //   - 5 warmup calls with 200-500ms jittered gaps
+              //   - Mixed action vocabulary (IMAGE/VIDEO_GENERATION
+              //     plus real page actions like homepage/select_model/
+              //     generate) so the call distribution doesn't itself
+              //     look synthetic
+              //   - 200-400ms settle before the real mint
+              // Total cluster window: ~1.8-3.5s.
+              const NEEDS_WARMUP_CLUSTER = (
+                captchaAction === "VIDEO_GENERATION" ||
+                captchaAction === "IMAGE_GENERATION"
+              );
               if (NEEDS_WARMUP_CLUSTER) {
                 // Think time — simulates user pausing before clicking
                 await new Promise((r) => setTimeout(r, 500 + Math.random() * 500));
