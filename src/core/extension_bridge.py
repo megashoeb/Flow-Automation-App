@@ -68,13 +68,21 @@ class ExtensionBridge:
         # Pool sizing history:
         #   d9d752b introduced pool with target=5.
         #   18ee523 bumped to 10 for video burst dispatch.
-        #   (my 20 Apr edit)   trimmed to 3 hoping to reduce bot-fingerprint
-        #     — that was wrong. Logs showed the real failure was reCAPTCHA
-        #     score-too-low (pool tokens aging past the score threshold
-        #     between bulk dispatches, not too many mints). Restoring 5
-        #     matches the original "15-20 parallel worked" state while
-        #     staying below the 10 level that was never strictly needed.
-        self.TOKEN_POOL_TARGET = 5   # target pre-fetched tokens per (account, action)
+        #   target=3 experiment (20 Apr) — wrong direction.
+        #   target=5 restore — still saw "reCAPTCHA Score Too Low" in
+        #     production logs. Diagnosis: pool tokens sit for 7-13s
+        #     before use. Even with the pre-warmup cluster boosting the
+        #     score at mint time, Google's v3 score decays between mint
+        #     and evaluation when the tab has zero real user interaction.
+        #     Manual generation works because the click-to-mint-to-API
+        #     window is ~500ms — the boosted score is still fresh.
+        #   target=0 (this commit) — disable pool entirely. Every token
+        #     mints on-demand right before use. Token age at evaluation
+        #     ~1s instead of ~10s. Trade-off is serialized mint latency
+        #     (~1s per request through the scripting channel), but the
+        #     2-3s dispatch stagger already gates us at that rate, so
+        #     throughput is effectively unchanged.
+        self.TOKEN_POOL_TARGET = 0   # 0 = no prefetch, mint on-demand
         self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
         # Which actions to keep prefetched. Both image and video are common
         # enough to benefit from a hot pool; less-common actions fall through
