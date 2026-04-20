@@ -3634,8 +3634,17 @@ class MainWindow(QMainWindow):
             ("Portrait (3:4)", "Portrait (3:4)"),
             ("Tall Portrait (9:16)", "Tall Portrait (9:16)"),
         ], current_data="Landscape (16:9)")
+        # Outputs per pipeline prompt — mirrors the other tabs so user
+        # can choose how many image variants to generate per Step 1.
+        # Default x1 (save credits). Pipeline feeds the FIRST media_id
+        # to Step 2 regardless of count, so x2+ gives more thumbnails
+        # saved but only one proceeds to video.
+        self.pipe_cmb_img_outputs = self._create_setting_combo(
+            [("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1,
+        )
         form1.addRow(self._make_setting_label("Image Model:"), self.pipe_cmb_img_model)
         form1.addRow(self._make_setting_label("Image Ratio:"), self.pipe_cmb_img_ratio)
+        form1.addRow(self._make_setting_label("Image Outputs:"), self.pipe_cmb_img_outputs)
 
         pipe_ref_header = QHBoxLayout()
         self.pipe_btn_add_refs = QPushButton("+ Add Reference Image(s)")
@@ -3699,11 +3708,18 @@ class MainWindow(QMainWindow):
             ("1080p (Free)", "1080p"),
             ("4K (+50)", "4k"),
         ], current_data="none")
+        # Outputs per video prompt — same semantics as the other tabs.
+        # x1 by default to keep credit burn predictable. x2+ multiplies
+        # video credits accordingly (estimate updates live).
+        self.pipe_cmb_vid_outputs = self._create_setting_combo(
+            [("x1", 1), ("x2", 2), ("x3", 3), ("x4", 4)], current_data=1,
+        )
         self.pipe_cmb_parallel = self._create_parallel_combo(saved_slots)
 
         form2.addRow(self._make_setting_label("Video Mode:"), self.pipe_cmb_vid_mode)
         form2.addRow(self._make_setting_label("Video Quality:"), self.pipe_cmb_vid_quality)
         form2.addRow(self._make_setting_label("Video Ratio:"), self.pipe_cmb_vid_ratio)
+        form2.addRow(self._make_setting_label("Video Outputs:"), self.pipe_cmb_vid_outputs)
         form2.addRow(self._make_setting_label("Video Prompt:"), self.pipe_txt_vid_prompt)
         form2.addRow(
             self._make_setting_label("Upscale:"),
@@ -9784,6 +9800,8 @@ class MainWindow(QMainWindow):
             "t2v_cmb_outputs",
             "ref_cmb_outputs",
             "frm_cmb_outputs",
+            "pipe_cmb_img_outputs",
+            "pipe_cmb_vid_outputs",
             "pipe_cmb_vid_ratio",
         )
         if not hasattr(self, "mode_tabs") or not all(hasattr(self, name) for name in required_controls):
@@ -9901,11 +9919,18 @@ class MainWindow(QMainWindow):
         ref_paths = list(getattr(self, "current_pipe_ref_paths", []) or [])
         image_model = str(self.pipe_cmb_img_model.currentText() or "Imagen 4")
         video_model = str(self.pipe_cmb_vid_quality.currentText() or "Veo 3.1 - Fast")
+        # Per-prompt output counts — mirror the other tabs' dropdowns.
+        # Fallback to 1 if the combo hasn't been created yet (early
+        # init paths can hit this code before the widget exists).
+        img_outputs_combo = getattr(self, "pipe_cmb_img_outputs", None)
+        vid_outputs_combo = getattr(self, "pipe_cmb_vid_outputs", None)
+        img_output_count = int(img_outputs_combo.currentData() or 1) if img_outputs_combo is not None else 1
+        vid_output_count = int(vid_outputs_combo.currentData() or 1) if vid_outputs_combo is not None else 1
         return {
             "job_type": "pipeline",
             "model": image_model,
             "aspect_ratio": str(self.pipe_cmb_img_ratio.currentData() or self.pipe_cmb_img_ratio.currentText() or "Landscape (16:9)"),
-            "output_count": 1,
+            "output_count": img_output_count,
             "ref_path": ref_paths[0] if ref_paths else None,
             "ref_paths": ref_paths,
             "video_model": video_model,
@@ -9913,7 +9938,7 @@ class MainWindow(QMainWindow):
             "video_ratio": str(self.pipe_cmb_vid_ratio.currentData() or self.pipe_cmb_vid_ratio.currentText() or "Landscape (16:9)"),
             "video_prompt": str(self.pipe_txt_vid_prompt.text() or "").strip() or "animate",
             "video_upscale": str(self.pipe_cmb_upscale.currentData() or "none"),
-            "video_output_count": 1,
+            "video_output_count": vid_output_count,
             "start_image_path": None,
             "end_image_path": None,
         }
