@@ -24,7 +24,24 @@ let bridgeConnected = false;
 let connectedAccounts = {};  // tabId → { email, name, access_token, project_id }
 let tokenCount = 0;
 let lastPollError = "";
-let _workInProgress = false;  // serialization lock — only one handleWork at a time
+
+// Per-tab in-flight counter — each tab's scripting channel can only run
+// one `chrome.scripting.executeScript` at a time, so we track how many
+// work items are currently routing through each tab. findLabsTab() uses
+// this to pick the least-busy matching tab for the target account,
+// enabling true parallel dispatch when the user opens multiple labs
+// tabs for the same account.
+const _tabInFlight = {};      // tabId → number of in-flight work items
+
+function _incTabInFlight(tabId) {
+  if (!tabId) return;
+  _tabInFlight[tabId] = (_tabInFlight[tabId] || 0) + 1;
+}
+
+function _decTabInFlight(tabId) {
+  if (!tabId) return;
+  _tabInFlight[tabId] = Math.max(0, (_tabInFlight[tabId] || 0) - 1);
+}
 
 // ─── reCAPTCHA readiness cache (30s validity) ───
 const _recaptchaCache = {};  // tabId → { valid: bool, ts: timestamp }
@@ -126,15 +143,17 @@ async function pollBridge() {
       }).catch(() => {});
     }
 
-    // Handle pending work (token request) — serialize to avoid
-    // 6 concurrent executeScript calls on the same tab hanging Chrome
-    if (data.work && !_workInProgress) {
-      _workInProgress = true;
-      try {
-        await handleWork(data.work);
-      } finally {
-        _workInProgress = false;
-      }
+    // Handle pending work — fire-and-forget so multiple polls can
+    // dispatch different items in parallel. Per-tab serialization is
+    // enforced naturally by Chrome's scripting channel; findLabsTab()
+    // uses _tabInFlight to route each item to the least-busy matching
+    // tab so load spreads across tabs instead of piling on tab #1.
+    // A single tab account still behaves exactly as before (all items
+    // queue onto that one tab's channel).
+    if (data.work) {
+      handleWork(data.work).catch((e) => {
+        console.error("[handleWork]", e);
+      });
     }
 
     // Handle commands (cookie clear, tab reload, etc.)
@@ -185,12 +204,20 @@ async function handleWork(work) {
   //     why a Python aiohttp request with a valid reCAPTCHA token still
   //     gets rejected with PUBLIC_ERROR_UNUSUAL_ACTIVITY. ───
   if (action === "EXECUTE_FETCH") {
+    let selectedTabId = null;
     try {
       const tabId = await findLabsTab(account);
       if (!tabId) {
         await submitResult(request_id, { error: "no_labs_tab" });
         return;
       }
+      // Reserve this tab's in-flight slot the moment we commit to it,
+      // so a concurrent findLabsTab call for another job sees this tab
+      // as busier and prefers a different one. The slot is released in
+      // the outer finally block regardless of success/error/exception.
+      selectedTabId = tabId;
+      _incTabInFlight(tabId);
+
       const fetchUrl = work.fetch_url;
       const fetchMethod = work.fetch_method || "POST";
       const fetchBody = work.fetch_body || "";
@@ -357,6 +384,8 @@ async function handleWork(work) {
     } catch (e) {
       await submitResult(request_id, { error: "execute_fetch_threw: " + (e?.message || e) });
       return;
+    } finally {
+      _decTabInFlight(selectedTabId);
     }
   }
 
@@ -745,15 +774,23 @@ async function findLabsTab(targetAccount) {
 
   // If specific account requested, find matching tab with reCAPTCHA ready
   if (targetAccount) {
-    // Check cache first — but also verify reCAPTCHA is ready
+    // Collect ALL tabs matching this account with reCAPTCHA ready, then
+    // pick the one with the fewest in-flight work items. Enables parallel
+    // dispatch when the user has opened multiple labs.google.com tabs for
+    // the same account — each tab's scripting channel runs independently,
+    // so 3 tabs ≈ 3x throughput without touching the same-tab serialization.
+    const ready = [];
     for (const tab of tabs) {
       const cached = connectedAccounts[tab.id];
       if (cached && cached.email === targetAccount) {
         if (await checkRecaptchaReady(tab.id)) {
-          return tab.id;
+          ready.push(tab.id);
         }
-        // reCAPTCHA not ready on this tab — try others
       }
+    }
+    if (ready.length) {
+      ready.sort((a, b) => (_tabInFlight[a] || 0) - (_tabInFlight[b] || 0));
+      return ready[0];
     }
 
     // Cache miss — check each tab via script

@@ -97,15 +97,17 @@ class ExtensionBridge:
 
         # ─── EXECUTE_FETCH concurrency limiter ───────────────────────
         # Each EXECUTE_FETCH routes through the extension's MAIN-world
-        # script injection + native fetch, which is serialized per tab
-        # on the Chrome scripting channel. If we let 40 image-gen jobs
-        # fire simultaneously they all pile up on one channel and time
-        # out. Cap concurrent in-flight EXECUTE_FETCH per account to
-        # something the extension can comfortably drain (~6 keeps the
-        # channel saturated without starving anyone). Jobs beyond the
-        # cap wait their turn via the semaphore — they don't fail.
+        # script injection + native fetch, which is serialized per
+        # Chrome scripting channel — one channel per TAB. The extension
+        # now routes each work item to the least-busy matching tab via
+        # findLabsTab(), so if the user opens N labs.google.com tabs
+        # for the same account they get ~N parallel channels instead of
+        # one. This cap must be high enough to saturate a multi-tab
+        # setup (3 tabs × 4 concurrent per tab ≈ 12) but low enough that
+        # a single-tab account doesn't burst past what Chrome's one
+        # scripting channel can drain. 12 is the sweet spot for 1-4 tabs.
         self._fetch_semaphores: Dict[str, asyncio.Semaphore] = {}
-        self.FETCH_CONCURRENCY_PER_ACCOUNT = 6
+        self.FETCH_CONCURRENCY_PER_ACCOUNT = 12
 
     # ═══════════════════════════════════════════════════════════════
     # Lifecycle
