@@ -278,23 +278,28 @@ async function handleWork(work) {
                 await new Promise((r) => enterprise.ready(r));
               }
 
-              // Pre-warmup: fire 3 quick execute() calls with random
-              // actions before minting the real token. Real labs.google
-              // pages cluster execute() calls (we've measured 6000+/min)
-              // — a single isolated call statistically scores lower than
-              // one inside a natural cluster. The warmup tokens are
-              // discarded; only the real token gets injected. This
-              // dramatically cuts the random-variance reCAPTCHA failures
-              // that happened ~1-in-7 even with the EXECUTE_FETCH route.
-              const WARMUP_ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
-              for (let i = 0; i < 3; i++) {
-                try {
-                  const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
-                  // Fire-and-forget — don't await each one fully, but do
-                  // wait a tiny jittered gap so the cluster looks natural.
-                  enterprise.execute(siteKey, { action: wAction }).catch(() => {});
-                  await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
-                } catch {}
+              // Pre-warmup cluster: fire 3 quick execute() calls with
+              // random actions before the real token. This helps the
+              // score for VIDEO_GENERATION (the video endpoint is the
+              // stricter check that used to fail ~1-in-7 even via
+              // EXECUTE_FETCH). But for IMAGE_GENERATION the same
+              // cluster is pure overhead — image gen survived fine
+              // without it historically, and piling 3 extra execute()
+              // calls on top of pool prefetch + the background warmup
+              // loop is what pushed us past Google's bot-detection
+              // threshold. Skip the cluster unless we really need it.
+              const NEEDS_WARMUP_CLUSTER = captchaAction === "VIDEO_GENERATION";
+              if (NEEDS_WARMUP_CLUSTER) {
+                const WARMUP_ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
+                for (let i = 0; i < 3; i++) {
+                  try {
+                    const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
+                    // Fire-and-forget — don't await each one fully, but do
+                    // wait a tiny jittered gap so the cluster looks natural.
+                    enterprise.execute(siteKey, { action: wAction }).catch(() => {});
+                    await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+                  } catch {}
+                }
               }
 
               // Now mint the REAL token — fresh + with warm score
@@ -2114,8 +2119,13 @@ async function installFlowRecaptchaWarmup() {
           window.__glabsRecaptchaWarmupActive = true;
 
           const ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
-          const MIN_DELAY_MS = 1500;
-          const MAX_DELAY_MS = 3500;
+          // Slower warmup cadence — the original 1.5-3.5s loop compounded
+          // with pool prefetch + per-request pre-warmup cluster pushed
+          // each account past ~40 grecaptcha.execute() calls/min, which
+          // Google's reCAPTCHA Enterprise flags as bot-like. 20-40s
+          // keeps the score primed without looking programmatic.
+          const MIN_DELAY_MS = 20000;
+          const MAX_DELAY_MS = 40000;
 
           // Resolve the site key the same way our token code does, but
           // lazy — don't crash if the page hasn't fully loaded yet.
