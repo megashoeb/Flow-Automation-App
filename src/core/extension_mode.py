@@ -1402,14 +1402,15 @@ class ExtensionModeManager:
                     # window even when each request is individually clean
                     # (valid token + signed Chrome headers). Manual users
                     # can't click Generate 8 times per second; rate limit
-                    # kicks in on the pattern alone. We enforce a 0.8-1.5s
+                    # kicks in on the pattern alone. We enforce a 2-3s
                     # minimum gap between dispatches to the SAME account
-                    # so the request stream looks like a human's. Cross-
-                    # account dispatches still fire in parallel — their
-                    # sessions are independent.
+                    # so the request stream stays well inside Google's
+                    # ~40-60 req/min/account ceiling. Cross-account
+                    # dispatches still fire in parallel — their sessions
+                    # are independent.
                     last_ts = self._last_dispatch_ts.get(worker.account_email, 0.0)
                     elapsed = time.time() - last_ts
-                    min_gap = 0.8 + random.random() * 0.7  # 0.8–1.5s jittered
+                    min_gap = 2.0 + random.random() * 1.0  # 2.0–3.0s jittered
                     if last_ts and elapsed < min_gap:
                         await asyncio.sleep(min_gap - elapsed)
                     self._last_dispatch_ts[worker.account_email] = time.time()
