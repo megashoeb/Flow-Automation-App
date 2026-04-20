@@ -278,28 +278,39 @@ async function handleWork(work) {
                 await new Promise((r) => enterprise.ready(r));
               }
 
-              // Pre-warmup cluster: fire 3 quick execute() calls with
-              // random actions before the real token. This helps the
-              // score for VIDEO_GENERATION (the video endpoint is the
-              // stricter check that used to fail ~1-in-7 even via
-              // EXECUTE_FETCH). But for IMAGE_GENERATION the same
-              // cluster is pure overhead — image gen survived fine
-              // without it historically, and piling 3 extra execute()
-              // calls on top of pool prefetch + the background warmup
-              // loop is what pushed us past Google's bot-detection
-              // threshold. Skip the cluster unless we really need it.
+              // Pre-warmup cluster for VIDEO_GENERATION. The video
+              // endpoint runs a stricter score check than image — a
+              // tight 3×80-200ms cluster used to be enough, but logs
+              // show it's back to rejecting cluster-boosted tokens.
+              // Beefing it up to mimic natural "user opens generate
+              // dialog, mouses over options, clicks" timing:
+              //   - 500-1000ms think time before any warmup fires
+              //   - 5 warmup calls (was 3)
+              //   - 200-500ms jittered gap between (was 80-200ms)
+              //   - 200-400ms settle before real mint
+              // Total cluster window: ~1.8-3.5s vs the old ~0.6s.
+              //
+              // Image skips the cluster — image endpoint passes fine
+              // with just the pool-mint cluster, and adding more here
+              // would only inflate the grecaptcha call rate.
               const NEEDS_WARMUP_CLUSTER = captchaAction === "VIDEO_GENERATION";
               if (NEEDS_WARMUP_CLUSTER) {
-                const WARMUP_ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
-                for (let i = 0; i < 3; i++) {
+                // Think time — simulates user pausing before clicking
+                await new Promise((r) => setTimeout(r, 500 + Math.random() * 500));
+                const WARMUP_ACTIONS = [
+                  "IMAGE_GENERATION", "VIDEO_GENERATION",
+                  "homepage", "select_model", "generate",
+                ];
+                for (let i = 0; i < 5; i++) {
                   try {
                     const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
-                    // Fire-and-forget — don't await each one fully, but do
-                    // wait a tiny jittered gap so the cluster looks natural.
                     enterprise.execute(siteKey, { action: wAction }).catch(() => {});
-                    await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+                    await new Promise((r) => setTimeout(r, 200 + Math.random() * 300));
                   } catch {}
                 }
+                // Settle — tiny pause before the real mint so the
+                // cluster "decays" into the real click pattern
+                await new Promise((r) => setTimeout(r, 200 + Math.random() * 200));
               }
 
               // Now mint the REAL token — fresh + with warm score
