@@ -699,9 +699,29 @@ async function mainWorldExecute(action) {
         return result;
       }
 
-      // Ready + Execute — zero delays
+      // Ready + Execute
       if (typeof enterprise.ready === "function") {
         await new Promise((r) => enterprise.ready(r));
+      }
+
+      // Pre-warmup cluster — 3 fire-and-forget execute() calls before
+      // the real token mint. Real labs.google pages cluster execute()
+      // calls throughout normal UI (6000+/min measured), so a single
+      // isolated call scores lower than one inside a natural cluster.
+      // Critical for the POOL mint path because pool tokens get used
+      // seconds later by the aiohttp-image request — the tab's score
+      // baseline at mint time determines whether Google accepts the
+      // token at request time. Without this cluster, pool tokens come
+      // out cold and the real image request gets rejected with
+      // "reCAPTCHA Score Too Low" / "reCAPTCHA evaluation failed".
+      // EXECUTE_FETCH (video) already has its own inline cluster.
+      const WARMUP_ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
+      for (let i = 0; i < 3; i++) {
+        try {
+          const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
+          enterprise.execute(siteKey, { action: wAction }).catch(() => {});
+          await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+        } catch {}
       }
 
       const token = await enterprise.execute(siteKey, { action });
