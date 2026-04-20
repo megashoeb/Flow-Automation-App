@@ -3197,19 +3197,42 @@ class MainWindow(QMainWindow):
             )
             self.pipe_lbl_count.setStyleSheet("color: #F59E0B; font-size: 12px; padding: 4px 0;")
 
-    def _update_pipeline_video_quality_options(self, mode):
-        if not hasattr(self, "pipe_cmb_vid_quality"):
-            return
-        normalized_mode = str(mode or "ingredients").strip().lower() or "ingredients"
-        current_value = str(self.pipe_cmb_vid_quality.currentData() or "").strip()
-        self.pipe_cmb_vid_quality.blockSignals(True)
-        self.pipe_cmb_vid_quality.clear()
+    def _current_flow_plan(self):
+        """Read the currently-selected Flow plan (ultra/pro). Safe to call
+        before cmb_flow_plan exists — falls back to ultra (default).
+        """
+        combo = getattr(self, "cmb_flow_plan", None)
+        if combo is None:
+            return "ultra"
+        try:
+            value = combo.currentData()
+        except Exception:
+            value = None
+        if not value:
+            try:
+                value = combo.currentText()
+            except Exception:
+                value = None
+        return str(value or "ultra").strip().lower() or "ultra"
 
-        # Match labs.google.com Quality dropdown — Quality is available
-        # for ALL video sub-modes (ingredients, frames_start, etc.), not
-        # just frames_start. Previously only frames_start got the Quality
-        # entry which left Image→Video (ingredients) without it.
-        items = [
+    def _veo_tier_options_for_plan(self, plan):
+        """Return the list of (label, value) tier options Flow exposes
+        for the given plan. Verified via live captures on labs.google.com.
+
+        Ultra plan exposes all 5 tiers including the [Lower Pri] variants.
+        Pro plan exposes ONLY 3 tiers — no [Lower Pri] options exist in
+        Flow's official UI. Sending a _relaxed / _low_priority model on a
+        Pro account returns PUBLIC_ERROR_MODEL_ACCESS_DENIED.
+        """
+        plan_lower = str(plan or "ultra").strip().lower()
+        if plan_lower == "pro":
+            return [
+                ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
+                ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
+                ("Veo 3.1 - Quality", "Veo 3.1 - Quality"),
+            ]
+        # Ultra (default) — all 5 tiers
+        return [
             ("Veo 3.1 - Fast", "Veo 3.1 - Fast"),
             ("Veo 3.1 - Lite", "Veo 3.1 - Lite"),
             ("Veo 3.1 - Quality", "Veo 3.1 - Quality"),
@@ -3217,14 +3240,64 @@ class MainWindow(QMainWindow):
             ("Veo 3.1 - Lite [Lower Pri]", "Veo 3.1 - Lite [Lower Pri]"),
         ]
 
-        for label, value in items:
-            self.pipe_cmb_vid_quality.addItem(label, value)
+    def _repopulate_tier_combo(self, combo, items, default_value="Veo 3.1 - Fast"):
+        """Clear+refill a tier QComboBox while preserving the user's
+        selection if it's still valid under the new options. Falls back
+        to `default_value` when the old selection no longer exists
+        (e.g., Ultra user picks Fast [LP] then switches to Pro plan).
+        """
+        if combo is None:
+            return
+        current_value = ""
+        try:
+            current_value = str(combo.currentData() or combo.currentText() or "").strip()
+        except Exception:
+            current_value = ""
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for label, value in items:
+                combo.addItem(label, value)
+            restored_idx = combo.findData(current_value)
+            if restored_idx < 0:
+                # Try matching by visible label (in case only labels stored)
+                restored_idx = combo.findText(current_value)
+            if restored_idx < 0:
+                restored_idx = combo.findData(default_value)
+            if restored_idx < 0:
+                restored_idx = 0
+            combo.setCurrentIndex(max(0, restored_idx))
+        finally:
+            combo.blockSignals(False)
 
-        restored_idx = self.pipe_cmb_vid_quality.findData(current_value)
-        if restored_idx < 0:
-            restored_idx = 0
-        self.pipe_cmb_vid_quality.setCurrentIndex(restored_idx)
-        self.pipe_cmb_vid_quality.blockSignals(False)
+    def _apply_plan_tier_filter(self):
+        """Rebuild all 4 Veo quality dropdowns based on the current plan.
+        Called once at startup and again whenever the user flips the
+        Flow Account Plan dropdown.
+        """
+        plan = self._current_flow_plan()
+        items = self._veo_tier_options_for_plan(plan)
+        for attr in ("t2v_cmb_quality", "ref_cmb_quality", "frm_cmb_quality"):
+            combo = getattr(self, attr, None)
+            if combo is not None:
+                self._repopulate_tier_combo(combo, items)
+        # Pipeline dropdown has its own path (mode-aware) — re-run it so
+        # it picks up the new plan as well.
+        if hasattr(self, "pipe_cmb_vid_quality"):
+            mode = "ingredients"
+            if hasattr(self, "pipe_cmb_vid_mode"):
+                try:
+                    mode = str(self.pipe_cmb_vid_mode.currentData() or "ingredients")
+                except Exception:
+                    mode = "ingredients"
+            self._update_pipeline_video_quality_options(mode)
+
+    def _update_pipeline_video_quality_options(self, mode):
+        if not hasattr(self, "pipe_cmb_vid_quality"):
+            return
+        normalized_mode = str(mode or "ingredients").strip().lower() or "ingredients"
+        items = self._veo_tier_options_for_plan(self._current_flow_plan())
+        self._repopulate_tier_combo(self.pipe_cmb_vid_quality, items)
 
     def _on_pipeline_video_mode_changed(self, _index):
         mode = str(self.pipe_cmb_vid_mode.currentData() or "ingredients")
@@ -4801,6 +4874,17 @@ class MainWindow(QMainWindow):
             plan_idx = 0
         self.cmb_flow_plan.setCurrentIndex(plan_idx)
         browser_form.addRow(self._settings_label("Flow Account Plan"), self.cmb_flow_plan)
+        # Flow exposes DIFFERENT tier options per plan (verified live):
+        #   • Ultra → 5 tiers (Fast, Lite, Quality, Fast LP, Lite LP)
+        #   • Pro   → 3 tiers (Fast, Lite, Quality only — no LP variants)
+        # Reapply the filter whenever the user flips the plan so that the
+        # quality dropdowns throughout the app always mirror what Flow
+        # actually accepts. Also run it once now so the saved plan takes
+        # effect on the dropdowns created earlier in __init__.
+        self.cmb_flow_plan.currentIndexChanged.connect(
+            lambda _=None: self._apply_plan_tier_filter()
+        )
+        self._apply_plan_tier_filter()
 
         # Note: Genspark Model and Quality dropdowns live on the
         # Image Generation tab (per-job control) rather than here.

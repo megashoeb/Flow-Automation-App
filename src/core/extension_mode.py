@@ -212,6 +212,18 @@ def _normalize_video_sub_mode(video_sub_mode="", ref_path=None, start_image_path
 def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", ratio="", plan="ultra"):
     """Pick the correct video model key based on sub-mode, quality tier, and plan.
 
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ 📚 CANONICAL REFERENCE: docs/veo_model_mapping.md               │
+    │                                                                 │
+    │ All mapping decisions in this function are documented and       │
+    │ live-verified there. If the API ever returns MODEL_NOT_FOUND    │
+    │ or INVALID_MODEL, follow the "Quick re-verification ritual"     │
+    │ section in that doc to capture a fresh model name and update    │
+    │ both the doc AND this function in lock-step.                    │
+    │                                                                 │
+    │ Last full verification: 2026-04-20 (Ultra plan, Veo 3.1).       │
+    └─────────────────────────────────────────────────────────────────┘
+
     Pro and Ultra accounts use DIFFERENT model name suffixes — verified
     against a real Ultra-account HAR capture (sku=WS_ULTRA, tier=
     PAYGATE_TIER_TWO). Sending a Pro-style model name on an Ultra account
@@ -281,39 +293,30 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
             return "veo_3_1_t2v_lite_low_priority"       # CONFIRMED
         if tier == "quality":
             return "veo_3_1_t2v"                         # CONFIRMED
-        # Fast / Fast LP — ratio encoded for non-landscape
+        # Fast / Fast LP — ratio encoded for non-landscape.
+        # Note: Flow does NOT support Square video ratio — UI only exposes
+        # Landscape + Portrait. So no _square branch needed here.
         api_ratio = _resolve_video_ratio(ratio)
-        if "PORTRAIT" in api_ratio:
-            ratio_part = "_portrait"                     # CONFIRMED
-        elif "SQUARE" in api_ratio:
-            ratio_part = "_square"                       # GUESSED
-        else:
-            ratio_part = ""                              # landscape default
+        ratio_part = "_portrait" if "PORTRAIT" in api_ratio else ""
         relaxed_part = "_relaxed" if tier == "lower_pri" else ""
         return f"veo_3_1_t2v_fast{ratio_part}{ultra_suffix}{relaxed_part}"
 
     # ── Ingredients (R2V) ────────────────────────────────────────────
-    # Lite [LP] CONFIRMED no ratio, no _ultra (matches t2v/i2v Lite-LP
-    # pattern). Lite plain inferred from same pattern. Fast / Fast LP
-    # cross-verified by bot_engine.py's earlier HAR work — those keep
-    # ratio + _ultra. Quality currently collapses to Fast (Test 4 still
-    # pending — may have its own model).
+    # Lite + Lite [LP] CONFIRMED — no ratio, no _ultra suffix.
+    # Fast Landscape CONFIRMED — veo_3_1_r2v_fast_landscape_ultra.
+    # Quality: Flow UI doesn't expose Quality for ingredients officially —
+    # it falls back to Fast. We keep the same model for safety.
     if video_sub_mode == "ingredients":
         if tier == "lite":
-            return "veo_3_1_r2v_lite"                    # INFERRED
+            return "veo_3_1_r2v_lite"                    # CONFIRMED
         if tier == "lite_lower_pri":
             return "veo_3_1_r2v_lite_low_priority"       # CONFIRMED
-        # Fast / Fast LP / Quality — ratio + _ultra + maybe _relaxed
+        # Fast / Fast LP / Quality — ratio + _ultra + maybe _relaxed.
+        # Square not supported by Flow for video; UI only allows L/P.
         api_ratio = _resolve_video_ratio(ratio)
-        if "PORTRAIT" in api_ratio:
-            ratio_short = "portrait"
-        elif "SQUARE" in api_ratio:
-            ratio_short = "square"
-        else:
-            ratio_short = "landscape"
+        ratio_short = "portrait" if "PORTRAIT" in api_ratio else "landscape"
         relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
-        # Quality: best guess is the same fast model (no separate quality
-        # model spotted in HAR). Update once Test 4 captures it.
+        # Quality collapses to Fast (no separate r2v_quality model exists).
         return f"veo_3_1_r2v_fast_{ratio_short}{ultra_suffix}{relaxed_suffix}"
 
     # ── Frames Start (single image → video, "i2v" family) ────────────
@@ -326,25 +329,34 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
         if tier == "lite_lower_pri":
             return "veo_3_1_i2v_lite_low_priority"       # CONFIRMED
         if tier == "quality":
-            return "veo_3_1_i2v_s"                       # INFERRED from t2v pattern
+            return "veo_3_1_i2v_s"                       # CONFIRMED
         # Fast / Fast LP — keep _s, add _ultra, optional _relaxed
         relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
         return f"veo_3_1_i2v_s_fast{ultra_suffix}{relaxed_suffix}"
 
-    # ── Frames Start-End (start + end → video) — INTERPOLATION family ─
-    # Lite [LP] CONFIRMED uses "interpolation" family, NOT i2v_s_fl as
-    # the old code assumed. Fast / Quality / Lite plain still inferred
-    # — Test 6 / 7 will confirm.
+    # ── Frames Start-End (start + end → video) — HYBRID family ───────
+    # Live captures revealed this is a SPLIT family, not pure-interpolation:
+    #   • Fast / Fast LP / Quality → "i2v_s_*_fl" family (the OG suffix)
+    #   • Lite / Lite [LP]         → "interpolation_*" family (newer)
+    # Both endpoints share the same /batchAsyncGenerateVideoStartAndEndImage
+    # endpoint — only the videoModelKey differs by tier.
+    #
+    # Quirk: Google's _fl suffix moves position depending on tier!
+    #   Fast plain : veo_3_1_i2v_s_fast_ultra_fl       (_fl at END)
+    #   Fast LP    : veo_3_1_i2v_s_fast_fl_ultra_relaxed (_fl in MIDDLE)
+    # Both confirmed via live captures.
     if video_sub_mode == "frames_start_end":
         if tier == "lite":
-            return "veo_3_1_interpolation_lite"          # INFERRED
+            return "veo_3_1_interpolation_lite"                # CONFIRMED
         if tier == "lite_lower_pri":
-            return "veo_3_1_interpolation_lite_low_priority"  # CONFIRMED
+            return "veo_3_1_interpolation_lite_low_priority"   # CONFIRMED
         if tier == "quality":
-            return "veo_3_1_interpolation"               # INFERRED from t2v pattern
-        # Fast / Fast LP — interpolation prefix + _ultra + maybe _relaxed
-        relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
-        return f"veo_3_1_interpolation_fast{ultra_suffix}{relaxed_suffix}"
+            return "veo_3_1_i2v_s_fl"                          # CONFIRMED
+        if tier == "lower_pri":
+            # Fast LP: _fl moves before _ultra, _relaxed at end
+            return f"veo_3_1_i2v_s_fast_fl{ultra_suffix}_relaxed"  # CONFIRMED
+        # Fast plain: _fl stays at the end
+        return f"veo_3_1_i2v_s_fast{ultra_suffix}_fl"          # CONFIRMED
 
     # Last-resort fallback for unknown sub_mode/tier combos
     return "veo_3_1_t2v_fast_ultra" if is_ultra else "veo_3_1_t2v_fast"
