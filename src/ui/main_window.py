@@ -9325,13 +9325,41 @@ class MainWindow(QMainWindow):
 
         current_settings = self._current_generation_settings()
 
+        # Build the existing (image_path, prompt) set from pending/running
+        # jobs so we can skip pairs already queued. Without this, clicking
+        # "Add to Queue" twice silently double-queues every pair — which
+        # manifests as "same image used twice in generation" downstream.
+        existing_pairs = set()
+        try:
+            from src.db.db_manager import get_all_jobs
+            for existing in get_all_jobs() or []:
+                if existing.get("status") not in ("pending", "running"):
+                    continue
+                existing_pairs.add(
+                    (
+                        str(existing.get("ref_path") or existing.get("start_image_path") or "").strip(),
+                        str(existing.get("prompt") or "").strip(),
+                    )
+                )
+        except Exception:
+            existing_pairs = set()
+
         auto_generated_count = 0
+        skipped_duplicate_count = 0
         job_specs = []
         for pair in pairs:
             if not pair.get("paired", True):
                 auto_generated_count += 1
             ref_path = pair["image_path"] if bulk_sub_mode == "ingredients" else None
             start_image_path = pair["image_path"] if bulk_sub_mode == "frames_start" else None
+            dedup_key = (
+                str(ref_path or start_image_path or "").strip(),
+                str(pair["prompt"] or "").strip(),
+            )
+            if dedup_key in existing_pairs:
+                skipped_duplicate_count += 1
+                continue
+            existing_pairs.add(dedup_key)
             job_specs.append({
                 "job_id": str(uuid.uuid4()),
                 "prompt": pair["prompt"],

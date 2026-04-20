@@ -1856,6 +1856,16 @@ class ExtensionModeManager:
                             except (json.JSONDecodeError, TypeError):
                                 ref_path = ref_paths_raw.strip()
 
+                    # Log the exact pairing so the user can see at a glance
+                    # which image is going with which prompt. Surfaces any
+                    # accidental duplication (same file + same prompt across
+                    # multiple jobs) the moment it actually dispatches.
+                    _pair_ref = os.path.basename(ref_path or start_image_path or end_image_path or "") or "(no ref)"
+                    _pair_prompt = (prompt or "")[:60]
+                    self._log(
+                        f"[{worker.slot_id}] ↪ pair: ref={_pair_ref}  prompt={_pair_prompt!r}"
+                    )
+
                     result, error = await worker.generate_video(
                         prompt, video_model, ratio,
                         video_sub_mode=video_sub_mode,
