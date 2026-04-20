@@ -2119,13 +2119,18 @@ async function installFlowRecaptchaWarmup() {
           window.__glabsRecaptchaWarmupActive = true;
 
           const ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
-          // Slower warmup cadence — the original 1.5-3.5s loop compounded
-          // with pool prefetch + per-request pre-warmup cluster pushed
-          // each account past ~40 grecaptcha.execute() calls/min, which
-          // Google's reCAPTCHA Enterprise flags as bot-like. 20-40s
-          // keeps the score primed without looking programmatic.
-          const MIN_DELAY_MS = 20000;
-          const MAX_DELAY_MS = 40000;
+          // Fast warmup cadence — Google's reCAPTCHA Enterprise scores
+          // a tab based on recent activity. With a slow loop (20-40s)
+          // the baseline score decays between real requests and Google
+          // returns 429 "reCAPTCHA evaluation failed" or 400 "Score Too
+          // Low" for the actual image/video API calls even when the
+          // token itself is freshly minted. 1.5-3.5s matches real
+          // labs.google page behavior (execute() fires in tight
+          // clusters throughout normal UI interaction) and keeps the
+          // score above threshold during bulk runs. This was the
+          // original cadence that supported 15-20 parallel image gen.
+          const MIN_DELAY_MS = 1500;
+          const MAX_DELAY_MS = 3500;
 
           // Resolve the site key the same way our token code does, but
           // lazy — don't crash if the page hasn't fully loaded yet.

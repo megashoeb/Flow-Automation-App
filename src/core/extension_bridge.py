@@ -65,17 +65,16 @@ class ExtensionBridge:
         # the same warm account.
         self._token_pool: Dict[tuple, deque] = {}     # (account, action) -> deque of {token, access_token, project_id, ts}
         self._prefetch_requests: Dict[str, tuple] = {}  # prefetch_request_id -> (account, action)
-        # NOTE: pool size was bumped to 10 when we first added the video
-        # EXECUTE_FETCH path — the idea was to have plenty of hot tokens
-        # ready for burst video dispatch. In practice that caused Google
-        # to see ~40+ grecaptcha.execute() calls per minute per account
-        # (pool prefetch + per-request pre-warmup cluster + background
-        # warmup loop all compounding), which flagged every account as
-        # bot-like and tanked the reCAPTCHA score. A user-reported
-        # regression: before the pool bump, 15-20 parallel image gen on
-        # one account was stable. 3 is enough headroom for bursts while
-        # staying under Google's "this looks programmatic" threshold.
-        self.TOKEN_POOL_TARGET = 3   # target pre-fetched tokens per (account, action)
+        # Pool sizing history:
+        #   d9d752b introduced pool with target=5.
+        #   18ee523 bumped to 10 for video burst dispatch.
+        #   (my 20 Apr edit)   trimmed to 3 hoping to reduce bot-fingerprint
+        #     — that was wrong. Logs showed the real failure was reCAPTCHA
+        #     score-too-low (pool tokens aging past the score threshold
+        #     between bulk dispatches, not too many mints). Restoring 5
+        #     matches the original "15-20 parallel worked" state while
+        #     staying below the 10 level that was never strictly needed.
+        self.TOKEN_POOL_TARGET = 5   # target pre-fetched tokens per (account, action)
         self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
         # Which actions to keep prefetched. Both image and video are common
         # enough to benefit from a hot pool; less-common actions fall through
