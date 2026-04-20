@@ -278,46 +278,13 @@ async function handleWork(work) {
                 await new Promise((r) => enterprise.ready(r));
               }
 
-              // Pre-warmup cluster for BOTH image and video now.
-              // Google tightened reCAPTCHA enforcement on the image
-              // endpoint (previously lax) — "reCAPTCHA evaluation
-              // failed" 429s appeared on aiohttp-image once account
-              // trust degraded slightly. Moving image to EXECUTE_FETCH
-              // means image requests also need the cluster-boost so
-              // the token scores well at mint time.
-              //
-              // Pattern mimics natural "user opens dialog, mouses over
-              // options, clicks" timing instead of a 500ms burst:
-              //   - 500-1000ms think time before any warmup fires
-              //   - 5 warmup calls with 200-500ms jittered gaps
-              //   - Mixed action vocabulary (IMAGE/VIDEO_GENERATION
-              //     plus real page actions like homepage/select_model/
-              //     generate) so the call distribution doesn't itself
-              //     look synthetic
-              //   - 200-400ms settle before the real mint
-              // Total cluster window: ~1.8-3.5s.
-              const NEEDS_WARMUP_CLUSTER = (
-                captchaAction === "VIDEO_GENERATION" ||
-                captchaAction === "IMAGE_GENERATION"
-              );
-              if (NEEDS_WARMUP_CLUSTER) {
-                // Think time — simulates user pausing before clicking
-                await new Promise((r) => setTimeout(r, 500 + Math.random() * 500));
-                const WARMUP_ACTIONS = [
-                  "IMAGE_GENERATION", "VIDEO_GENERATION",
-                  "homepage", "select_model", "generate",
-                ];
-                for (let i = 0; i < 5; i++) {
-                  try {
-                    const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
-                    enterprise.execute(siteKey, { action: wAction }).catch(() => {});
-                    await new Promise((r) => setTimeout(r, 200 + Math.random() * 300));
-                  } catch {}
-                }
-                // Settle — tiny pause before the real mint so the
-                // cluster "decays" into the real click pattern
-                await new Promise((r) => setTimeout(r, 200 + Math.random() * 200));
-              }
+              // NO pre-warmup cluster. The user's older working build
+              // proved a single bare enterprise.execute() is what the
+              // tab SHOULD look like — any extra execute() calls
+              // (cluster, warmup loop, etc.) inflate the per-tab
+              // execute rate and Google's reCAPTCHA Enterprise reads
+              // THAT as the bot signature. Match the working-build
+              // pattern: just mint one token and use it.
 
               // Now mint the REAL token — fresh + with warm score
               const token = await enterprise.execute(siteKey, { action: captchaAction });
@@ -716,29 +683,12 @@ async function mainWorldExecute(action) {
         return result;
       }
 
-      // Ready + Execute
+      // Ready + Execute — zero delays, no cluster.
+      // Matches the working older build's simple pattern: any extra
+      // execute() calls bumps the tab's per-minute rate and Google's
+      // reCAPTCHA Enterprise flags the tab.
       if (typeof enterprise.ready === "function") {
         await new Promise((r) => enterprise.ready(r));
-      }
-
-      // Pre-warmup cluster — 3 fire-and-forget execute() calls before
-      // the real token mint. Real labs.google pages cluster execute()
-      // calls throughout normal UI (6000+/min measured), so a single
-      // isolated call scores lower than one inside a natural cluster.
-      // Critical for the POOL mint path because pool tokens get used
-      // seconds later by the aiohttp-image request — the tab's score
-      // baseline at mint time determines whether Google accepts the
-      // token at request time. Without this cluster, pool tokens come
-      // out cold and the real image request gets rejected with
-      // "reCAPTCHA Score Too Low" / "reCAPTCHA evaluation failed".
-      // EXECUTE_FETCH (video) already has its own inline cluster.
-      const WARMUP_ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
-      for (let i = 0; i < 3; i++) {
-        try {
-          const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
-          enterprise.execute(siteKey, { action: wAction }).catch(() => {});
-          await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
-        } catch {}
       }
 
       const token = await enterprise.execute(siteKey, { action });
@@ -2250,9 +2200,14 @@ async function installFlowRecaptchaWarmup() {
 // Re-run the installer every 30s so newly opened labs tabs pick up the
 // warmup. Idempotent because of the window.__glabsRecaptchaWarmupActive
 // flag — re-injecting an already-warm tab is a no-op.
-setInterval(installFlowRecaptchaWarmup, 30000);
-// First run after 5s so Chrome finishes loading the tab + reCAPTCHA SDK
-setTimeout(installFlowRecaptchaWarmup, 5000);
+// ── Background warmup loop DISABLED ────────────────────────────────
+// This was continuously firing grecaptcha.enterprise.execute() every
+// ~1.5-40s on every labs tab to "keep score primed". In practice it
+// did the opposite — Google's reCAPTCHA Enterprise reads the per-tab
+// execute() rate as a primary bot signal, so the loop itself pushed
+// us over the threshold. The user's older working build has no warmup
+// loop at all and runs 15+ parallel image gen cleanly.
+// (Intentionally not scheduling the installer.)
 
 // Also install warmup right after a labs.google tab finishes loading
 // (caught by the existing onUpdated listener below — see line ~1875).
@@ -2277,9 +2232,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab.url && tab.url.startsWith(LABS_ORIGIN)) {
     invalidateRecaptchaCache(tabId);  // force fresh check after reload
     setTimeout(() => detectAccounts(), 3000);
-    // Re-install warmup loop after reload (window flag was wiped).
-    // Wait 4s for grecaptcha SDK to finish loading on the fresh page.
-    setTimeout(installFlowRecaptchaWarmup, 4000);
+    // Warmup loop disabled — see note near setInterval line above.
   }
 });
 
