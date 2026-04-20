@@ -246,10 +246,64 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
     else:
         tier = "fast"
 
-    # Ingredients (R2V) is special — model name encodes aspect ratio
-    # (landscape/portrait/square) AND has its own tier suffix rules.
-    # Resolved via dedicated helper before the generic table lookup.
+    # ════════════════════════════════════════════════════════════════
+    # Model resolution rebuilt from real labs.google.com Ultra captures
+    # (DevTools fetch wrapper, 2026-04). Big surprises that the old
+    # static table got wrong:
+    #
+    #   1. Lite is its OWN model family in every sub-mode — it does NOT
+    #      collapse to Fast. Pattern: veo_3_1_{family}_lite (no _ultra,
+    #      no ratio, no _s on i2v).
+    #   2. Lite [Lower Pri] uses suffix "_low_priority", NOT "_relaxed"
+    #      like Fast LP. Confirmed in t2v + r2v + i2v + interpolation.
+    #   3. frames_start_end is a DIFFERENT family ("interpolation"), not
+    #      i2v_s with _fl suffix.
+    #   4. The _s suffix on i2v only appears on the Fast variants
+    #      (i2v_s_fast_ultra). Lite/Lite-LP drop it (just i2v_lite).
+    #   5. _ultra suffix only on Fast/Fast-LP variants. Lite/Lite-LP/
+    #      Quality skip it.
+    #
+    # Family prefix per sub-mode:
+    #   text_to_video    → t2v
+    #   ingredients      → r2v          (Fast keeps _s? not yet seen)
+    #   frames_start     → i2v          (Fast has _s, Lite drops it)
+    #   frames_start_end → interpolation (entirely new family!)
+    # ════════════════════════════════════════════════════════════════
+    is_ultra = (plan_lower == "ultra")
+    ultra_suffix = "_ultra" if is_ultra else ""
+
+    # ── Text-to-video ────────────────────────────────────────────────
+    # All major combos verified via live captures; Square is inferred.
+    if video_sub_mode == "text_to_video":
+        if tier == "lite":
+            return "veo_3_1_t2v_lite"                    # CONFIRMED
+        if tier == "lite_lower_pri":
+            return "veo_3_1_t2v_lite_low_priority"       # CONFIRMED
+        if tier == "quality":
+            return "veo_3_1_t2v"                         # CONFIRMED
+        # Fast / Fast LP — ratio encoded for non-landscape
+        api_ratio = _resolve_video_ratio(ratio)
+        if "PORTRAIT" in api_ratio:
+            ratio_part = "_portrait"                     # CONFIRMED
+        elif "SQUARE" in api_ratio:
+            ratio_part = "_square"                       # GUESSED
+        else:
+            ratio_part = ""                              # landscape default
+        relaxed_part = "_relaxed" if tier == "lower_pri" else ""
+        return f"veo_3_1_t2v_fast{ratio_part}{ultra_suffix}{relaxed_part}"
+
+    # ── Ingredients (R2V) ────────────────────────────────────────────
+    # Lite [LP] CONFIRMED no ratio, no _ultra (matches t2v/i2v Lite-LP
+    # pattern). Lite plain inferred from same pattern. Fast / Fast LP
+    # cross-verified by bot_engine.py's earlier HAR work — those keep
+    # ratio + _ultra. Quality currently collapses to Fast (Test 4 still
+    # pending — may have its own model).
     if video_sub_mode == "ingredients":
+        if tier == "lite":
+            return "veo_3_1_r2v_lite"                    # INFERRED
+        if tier == "lite_lower_pri":
+            return "veo_3_1_r2v_lite_low_priority"       # CONFIRMED
+        # Fast / Fast LP / Quality — ratio + _ultra + maybe _relaxed
         api_ratio = _resolve_video_ratio(ratio)
         if "PORTRAIT" in api_ratio:
             ratio_short = "portrait"
@@ -257,87 +311,43 @@ def _resolve_video_model_for_sub_mode(video_sub_mode, model="", video_model="", 
             ratio_short = "square"
         else:
             ratio_short = "landscape"
-        ultra_suffix = "_ultra" if plan_lower == "ultra" else ""
-        # Both lower_pri AND lite_lower_pri use the same _relaxed
-        # variant — R2V has no separate Lite model, so lite + lower
-        # collapses to the same relaxed Fast model.
-        relaxed_suffix = "_relaxed" if tier in ("lower_pri", "lite_lower_pri") else ""
-        # fast / lite / quality all map to the same fast variant —
-        # there is no R2V quality model, only the fast/relaxed pair.
+        relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
+        # Quality: best guess is the same fast model (no separate quality
+        # model spotted in HAR). Update once Test 4 captures it.
         return f"veo_3_1_r2v_fast_{ratio_short}{ultra_suffix}{relaxed_suffix}"
 
-    # Text-to-video — verified via real labs.google.com Ultra captures
-    # (DevTools fetch wrapper). Pattern:
-    #   • Lite / Quality / Lite [Lower Pri] = single model, NO aspect-ratio
-    #     encoding, NO _ultra suffix. Same model serves landscape/portrait/square.
-    #   • Fast / Fast [Lower Pri] = aspect ratio encoded for portrait/square
-    #     (landscape is the default and is NOT named in the model key).
-    #     Has the _ultra suffix on Ultra plans.
-    #   • Lite [Lower Pri] uses "_low_priority" suffix, NOT "_relaxed"
-    #     like the Fast variant does. (Discovered the hard way.)
-    if video_sub_mode == "text_to_video":
-        is_ultra = (plan_lower == "ultra")
-        ultra_suffix = "_ultra" if is_ultra else ""
+    # ── Frames Start (single image → video, "i2v" family) ────────────
+    # Lite + Lite LP CONFIRMED — drop the _s suffix entirely, no ratio,
+    # no _ultra. Fast confirmed via HAR (i2v_s_fast_ultra). Other tiers
+    # follow the inferred pattern.
+    if video_sub_mode == "frames_start":
         if tier == "lite":
-            return "veo_3_1_t2v_lite"
+            return "veo_3_1_i2v_lite"                    # CONFIRMED
         if tier == "lite_lower_pri":
-            return "veo_3_1_t2v_lite_low_priority"
+            return "veo_3_1_i2v_lite_low_priority"       # CONFIRMED
         if tier == "quality":
-            return "veo_3_1_t2v"
-        # Fast / Fast Lower Pri — ratio encoded for non-landscape
-        api_ratio = _resolve_video_ratio(ratio)
-        if "PORTRAIT" in api_ratio:
-            ratio_part = "_portrait"
-        elif "SQUARE" in api_ratio:
-            # Not yet captured from real traffic — guessed from the
-            # portrait pattern. Update if a square test reveals different.
-            ratio_part = "_square"
-        else:
-            ratio_part = ""  # landscape is the unnamed default
-        relaxed_part = "_relaxed" if tier == "lower_pri" else ""
-        return f"veo_3_1_t2v_fast{ratio_part}{ultra_suffix}{relaxed_part}"
+            return "veo_3_1_i2v_s"                       # INFERRED from t2v pattern
+        # Fast / Fast LP — keep _s, add _ultra, optional _relaxed
+        relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
+        return f"veo_3_1_i2v_s_fast{ultra_suffix}{relaxed_suffix}"
 
-    # Pro tier model keys for the I2V (image-to-video) sub-modes.
-    # NOT YET VERIFIED against real Pro traffic — inherited from existing
-    # code + competitor's bot_engine.py mappings. Replace with captured
-    # values when a Pro account becomes available.
-    pro_keys = {
-        ("frames_start", "fast"): "veo_3_1_i2v_s_fast",
-        ("frames_start", "lite"): "veo_3_1_i2v_s_fast",
-        ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
-        ("frames_start", "lite_lower_pri"): "veo_3_1_i2v_s_fast_relaxed",
-        ("frames_start", "quality"): "veo_3_1_i2v_s",
-        ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_fl",
-        ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_fl",
-        ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_relaxed",
-        ("frames_start_end", "lite_lower_pri"): "veo_3_1_i2v_s_fast_fl_relaxed",
-        ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
-    }
-
-    # Ultra tier model keys — partial verification only (the Ultra HAR
-    # confirmed veo_3_1_i2v_s_fast_ultra). Other entries follow the
-    # same _ultra-before-_relaxed / _ultra-before-_fl pattern but need
-    # frames_start / frames_start_end captures to confirm.
-    ultra_keys = {
-        ("frames_start", "fast"): "veo_3_1_i2v_s_fast_ultra",
-        ("frames_start", "lite"): "veo_3_1_i2v_s_fast_ultra",
-        ("frames_start", "lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
-        ("frames_start", "lite_lower_pri"): "veo_3_1_i2v_s_fast_ultra_relaxed",
-        ("frames_start", "quality"): "veo_3_1_i2v_s",
-        ("frames_start_end", "fast"): "veo_3_1_i2v_s_fast_ultra_fl",
-        ("frames_start_end", "lite"): "veo_3_1_i2v_s_fast_ultra_fl",
-        ("frames_start_end", "lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
-        ("frames_start_end", "lite_lower_pri"): "veo_3_1_i2v_s_fast_fl_ultra_relaxed",
-        ("frames_start_end", "quality"): "veo_3_1_i2v_s_fl",
-    }
-
-    model_keys = ultra_keys if plan_lower == "ultra" else pro_keys
-    key = model_keys.get((video_sub_mode, tier))
-    if key:
-        return key
+    # ── Frames Start-End (start + end → video) — INTERPOLATION family ─
+    # Lite [LP] CONFIRMED uses "interpolation" family, NOT i2v_s_fl as
+    # the old code assumed. Fast / Quality / Lite plain still inferred
+    # — Test 6 / 7 will confirm.
+    if video_sub_mode == "frames_start_end":
+        if tier == "lite":
+            return "veo_3_1_interpolation_lite"          # INFERRED
+        if tier == "lite_lower_pri":
+            return "veo_3_1_interpolation_lite_low_priority"  # CONFIRMED
+        if tier == "quality":
+            return "veo_3_1_interpolation"               # INFERRED from t2v pattern
+        # Fast / Fast LP — interpolation prefix + _ultra + maybe _relaxed
+        relaxed_suffix = "_relaxed" if tier == "lower_pri" else ""
+        return f"veo_3_1_interpolation_fast{ultra_suffix}{relaxed_suffix}"
 
     # Last-resort fallback for unknown sub_mode/tier combos
-    return "veo_3_1_t2v_fast_ultra" if plan_lower == "ultra" else "veo_3_1_t2v_fast"
+    return "veo_3_1_t2v_fast_ultra" if is_ultra else "veo_3_1_t2v_fast"
 
 
 def _paygate_tier_for_plan(plan):
