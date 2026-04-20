@@ -26,6 +26,55 @@ try:
 except ImportError:
     aiohttp = None
 
+
+# ─────────────────────────────────────────────────────────────────
+# SSL context for aiohttp calls
+#
+# PyInstaller-bundled Python on Windows often ships without a working
+# CA trust store, so aiohttp's default SSL verification fails against
+# Google's certs with:
+#   SSLCertVerificationError: unable to get local issuer certificate
+#
+# We build a shared SSL context from certifi (Mozilla's CA bundle —
+# always available because aiohttp already depends on it transitively)
+# and reuse it across every ClientSession in this module. Fallback to
+# the system default context if certifi ever disappears.
+# ─────────────────────────────────────────────────────────────────
+_SSL_CONTEXT = None
+
+
+def _get_ssl_context():
+    """Return a process-wide SSL context that trusts certifi's CA bundle.
+    Cached on first use. Safe to call even when `ssl`/`certifi` fail to
+    import — falls back to None (which lets aiohttp use its default).
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    try:
+        import ssl as _ssl
+        try:
+            import certifi
+            _SSL_CONTEXT = _ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            _SSL_CONTEXT = _ssl.create_default_context()
+    except Exception:
+        _SSL_CONTEXT = None
+    return _SSL_CONTEXT
+
+
+def _make_aiohttp_session(**kwargs):
+    """Build an aiohttp.ClientSession with our certifi-backed SSL context.
+    Drop-in replacement for bare `aiohttp.ClientSession()` — extra kwargs
+    forward through to the real constructor.
+    """
+    ctx = _get_ssl_context()
+    if ctx is None:
+        return aiohttp.ClientSession(**kwargs)
+    connector = aiohttp.TCPConnector(ssl=ctx)
+    return aiohttp.ClientSession(connector=connector, **kwargs)
+
+
 from src.core.extension_bridge import ExtensionBridge
 from src.db.db_manager import (
     get_accounts,
@@ -419,7 +468,7 @@ class ExtensionWorker:
             "isUserUploaded": True,
         }
 
-        async with aiohttp.ClientSession() as session:
+        async with _make_aiohttp_session() as session:
             async with session.post(
                 UPLOAD_IMAGE_URL,
                 headers={
@@ -528,7 +577,7 @@ class ExtensionWorker:
             }
 
             try:
-                async with aiohttp.ClientSession() as session:
+                async with _make_aiohttp_session() as session:
                     async with session.post(
                         VIDEO_POLL_URL,
                         headers={
@@ -772,7 +821,7 @@ class ExtensionWorker:
 
             # Direct API call from Python — parallel-safe, no extension bottleneck.
             url = IMAGE_API_URL.format(project_id=project_id)
-            async with aiohttp.ClientSession() as session:
+            async with _make_aiohttp_session() as session:
                 async with session.post(
                     url,
                     headers={
@@ -1036,7 +1085,7 @@ class ExtensionWorker:
                             },
                             "updateMask": "metadata.primaryMediaId",
                         }
-                        async with aiohttp.ClientSession() as s:
+                        async with _make_aiohttp_session() as s:
                             async with s.patch(
                                 patch_url,
                                 headers={
@@ -1105,7 +1154,7 @@ class ExtensionWorker:
 
         # ── Method 1: List projects via aisandbox API ──
         try:
-            async with aiohttp.ClientSession() as session:
+            async with _make_aiohttp_session() as session:
                 async with session.get(
                     "https://aisandbox-pa.googleapis.com/v1/projects",
                     headers=headers,
@@ -1127,7 +1176,7 @@ class ExtensionWorker:
 
         # ── Method 2: listFlows via trpc ──
         try:
-            async with aiohttp.ClientSession() as session:
+            async with _make_aiohttp_session() as session:
                 async with session.get(
                     "https://labs.google/fx/api/trpc/backbone.listFlows",
                     headers=headers,
@@ -2054,7 +2103,7 @@ class ExtensionModeManager:
                 cookie_str = cookie_result.get("cookies", "")
                 if cookie_str:
                     dl_headers["cookie"] = cookie_str
-                    async with aiohttp.ClientSession() as session:
+                    async with _make_aiohttp_session() as session:
                         async with session.get(
                             fife_url,
                             headers=dl_headers,
@@ -2081,7 +2130,7 @@ class ExtensionModeManager:
                 cdn_url = bridge_result.get("cdn_url", "")
                 if cdn_url:
                     dl_headers.pop("cookie", None)
-                    async with aiohttp.ClientSession() as session:
+                    async with _make_aiohttp_session() as session:
                         async with session.get(
                             cdn_url,
                             headers=dl_headers,
@@ -2102,7 +2151,7 @@ class ExtensionModeManager:
 
         # ── IMAGE: direct aiohttp download (no cookies needed) ──
         try:
-            async with aiohttp.ClientSession() as session:
+            async with _make_aiohttp_session() as session:
                 async with session.get(
                     fife_url,
                     headers=dl_headers,
