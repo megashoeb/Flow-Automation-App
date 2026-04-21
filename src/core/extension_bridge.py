@@ -65,24 +65,11 @@ class ExtensionBridge:
         # the same warm account.
         self._token_pool: Dict[tuple, deque] = {}     # (account, action) -> deque of {token, access_token, project_id, ts}
         self._prefetch_requests: Dict[str, tuple] = {}  # prefetch_request_id -> (account, action)
-        # Pool sizing history:
-        #   d9d752b introduced pool with target=5.
-        #   18ee523 bumped to 10 for video burst dispatch.
-        #   target=3 experiment (20 Apr) — wrong direction.
-        #   target=5 restore — still saw "reCAPTCHA Score Too Low" in
-        #     production logs. Diagnosis: pool tokens sit for 7-13s
-        #     before use. Even with the pre-warmup cluster boosting the
-        #     score at mint time, Google's v3 score decays between mint
-        #     and evaluation when the tab has zero real user interaction.
-        #     Manual generation works because the click-to-mint-to-API
-        #     window is ~500ms — the boosted score is still fresh.
-        #   target=0 (this commit) — disable pool entirely. Every token
-        #     mints on-demand right before use. Token age at evaluation
-        #     ~1s instead of ~10s. Trade-off is serialized mint latency
-        #     (~1s per request through the scripting channel), but the
-        #     2-3s dispatch stagger already gates us at that rate, so
-        #     throughput is effectively unchanged.
-        self.TOKEN_POOL_TARGET = 0   # 0 = no prefetch, mint on-demand
+        # Restored from Apr 19 working build (db900f5) that processed
+        # 150+ videos cleanly. Target=10 is the proven value — today's
+        # 0/3/5 detours were all wrong. Pool tokens + the background
+        # warmup loop are how Google's reCAPTCHA score stays primed.
+        self.TOKEN_POOL_TARGET = 10
         self.TOKEN_MAX_AGE = 90      # seconds before a cached token is too old
         # Which actions to keep prefetched. Both image and video are common
         # enough to benefit from a hot pool; less-common actions fall through

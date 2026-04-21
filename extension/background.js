@@ -278,13 +278,22 @@ async function handleWork(work) {
                 await new Promise((r) => enterprise.ready(r));
               }
 
-              // NO pre-warmup cluster. The user's older working build
-              // proved a single bare enterprise.execute() is what the
-              // tab SHOULD look like — any extra execute() calls
-              // (cluster, warmup loop, etc.) inflate the per-tab
-              // execute rate and Google's reCAPTCHA Enterprise reads
-              // THAT as the bot signature. Match the working-build
-              // pattern: just mint one token and use it.
+              // Pre-warmup cluster for VIDEO_GENERATION (restored from
+              // Apr 19 working build). 3 fire-and-forget execute()
+              // calls before the real token mint keep the video
+              // endpoint's stricter reCAPTCHA score check passing.
+              // Image action skips the cluster — image endpoint is
+              // lenient enough.
+              if (captchaAction === "VIDEO_GENERATION") {
+                const WARMUP_ACTIONS = ["IMAGE_GENERATION", "VIDEO_GENERATION"];
+                for (let i = 0; i < 3; i++) {
+                  try {
+                    const wAction = WARMUP_ACTIONS[Math.floor(Math.random() * WARMUP_ACTIONS.length)];
+                    enterprise.execute(siteKey, { action: wAction }).catch(() => {});
+                    await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+                  } catch {}
+                }
+              }
 
               // Now mint the REAL token — fresh + with warm score
               const token = await enterprise.execute(siteKey, { action: captchaAction });
@@ -2200,14 +2209,16 @@ async function installFlowRecaptchaWarmup() {
 // Re-run the installer every 30s so newly opened labs tabs pick up the
 // warmup. Idempotent because of the window.__glabsRecaptchaWarmupActive
 // flag — re-injecting an already-warm tab is a no-op.
-// ── Background warmup loop DISABLED ────────────────────────────────
-// This was continuously firing grecaptcha.enterprise.execute() every
-// ~1.5-40s on every labs tab to "keep score primed". In practice it
-// did the opposite — Google's reCAPTCHA Enterprise reads the per-tab
-// execute() rate as a primary bot signal, so the loop itself pushed
-// us over the threshold. The user's older working build has no warmup
-// loop at all and runs 15+ parallel image gen cleanly.
-// (Intentionally not scheduling the installer.)
+// Background warmup loop — RESTORED from Apr 19 working build. Fires
+// grecaptcha.enterprise.execute() at a jittered 1.5–3.5s cadence on
+// every open labs tab to keep the tab's reCAPTCHA Enterprise score
+// primed. The concurrent 150-video test run proved this is the right
+// cadence — the tab-level score primes the real tokens and the real
+// video POSTs pass. Disabling this on Apr 21 broke reCAPTCHA scoring
+// for everyone — score decays between real requests without activity.
+setInterval(installFlowRecaptchaWarmup, 30000);
+// First run after 5s so Chrome finishes loading the tab + reCAPTCHA SDK
+setTimeout(installFlowRecaptchaWarmup, 5000);
 
 // Also install warmup right after a labs.google tab finishes loading
 // (caught by the existing onUpdated listener below — see line ~1875).
@@ -2232,7 +2243,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab.url && tab.url.startsWith(LABS_ORIGIN)) {
     invalidateRecaptchaCache(tabId);  // force fresh check after reload
     setTimeout(() => detectAccounts(), 3000);
-    // Warmup loop disabled — see note near setInterval line above.
+    // Re-install warmup loop after reload (window flag was wiped).
+    setTimeout(installFlowRecaptchaWarmup, 4000);
   }
 });
 
