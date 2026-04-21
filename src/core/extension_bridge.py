@@ -389,10 +389,18 @@ class ExtensionBridge:
                 if ext_key and ext_key in failed_ext_keys:
                     continue
 
-                # Skip if this request is currently dispatched to another extension
-                # (waiting for response — don't give same work to two extensions)
-                dispatched_key = self._dispatched_to.get(req_id)
-                if dispatched_key is not None and dispatched_key != ext_key:
+                # Skip if this request is currently dispatched to ANY extension
+                # (waiting for response — don't give same work twice). The old
+                # check was `dispatched_key != ext_key`, which let the SAME
+                # extension re-receive the same work on every 500ms poll until
+                # the response came back. The original code paired this with
+                # an extension-side _workInProgress lock that silently dropped
+                # the dupes; that lock was removed in 4a368a9 to enable
+                # multi-tab parallelism, which exposed the bug. Result: a
+                # single video request was dispatched 7–30 times during its
+                # 15–30s generation window, and Google generated a video for
+                # each duplicate POST. Fix: dedup at the bridge instead.
+                if self._dispatched_to.get(req_id) is not None:
                     continue
 
                 # Only give work if this extension has the target account
