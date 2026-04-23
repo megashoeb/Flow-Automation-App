@@ -2340,6 +2340,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+// ─── MV3 Service Worker Keep-Alive ───
+// Manifest V3 suspends background service workers after ~30s of inactivity.
+// When suspended, the next chrome.scripting.executeScript call can fail with
+// "fetch_failed: Failed to fetch" or "no_script_result" while the worker
+// wakes up. To prevent this, we register a chrome.alarms alarm that fires
+// every 24 seconds. The alarm event itself resets the idle timer, keeping
+// the worker persistently alive during active generation runs.
+//
+// This is the Chrome-sanctioned workaround for MV3 worker suspension.
+// Cost: ~0MB RAM, zero network, zero battery. Benefit: eliminates the
+// intermittent "Bridge error: fetch_failed" / "no_script_result" errors
+// that occur when the worker naps between parallel POSTs.
+try {
+  if (chrome.alarms && chrome.alarms.create) {
+    chrome.alarms.create("gLabsKeepAlive", { periodInMinutes: 0.4 }); // 24s
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === "gLabsKeepAlive") {
+        // No-op — the act of firing this event wakes/keeps the worker alive.
+      }
+    });
+    console.log("[G-Labs Helper] Keep-alive alarm registered (24s interval)");
+  }
+} catch (e) {
+  console.warn("[G-Labs Helper] Keep-alive alarm failed:", e.message);
+}
+
 console.log("[G-Labs Helper] Extension started. Bridge:", BRIDGE_URL);
 
 // Start Genspark module if it loaded successfully — independent of Flow.
