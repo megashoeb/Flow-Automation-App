@@ -476,6 +476,13 @@ async function grokClickSend(tabId, prompt) {
 
     const MODE_TOKENS = /\b(image|video|photo|audio|480p|720p|1080p|4k|\d+s\b|6s|10s|\d+:\d+|ratio|square|landscape|portrait|widescreen|vertical|horizontal)\b/i;
 
+    // Strong negatives — buttons whose label matches any of these are
+    // definitely NOT the send button. Grok's composer region in
+    // image-mode surfaces several of these near the input (Save /
+    // Bookmark / Share thumbnails appear after attachment).
+    const NOT_SEND_TOKENS =
+      /\b(save|bookmark|favorit|heart|like|unlike|share|download|copy|paste|edit|rename|delete|remove|trash|cancel|close|dismiss|settings|options|menu|more|help|info|profile|user|account|login|logout|sign\s*in|sign\s*up|signin|signup|register|feedback|language|locale|theme|dark|light|attach|upload|file|pick|choose|browse|preview|fullscreen|mute|play|pause|stop|back|forward|next|prev|previous|retry|refresh|reload|expand|collapse|sidebar|drawer|toggle)\b/i;
+
     const scoredBtns = btnsUnique.map((b) => {
       const text = (b.textContent || "").trim();
       const ariaLabel = (b.getAttribute("aria-label") || "").toLowerCase();
@@ -487,9 +494,16 @@ async function grokClickSend(tabId, prompt) {
 
       let score = 0;
       if (type === "submit") score += 25;
-      const combinedLabel = ariaLabel + " " + title;
+
+      const combinedLabel = ariaLabel + " " + title + " " + text.toLowerCase();
+      // Strong reward for explicit send/submit/generate labels
       if (/\b(send|submit|generate|create|imagine|post|enter)\b/.test(combinedLabel)) {
         score += 30;
+      }
+      // STRONG negative for obvious non-send action labels — this is
+      // the fix for 1.8.1 picking "Save" on the image-attached UI.
+      if (NOT_SEND_TOKENS.test(combinedLabel)) {
+        score -= 50;
       }
       if (hasSvg && text.length === 0) score += 15;
       if (text.length > 0) {
@@ -502,6 +516,17 @@ async function grokClickSend(tabId, prompt) {
         score += 3;
       }
       if (rect.width < 16 || rect.height < 16) score -= 50;
+
+      // Small extra reward for being on the same horizontal row as the
+      // input AND to its right — typical send-button placement in a
+      // chat composer.
+      try {
+        const inputCenterY = (inputRect.top + inputRect.bottom) / 2;
+        const btnCenterY = (rect.top + rect.bottom) / 2;
+        if (Math.abs(inputCenterY - btnCenterY) < 50 && rect.left >= inputRect.left) {
+          score += 8;
+        }
+      } catch {}
 
       return { btn: b, score, text, ariaLabel, title, hasSvg, type, rect };
     });
@@ -1024,6 +1049,21 @@ async function grokHandleWork(work) {
     "clicked",
     `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"}${scoreInfo})`
   );
+  // Low-confidence click — surface top-5 candidates so the user can
+  // eyeball which button was picked vs which SHOULD have been picked.
+  if (
+    typeof clickResult.buttonScore === "number" &&
+    clickResult.buttonScore < 25 &&
+    clickResult.topCandidates
+  ) {
+    const cands = clickResult.topCandidates
+      .map(
+        (c) =>
+          `[${c.score.toFixed(0)} "${c.ariaLabel || c.text || "?"}"]`
+      )
+      .join(" ");
+    await grokReportProgress(request_id, "low_confidence_click", cands);
+  }
 
   // Poll for videoUrl — either from the fetch-wrapper's stream capture
   // (__grokAutomationVideoUrl) or from the DOM (<video> element src).
