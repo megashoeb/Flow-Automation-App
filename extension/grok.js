@@ -171,53 +171,95 @@ async function grokInstallHeaderCapture(tabId) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function grokEnsureOnImaginePage(tabId) {
+  const pathOf = (url) => {
+    try { return new URL(url).pathname; } catch { return ""; }
+  };
+  const isImagineHome = (url) => {
+    const p = pathOf(url);
+    return p === "/imagine" || p === "/imagine/";
+  };
+
   try {
     const tab = await chrome.tabs.get(tabId);
     const url = tab.url || "";
-    let path = "";
-    try {
-      path = new URL(url).pathname;
-    } catch {}
-    // Already on /imagine (no trailing post/... path)
-    if (path === "/imagine" || path === "/imagine/") {
+    if (isImagineHome(url)) {
       return { ok: true, changed: false, url };
     }
-    // If URL doesn't even look like grok.com, bail — something's odd.
     if (!url.startsWith(GROK_ORIGIN)) {
       return { error: `unexpected_url: ${url.slice(0, 80)}` };
     }
-    // Navigate back to the compose home
-    await chrome.tabs.update(tabId, { url: `${GROK_ORIGIN}/imagine` });
-    // Wait for page to finish loading. Chrome exposes tab.status =
-    // "loading" → "complete". We also wait briefly after "complete"
-    // so React + our content-script fetch patch can re-install.
-    const deadline = Date.now() + 20000;
+
+    // Strategy 1: script-based hard navigation via window.location.
+    // This is the most reliable for SPAs — it forces a full page
+    // reload instead of Next.js client-side routing, so our content
+    // script reinjects cleanly and there's no stale React state.
+    let navStarted = false;
+    try {
+      const scriptRes = await grokExecInTab(tabId, () => {
+        try {
+          window.location.replace("/imagine");
+          return { ok: true };
+        } catch (e) {
+          return { error: String(e?.message || e) };
+        }
+      });
+      if (scriptRes?.ok) navStarted = true;
+    } catch {}
+
+    // Strategy 2: fallback to chrome.tabs.update if the script-based
+    // nav didn't register (e.g. tab was in a weird state).
+    if (!navStarted) {
+      try {
+        await chrome.tabs.update(tabId, { url: `${GROK_ORIGIN}/imagine` });
+        navStarted = true;
+      } catch (e) {
+        return {
+          error: `nav_kick_failed: ${String(e?.message || e).slice(0, 120)}`,
+        };
+      }
+    }
+
+    // Poll for the URL to reflect /imagine. We accept ANY URL whose
+    // pathname is /imagine even if status is still "loading" — on
+    // SPAs the URL can update before status flips, and on hard
+    // reloads we'll get another round once the new page finishes.
+    // 30-second budget (prior 20s was tight for SPAs under cold cache).
+    const deadline = Date.now() + 30000;
+    let lastUrl = url;
+    let urlReachedImagine = false;
+    let completeAfterImagine = false;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 400));
+      let refreshed;
       try {
-        const refreshed = await chrome.tabs.get(tabId);
-        if (
-          refreshed.status === "complete" &&
-          refreshed.url &&
-          (() => {
-            try {
-              const p = new URL(refreshed.url).pathname;
-              return p === "/imagine" || p === "/imagine/";
-            } catch {
-              return false;
-            }
-          })()
-        ) {
-          // Small extra delay for React re-hydration and any
-          // Statsig / fetch wrapper to initialize.
-          await new Promise((r) => setTimeout(r, 1500));
-          return { ok: true, changed: true, url: refreshed.url };
-        }
+        refreshed = await chrome.tabs.get(tabId);
       } catch {
         return { error: "tab_closed_during_nav" };
       }
+      lastUrl = refreshed.url || lastUrl;
+      if (isImagineHome(lastUrl)) {
+        urlReachedImagine = true;
+        if (refreshed.status === "complete") {
+          completeAfterImagine = true;
+          break;
+        }
+      }
     }
-    return { error: "navigation_timeout" };
+
+    if (!urlReachedImagine) {
+      return {
+        error: `navigation_timeout (last_url=${lastUrl.slice(0, 80)})`,
+      };
+    }
+
+    // Extra settle time — React hydration + content-script re-install
+    // + any Statsig SDK warm-up. Even if status never hit "complete"
+    // (rare, but possible when DevTools is closed), the URL is on
+    // /imagine so the composer should be usable after a beat.
+    await new Promise((r) =>
+      setTimeout(r, completeAfterImagine ? 2000 : 3000)
+    );
+    return { ok: true, changed: true, url: lastUrl };
   } catch (e) {
     return { error: `nav_err: ${String(e?.message || e).slice(0, 120)}` };
   }
