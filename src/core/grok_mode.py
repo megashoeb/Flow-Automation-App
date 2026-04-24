@@ -38,19 +38,28 @@ _ALLOWED_LEN = {6, 10}
 
 
 def _resolve_aspect_ratio(ratio_name: str) -> str:
+    """Resolve UI ratio label (e.g. 'Landscape (16:9)', 'VIDEO_ASPECT_RATIO_
+    PORTRAIT') to one of Grok's 5 accepted values: 16:9, 9:16, 1:1, 2:3,
+    3:2. Defaults to 16:9 for anything unrecognised."""
     raw = str(ratio_name or "").strip()
     if raw in _ALLOWED_ASPECT:
         return raw
     low = raw.lower()
-    if "portrait" in low or "9:16" in raw:
+    # Check raw tokens first (match "16:9" inside "Landscape (16:9)")
+    for token in ("9:16", "2:3", "3:2", "1:1", "16:9"):
+        if token in raw:
+            return token
+    # Common Flow identifiers
+    if "portrait" in low:
         return "9:16"
-    if "square" in low or "1:1" in raw:
+    if "square" in low:
         return "1:1"
-    if "2:3" in raw:
-        return "2:3"
-    if "3:2" in raw:
-        return "3:2"
-    if "landscape" in low or "16:9" in raw or not raw:
+    if "landscape" in low:
+        return "16:9"
+    # Flow internal strings like "VIDEO_ASPECT_RATIO_PORTRAIT"
+    if "portrait" in low.replace("_", " "):
+        return "9:16"
+    if "landscape" in low.replace("_", " "):
         return "16:9"
     return "16:9"
 
@@ -402,9 +411,23 @@ class GrokModeManager:
         short = (prompt[:40] + "…") if len(prompt) > 40 else prompt
         self._log(f"[{worker.slot_id}] Job {str(job_id)[:6]}…: {short}")
 
-        # Per-job aspect ratio if the video job carries one, else global default
+        # Per-job aspect ratio (Video tab's Ratio dropdown writes video_ratio)
         per_job_ratio = str(job.get("video_ratio") or "").strip()
         job_aspect = _resolve_aspect_ratio(per_job_ratio) if per_job_ratio else self._aspect
+
+        # Per-job resolution — Video tab's "Upscale" dropdown writes video_upscale.
+        # Map Veo-style values ("720p", "1080p", "4k", "none") → Grok resolution.
+        # Grok only supports 480p and 720p; anything above 720p falls back to 720p.
+        per_job_upscale = str(job.get("video_upscale") or "").strip().lower()
+        if per_job_upscale in {"480", "480p"}:
+            job_resolution = "480p"
+        elif per_job_upscale in {"720", "720p"}:
+            job_resolution = "720p"
+        elif per_job_upscale in {"1080", "1080p", "2k", "4k"}:
+            # Grok's top tier is 720p — inform user but continue
+            job_resolution = "720p"
+        else:
+            job_resolution = self._resolution
 
         # Reference image: pipeline produces start_image_path; user may also
         # specify image_path directly. Fall back to configured folder.
@@ -442,6 +465,13 @@ class GrokModeManager:
                 ref_b64 = ""
                 ref_name = ""
 
+        # Per-job settings snapshot — so user can verify the UI→Grok mapping
+        self._log(
+            f"[{worker.slot_id}] Grok config → aspect={job_aspect}, "
+            f"resolution={job_resolution}, length={self._video_length}s, "
+            f"mode={self._mode}, ref={'yes' if ref_b64 else 'no'}"
+        )
+
         # Submit to bridge
         try:
             future = self._bridge.submit_request(
@@ -449,7 +479,7 @@ class GrokModeManager:
                 prompt=prompt,
                 aspect_ratio=job_aspect,
                 video_length=self._video_length,
-                resolution=self._resolution,
+                resolution=job_resolution,
                 mode=self._mode,
                 reference_image_base64=ref_b64,
                 reference_image_filename=ref_name,
