@@ -160,6 +160,70 @@ async function grokInstallHeaderCapture(tabId) {
 // ═══════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════
+// Page navigation — each successful generation leaves the tab at
+// /imagine/post/<id> (the post detail view). That page has a
+// different composer — the Compose Post button targets a REPLY flow,
+// not a fresh /rest/app-chat/conversations/new. Before every dispatch
+// we make sure the tab is on the bare /imagine page so the next
+// prompt starts a clean new generation.
+//
+// Returns { ok, changed, url } or { error }.
+// ═══════════════════════════════════════════════════════════════════
+
+async function grokEnsureOnImaginePage(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const url = tab.url || "";
+    let path = "";
+    try {
+      path = new URL(url).pathname;
+    } catch {}
+    // Already on /imagine (no trailing post/... path)
+    if (path === "/imagine" || path === "/imagine/") {
+      return { ok: true, changed: false, url };
+    }
+    // If URL doesn't even look like grok.com, bail — something's odd.
+    if (!url.startsWith(GROK_ORIGIN)) {
+      return { error: `unexpected_url: ${url.slice(0, 80)}` };
+    }
+    // Navigate back to the compose home
+    await chrome.tabs.update(tabId, { url: `${GROK_ORIGIN}/imagine` });
+    // Wait for page to finish loading. Chrome exposes tab.status =
+    // "loading" → "complete". We also wait briefly after "complete"
+    // so React + our content-script fetch patch can re-install.
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 400));
+      try {
+        const refreshed = await chrome.tabs.get(tabId);
+        if (
+          refreshed.status === "complete" &&
+          refreshed.url &&
+          (() => {
+            try {
+              const p = new URL(refreshed.url).pathname;
+              return p === "/imagine" || p === "/imagine/";
+            } catch {
+              return false;
+            }
+          })()
+        ) {
+          // Small extra delay for React re-hydration and any
+          // Statsig / fetch wrapper to initialize.
+          await new Promise((r) => setTimeout(r, 1500));
+          return { ok: true, changed: true, url: refreshed.url };
+        }
+      } catch {
+        return { error: "tab_closed_during_nav" };
+      }
+    }
+    return { error: "navigation_timeout" };
+  } catch (e) {
+    return { error: `nav_err: ${String(e?.message || e).slice(0, 120)}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Image attachment — injects a File into Grok's composer UI so the
 // subsequent send click produces a proper image-to-video request (one
 // with fileAttachments set in the conversations/new body).
@@ -1096,6 +1160,26 @@ async function grokHandleWork(work) {
       "started",
       `account=${account} tab=${tabId} pool=${tabPool.length}`
     );
+
+    // After each completed generation Grok lands the tab on
+    // /imagine/post/<id>. The post view has a different composer
+    // (Compose Post → reply flow) that doesn't fire a fresh
+    // /rest/app-chat/conversations/new. Bounce back to /imagine
+    // before every dispatch so each job starts from a clean
+    // compose state.
+    const navResult = await grokEnsureOnImaginePage(tabId);
+    if (navResult.error) {
+      await grokSubmitResult(request_id, {
+        error: `navigation_failed_${navResult.error}`,
+        detail:
+          "Could not return to grok.com/imagine. Check the tab URL and " +
+          "make sure Grok is reachable.",
+      });
+      return;
+    }
+    if (navResult.changed) {
+      await grokReportProgress(request_id, "navigated", "→ /imagine");
+    }
 
   const userPrompt = String(prompt || "").trim();
   const hasReference = !!(reference_image_base64 && reference_image_filename);
