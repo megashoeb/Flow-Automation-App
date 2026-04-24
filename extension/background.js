@@ -13,6 +13,8 @@
 try { importScripts("personas.js"); } catch (e) { console.warn("personas.js not loaded:", e); }
 // Load Genspark module (standalone — uses port 18925 separately from Flow)
 try { importScripts("genspark.js"); } catch (e) { console.warn("genspark.js not loaded:", e); }
+// Load Grok module (standalone — uses port 18926 separately from Flow/Genspark)
+try { importScripts("grok.js"); } catch (e) { console.warn("grok.js not loaded:", e); }
 
 const BRIDGE_URL = "http://127.0.0.1:18924";
 const POLL_INTERVAL = 1500;
@@ -2376,4 +2378,14 @@ try {
   }
 } catch (e) {
   console.warn("[G-Labs Helper] Genspark module failed to start:", e);
+}
+
+// Start Grok module — independent of Flow/Genspark.
+// Silently stays idle when the Grok bridge (port 18926) isn't running.
+try {
+  if (typeof self.grokStart === "function") {
+    self.grokStart();
+  }
+} catch (e) {
+  console.warn("[G-Labs Helper] Grok module failed to start:", e);
 }

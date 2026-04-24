@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "G-Labs Studio Helper",
-  "version": "1.5.1",
-  "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image generation",
+  "version": "1.6.0",
+  "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image/video generation (Flow + Genspark + Grok)",
   "permissions": [
     "tabs",
     "scripting",
@@ -17,6 +17,7 @@
     "https://storage.googleapis.com/*",
     "http://127.0.0.1:18924/*",
     "http://127.0.0.1:18925/*",
+    "http://127.0.0.1:18926/*",
     "https://www.google.com/*",
     "https://www.youtube.com/*",
     "https://mail.google.com/*",
@@ -25,7 +26,10 @@
     "https://photos.google.com/*",
     "https://www.genspark.ai/*",
     "https://genspark.ai/*",
-    "https://cdn1.genspark.ai/*"
+    "https://cdn1.genspark.ai/*",
+    "https://grok.com/*",
+    "https://assets.grok.com/*",
+    "https://imagine-public.x.ai/*"
   ],
   "background": {
     "service_worker": "background.js"

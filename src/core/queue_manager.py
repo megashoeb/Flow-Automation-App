@@ -508,6 +508,29 @@ class AsyncQueueManager(QThread):
                 return
             self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
 
+        # Chrome Extension mode — Grok Imagine (video only, cookie auth, no reCAPTCHA)
+        elif self.generation_mode == "chrome_extension_grok":
+            self.signals.log_msg.emit(
+                "[SYSTEM] Generation mode: Chrome Extension — Grok Imagine "
+                "(grok.com video generation, SuperGrok/Premium+ accounts)"
+            )
+            try:
+                from src.core.grok_mode import GrokModeManager
+                manager = GrokModeManager(self)
+                await manager.run()
+            except ImportError:
+                self.signals.log_msg.emit(
+                    "[ERROR] grok_mode.py not found. Falling back to browser mode."
+                )
+            except Exception as e:
+                self.signals.log_msg.emit(
+                    f"[ERROR] Grok mode failed: {str(e)[:150]}. "
+                    "Falling back to browser mode."
+                )
+            else:
+                return
+            self.signals.log_msg.emit("[SYSTEM] Falling back to browser-per-slot mode.")
+
         # CDP Shared mode — 1 process per account, N contexts
         elif self.generation_mode == "cdp_shared":
             self.signals.log_msg.emit("[SYSTEM] Generation mode: CDP Shared (1 browser per account, N contexts)")

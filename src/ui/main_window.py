@@ -4845,6 +4845,10 @@ class MainWindow(QMainWindow):
             "Chrome Extension — Genspark (Nano Banana, unlimited Plus/Pro)",
             "chrome_extension_genspark",
         )
+        self.cmb_generation_mode.addItem(
+            "Chrome Extension — Grok Imagine (video only, SuperGrok)",
+            "chrome_extension_grok",
+        )
         self.cmb_generation_mode.setToolTip(
             "Browser per slot: Each slot opens its own browser (~300MB each). Proven stable.\n\n"
             "HTTP Shared: 1 browser per account for reCAPTCHA only.\n"
@@ -4859,7 +4863,12 @@ class MainWindow(QMainWindow):
             "Chrome Extension — Genspark: Drives genspark.ai directly through your logged-in\n"
             "Chrome tab. Plus plan ($24.99) gives UNLIMITED Nano Banana Pro 2K; Pro plan\n"
             "($249.99) gives UNLIMITED Nano Banana Pro 4K. No per-day caps, simpler cookie-\n"
-            "based auth. Runs on a separate bridge (port 18925) so Flow is untouched."
+            "based auth. Runs on a separate bridge (port 18925) so Flow is untouched.\n\n"
+            "Chrome Extension — Grok Imagine: Drives grok.com/imagine directly through your\n"
+            "logged-in Chrome tab. Video generation only (text→video or image→video). No\n"
+            "reCAPTCHA, cookie-based auth. SuperGrok ($30/mo) ~100 videos/day, Premium\n"
+            "$8/mo ~50/day, Premium+ $40/mo ~100/day. Settings saved under grok_* keys;\n"
+            "runs on separate bridge (port 18926) so Flow + Genspark are untouched."
         )
         saved_gen_mode = str(get_setting("generation_mode", "browser_per_slot") or "browser_per_slot").strip().lower()
         gen_mode_idx = self.cmb_generation_mode.findData(saved_gen_mode)
