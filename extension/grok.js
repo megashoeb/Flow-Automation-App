@@ -68,26 +68,41 @@ const grokSubmittedRequestIds = new Set();
 // periodically in case the page navigated/reloaded.
 // ═══════════════════════════════════════════════════════════════════
 
+// The actual fetch monkey-patch is installed by grok-inject.js as a
+// manifest content_script at document_start (world: MAIN). That way
+// it runs BEFORE Grok's own bundler grabs fetch, so every /rest/ call
+// — including the ones Grok makes on page load — is captured.
+//
+// This function is a belt-and-suspenders fallback: if the content
+// script somehow didn't install (e.g. older Chrome without MAIN-world
+// content_scripts), we install the same patch via executeScript. The
+// patch is idempotent so it's cheap to call on every detection cycle.
 async function grokInstallHeaderCapture(tabId) {
   try {
     const result = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
       func: () => {
-        if (window.__grokFetchPatchInstalled) return { ok: true, already: true };
+        if (window.__grokFetchPatchInstalled) {
+          return {
+            ok: true,
+            already: true,
+            captured: !!window.__grokHeadersCapturedAt,
+            stats: window.__grokCaptureStats || null,
+          };
+        }
         window.__grokFetchPatchInstalled = true;
         window.__grokLastHeaders = {};
         window.__grokHeadersCapturedAt = 0;
+        window.__grokCaptureStats = { totalCalls: 0, restCalls: 0 };
         const origFetch = window.fetch;
         window.fetch = async function (input, init) {
           try {
+            window.__grokCaptureStats.totalCalls++;
             const url =
               typeof input === "string" ? input : input && input.url ? input.url : "";
-            if (
-              url &&
-              (url.includes("/rest/app-chat/") ||
-                url.includes("/rest/media/"))
-            ) {
+            if (url && url.includes("/rest/")) {
+              window.__grokCaptureStats.restCalls++;
               const hdrs = init && init.headers;
               const snap = {};
               if (hdrs) {
@@ -101,17 +116,15 @@ async function grokInstallHeaderCapture(tabId) {
                   );
                 }
               }
-              // Merge with any prior capture so partial-header calls
-              // still contribute to a full snapshot.
               window.__grokLastHeaders = {
                 ...window.__grokLastHeaders,
                 ...snap,
               };
-              window.__grokHeadersCapturedAt = Date.now();
+              if (Object.keys(snap).length) {
+                window.__grokHeadersCapturedAt = Date.now();
+              }
             }
-          } catch (e) {
-            // Never let our instrumentation break real app fetches.
-          }
+          } catch (e) {}
           return origFetch.apply(this, arguments);
         };
         return { ok: true, installed: true };
@@ -133,12 +146,26 @@ async function grokReadCapturedHeaders(tabId) {
         return {
           headers: window.__grokLastHeaders || {},
           capturedAt: window.__grokHeadersCapturedAt || 0,
+          stats: window.__grokCaptureStats || { totalCalls: 0, restCalls: 0 },
+          patchInstalled: !!window.__grokFetchPatchInstalled,
         };
       },
     });
-    return result?.[0]?.result || { headers: {}, capturedAt: 0 };
+    return (
+      result?.[0]?.result || {
+        headers: {},
+        capturedAt: 0,
+        stats: { totalCalls: 0, restCalls: 0 },
+        patchInstalled: false,
+      }
+    );
   } catch {
-    return { headers: {}, capturedAt: 0 };
+    return {
+      headers: {},
+      capturedAt: 0,
+      stats: { totalCalls: 0, restCalls: 0 },
+      patchInstalled: false,
+    };
   }
 }
 
@@ -375,42 +402,46 @@ async function grokHandleWork(work) {
 
   await grokReportProgress(request_id, "started", `account=${account}`);
 
-  // Make sure the fetch header capture is installed in this tab, then
-  // snapshot the latest captured anti-bot headers. If none have been
-  // captured yet (user never hit a real Grok endpoint), nudge the page
-  // by fetching /rest/rate-limits which any logged-in user can call.
+  // Make sure the fetch header capture is installed, then read the
+  // latest snapshot of anti-bot headers Grok's own code has attached.
   try {
     await grokInstallHeaderCapture(tabId);
   } catch {}
 
   let captured = await grokReadCapturedHeaders(tabId);
-  if (!captured.capturedAt) {
-    // Trigger a benign real fetch so the page's own code attaches its
-    // anti-bot headers and our patch can capture them. We fire it from
-    // inside the tab so the page's fetch wrapper applies.
-    try {
-      await grokExecInTab(tabId, async () => {
-        try {
-          await fetch("/rest/rate-limits", {
-            method: "GET",
-            credentials: "include",
-            headers: { Accept: "application/json" },
-          });
-        } catch {}
-        // Also try the page's internal polling endpoint to help capture
-        await new Promise((r) => setTimeout(r, 300));
-        return { ok: true };
-      });
-      captured = await grokReadCapturedHeaders(tabId);
-    } catch {}
+  if (!captured.headers["x-statsig-id"]) {
+    // No x-statsig-id yet — Grok only attaches this on /rest/app-chat
+    // or /rest/media calls, and those happen only when the user takes
+    // an action. On a freshly-loaded /imagine page with no interaction
+    // we won't see one. Wait briefly in case the page is still booting
+    // (Statsig SDK fires a /initialize call on load in some versions)
+    // then read again.
+    await new Promise((r) => setTimeout(r, 1500));
+    captured = await grokReadCapturedHeaders(tabId);
   }
+
   const replayHeaders = grokPickReplayHeaders(captured.headers);
   const hasAntiBotHeaders = !!replayHeaders["x-statsig-id"];
-  await grokReportProgress(
-    request_id,
-    "headers_captured",
-    hasAntiBotHeaders ? "ok" : "missing_x-statsig-id"
-  );
+  const stats = captured.stats || { totalCalls: 0, restCalls: 0 };
+  const diagDetail = hasAntiBotHeaders
+    ? `ok (from ${stats.restCalls || 0} rest calls)`
+    : `MISSING — patch=${captured.patchInstalled ? "yes" : "no"}, ` +
+      `fetches=${stats.totalCalls || 0}, rest=${stats.restCalls || 0}. ` +
+      `→ generate 1 video manually on grok.com/imagine first, then retry`;
+  await grokReportProgress(request_id, "headers_captured", diagDetail);
+
+  if (!hasAntiBotHeaders) {
+    // Fail fast with an actionable error — no point running upload +
+    // create post just to be rejected at animate.
+    await grokSubmitResult(request_id, {
+      error: "no_antibot_headers_captured",
+      detail:
+        "Open grok.com/imagine and manually generate 1 video (any prompt) " +
+        "so the extension can capture Grok's anti-bot headers. Then click " +
+        "Start Automation again. This warmup is only needed once per tab.",
+    });
+    return;
+  }
 
   // ─────────────────────────────────────────────────────────────
   // Step 1 (optional): Upload reference image

@@ -533,11 +533,26 @@ class GrokModeManager:
         # Interpret result
         if not result or result.get("error"):
             err = (result or {}).get("error", "unknown_error")
-            body_preview = (result or {}).get("response_body", "")
+            body_preview = (result or {}).get("response_body", "") or (result or {}).get("detail", "")
             msg = f"{err}"
             if body_preview:
-                msg += f" — {body_preview[:120]}"
+                msg += f" — {body_preview[:200]}"
             self._log(f"[{worker.slot_id}] Grok returned error: {msg}")
+
+            # Surface actionable guidance for the common first-run error:
+            # captured headers were empty (user hasn't interacted with Grok
+            # yet on this tab). This isn't retryable silently — user must
+            # warm up the tab.
+            if err == "no_antibot_headers_captured":
+                self._log(
+                    "[GrokMode] ⚠ Grok anti-bot headers not captured yet.\n"
+                    "  Open the grok.com/imagine tab in Chrome, type any prompt\n"
+                    "  (e.g. 'a cat'), and click send to generate 1 video\n"
+                    "  manually. This triggers Grok's code to attach its\n"
+                    "  x-statsig-id header which the extension then captures.\n"
+                    "  After that, click Start Automation again — this only\n"
+                    "  needs to be done once per Chrome session."
+                )
 
             # Specific error handling
             if "moderat" in str(err).lower():

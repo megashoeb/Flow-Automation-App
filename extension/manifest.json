@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "G-Labs Studio Helper",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Connects G-Labs Automation Studio to Chrome for fast, reliable image/video generation (Flow + Genspark + Grok)",
   "permissions": [
     "tabs",
@@ -34,6 +34,15 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": ["https://grok.com/*"],
+      "js": ["grok-inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
