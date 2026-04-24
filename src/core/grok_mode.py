@@ -442,11 +442,40 @@ class GrokModeManager:
         else:
             job_resolution = self._resolution
 
-        # Reference image: pipeline produces start_image_path; user may also
-        # specify image_path directly. Fall back to configured folder.
-        image_path = str(
-            job.get("start_image_path") or job.get("image_path") or ""
-        )
+        # Reference image — look in every field the app may populate:
+        #   - start_image_path : pipeline output (image→video chain)
+        #   - ref_path         : "Video + Ref" tab, single reference
+        #   - ref_paths        : "Video + Ref" tab, list / CSV of refs
+        #   - image_path       : legacy / custom dispatch field
+        # Falls back to configured reference folder if none present.
+        def _first_ref_path(raw: Any) -> str:
+            if not raw:
+                return ""
+            s = str(raw).strip()
+            if not s:
+                return ""
+            # ref_paths may come as JSON list string or ; / , separated
+            if s.startswith("["):
+                try:
+                    import json as _json
+                    arr = _json.loads(s)
+                    if isinstance(arr, list) and arr:
+                        return str(arr[0])
+                except Exception:
+                    pass
+            for sep in ";", ",", "\n":
+                if sep in s:
+                    first = s.split(sep, 1)[0].strip()
+                    if first:
+                        return first
+            return s
+
+        image_path = ""
+        for field in ("start_image_path", "ref_path", "ref_paths", "image_path"):
+            candidate = _first_ref_path(job.get(field))
+            if candidate:
+                image_path = candidate
+                break
         ref_b64 = ""
         ref_name = ""
         ref_mime = "image/jpeg"
