@@ -674,7 +674,10 @@ async function grokClickSend(tabId, prompt) {
       if (NOT_SEND_TOKENS.test(combinedLabel)) {
         score -= 50;
       }
-      if (hasSvg && text.length === 0) score += 15;
+      // Icon-only button (no text, has SVG) is VERY likely the send
+      // arrow in a modern chat composer — bump the reward so it beats
+      // any random "Submit" text button elsewhere on the page.
+      if (hasSvg && text.length === 0) score += 25;
       if (text.length > 0) {
         if (MODE_TOKENS.test(text)) score -= 40;
         else score -= 3;
@@ -682,20 +685,31 @@ async function grokClickSend(tabId, prompt) {
       if (MODE_TOKENS.test(combinedLabel)) score -= 40;
       score += ((rect.right || 0) / Math.max(1, window.innerWidth)) * 5;
       if (rect.width > 0 && rect.width < 60 && rect.height < 60 && hasSvg && text.length === 0) {
-        score += 3;
+        score += 10; // was +3 — small icon in composer is very diagnostic
       }
       if (rect.width < 16 || rect.height < 16) score -= 50;
 
-      // Small extra reward for being on the same horizontal row as the
-      // input AND to its right — typical send-button placement in a
-      // chat composer.
+      // STRONG reward for being on the same horizontal row as the input
+      // AND to its right — that's exactly where the send arrow lives
+      // in a chat composer. Previously +8; a "Submit" text button
+      // elsewhere on the page with +30 label match could still beat
+      // the real send. Bumping to +20 puts the composer-row icon
+      // firmly ahead.
+      let inComposerRow = false;
       try {
         const inputCenterY = (inputRect.top + inputRect.bottom) / 2;
         const btnCenterY = (rect.top + rect.bottom) / 2;
-        if (Math.abs(inputCenterY - btnCenterY) < 50 && rect.left >= inputRect.left) {
-          score += 8;
+        if (Math.abs(inputCenterY - btnCenterY) < 60 && rect.left >= inputRect.left) {
+          score += 20;
+          inComposerRow = true;
         }
       } catch {}
+
+      // Extra "this is almost certainly the send" signal: icon-only
+      // AND in the composer row. Real send buttons always tick both.
+      if (inComposerRow && hasSvg && text.length === 0) {
+        score += 15;
+      }
 
       return { btn: b, score, text, ariaLabel, title, hasSvg, type, rect };
     });
@@ -1322,25 +1336,21 @@ async function grokHandleWork(work) {
     "clicked",
     `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"}${scoreInfo})`
   );
-  // Always surface top-5 candidates if the score was < 30 (below the
-  // "explicit send match" threshold). Makes it obvious what else was
-  // around. If explicitMatch is true we skip the log.
-  if (
-    !clickResult.explicitMatch &&
-    typeof clickResult.buttonScore === "number" &&
-    clickResult.buttonScore < 30 &&
-    clickResult.topCandidates
-  ) {
+  // If we DIDN'T hit the explicit-match short-circuit, surface the
+  // top-5 candidates so the log shows what else was competing. Helps
+  // debug when image-mode or other UI variants pick a wrong button
+  // (the "Submit" text button with score 49.9 bug from v1.8.6).
+  if (!clickResult.explicitMatch && clickResult.topCandidates) {
     const cands = clickResult.topCandidates
       .slice(0, 5)
       .map(
         (c) =>
           `[${c.score}|${c.tag || "?"}${c.hasSvg ? "+svg" : ""} "${
-            c.ariaLabel || c.text || "-"
+            (c.ariaLabel || c.text || "-").slice(0, 20)
           }"]`
       )
       .join(" ");
-    await grokReportProgress(request_id, "low_confidence_click", cands);
+    await grokReportProgress(request_id, "click_candidates", cands);
   }
 
   // Poll for videoUrl — either from the fetch-wrapper's stream capture
@@ -1353,6 +1363,22 @@ async function grokHandleWork(work) {
   let errorSeen = "";
   const pollDeadline = Date.now() + 240000; // 4 min safety cap
   let lastReportedProgress = -1;
+
+  // Click-effect verification — within 25 seconds Grok's own code
+  // should either (a) start streaming progress (progress > 0), (b)
+  // navigate the tab to /imagine/post/<id>, or (c) populate a DOM
+  // video element. If NONE of those happen, the click landed on the
+  // wrong button (common issue in image-mode when the send button's
+  // aria-label is empty and a text-"Submit" button wins the
+  // heuristic). Fail fast with a clear error so the job doesn't
+  // tie up the tab for 4 minutes.
+  const clickEffectDeadline = Date.now() + 25000;
+
+  let urlNavigated = false;
+  const initialUrl = (await (async () => {
+    try { const t = await chrome.tabs.get(tabId); return t.url || ""; }
+    catch { return ""; }
+  })()) || "";
 
   while (Date.now() < pollDeadline) {
     const state = await grokReadAutomationState(tabId);
@@ -1379,6 +1405,38 @@ async function grokHandleWork(work) {
         );
       }
     }
+
+    // Click-effect check. Within 25s we expect SOME signal: progress
+    // > 0, URL change to /post/<id>, or a <video> in the DOM. If
+    // none yet, keep waiting up to the deadline; after the deadline
+    // fail fast so the tab is released for the next job.
+    if (!urlNavigated) {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (
+          t.url &&
+          t.url !== initialUrl &&
+          t.url.includes("/imagine/post/")
+        ) {
+          urlNavigated = true;
+          await grokReportProgress(
+            request_id,
+            "post_page_reached",
+            t.url.slice(0, 100)
+          );
+        }
+      } catch {}
+    }
+    const clickHadEffect =
+      urlNavigated ||
+      progressPct > 0 ||
+      !!domFallbackUrl ||
+      !!videoUrl;
+    if (!clickHadEffect && Date.now() > clickEffectDeadline) {
+      errorSeen = "click_no_effect";
+      break;
+    }
+
     await new Promise((r) => setTimeout(r, 2000));
   }
 
