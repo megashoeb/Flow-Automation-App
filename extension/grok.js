@@ -209,64 +209,77 @@ async function grokDetectAccounts() {
     const fresh = {};
     for (const tab of tabs) {
       try {
-        // Grok's user info lives in /rest/rate-limits or the page's
-        // bootstrap data. Simplest reliable probe: hit /rest/rate-limits
-        // which returns the logged-in user context.
+        // Account detection — Grok's /rest/* endpoints for user identity
+        // aren't public, so probing them produces a bunch of noisy 404s
+        // in the user's DevTools console. Instead, we rely on signals
+        // already present in the page:
+        //   1. HTML body — Grok's UI embeds asset URLs that contain the
+        //      user's UUID: https://assets.grok.com/users/<uuid>/<...>
+        //   2. localStorage — Grok's Next.js bootstrap sometimes leaves
+        //      userId under a predictable key
+        // Either path gives us a user handle without any network noise.
         const result = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           world: "MAIN",
           func: async () => {
-            // Probe multiple likely endpoints — API names rotate and we
-            // want a cheap way to confirm login + extract userId.
-            const endpoints = [
-              "/rest/user/me",
-              "/rest/auth/me",
-              "/rest/users/me",
-              "/rest/app-chat/users/me",
-              "/rest/account/me",
-            ];
-            let userInfo = null;
-            for (const ep of endpoints) {
+            let userId = "";
+            let email = "";
+            // Strategy 1: HTML body contains asset URLs with userId
+            try {
+              const html = document.documentElement?.innerHTML || "";
+              const m = html.match(
+                /assets\.grok\.com\/users\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
+              );
+              if (m) userId = m[1];
+            } catch {}
+            // Strategy 2: localStorage scan for Grok-ish keys
+            if (!userId) {
               try {
-                const r = await fetch(ep, {
-                  method: "GET",
-                  credentials: "include",
-                  headers: { "Accept": "application/json" },
-                });
-                if (!r.ok) continue;
-                const ctype = r.headers.get("content-type") || "";
-                if (!ctype.includes("json")) continue;
-                const data = await r.json().catch(() => null);
-                if (!data) continue;
-                const u = data?.user || data?.data || data;
-                const email = u?.email || u?.userEmail || u?.username || "";
-                const userId = u?.id || u?.userId || u?.user_id || "";
-                if (email || userId) {
-                  userInfo = {
-                    email: email || `grok_user_${String(userId).slice(0, 8)}`,
-                    userId: String(userId || ""),
-                    subscription: String(u?.subscription || u?.tier || u?.plan || ""),
-                  };
-                  break;
+                for (let i = 0; i < localStorage.length; i++) {
+                  const k = localStorage.key(i) || "";
+                  const lk = k.toLowerCase();
+                  if (lk.includes("user") || lk.includes("auth") || lk.includes("session")) {
+                    const v = localStorage.getItem(k) || "";
+                    const uidMatch = v.match(/"(?:id|userId|user_id)"\s*:\s*"([0-9a-f-]{36})"/i);
+                    if (uidMatch) { userId = uidMatch[1]; break; }
+                  }
                 }
               } catch {}
             }
-            // Fallback — parse userId from any recent asset URL in the page
-            if (!userInfo) {
+            // Strategy 3: page scripts may leave __NEXT_DATA__ with user info
+            if (!userId) {
               try {
-                const match = document.body?.innerHTML?.match(
-                  /assets\.grok\.com\/users\/([0-9a-f-]{36})/i
-                );
-                if (match) {
-                  userInfo = {
-                    email: `grok_user_${match[1].slice(0, 8)}`,
-                    userId: match[1],
-                    subscription: "",
-                  };
+                const nd = document.getElementById("__NEXT_DATA__");
+                if (nd && nd.textContent) {
+                  const m = nd.textContent.match(
+                    /"userId"\s*:\s*"([0-9a-f]{8}-[0-9a-f-]{27,})"/i
+                  );
+                  if (m) userId = m[1];
                 }
               } catch {}
             }
-            return userInfo || { error: "not_logged_in" };
+            if (!userId) return { error: "not_logged_in" };
+            // Look for email too (nice-to-have, rarely available)
+            try {
+              const html = document.documentElement?.innerHTML || "";
+              const em = html.match(
+                /"email"\s*:\s*"([^"<>\s]+@[^"<>\s]+)"/i
+              );
+              if (em) email = em[1];
+            } catch {}
+            // Subscription — look for common markers
+            let sub = "";
+            try {
+              const html = document.documentElement?.innerHTML || "";
+              if (/supergrok/i.test(html)) sub = "SuperGrok";
+              else if (/premium\s*\+/i.test(html)) sub = "Premium+";
+              else if (/premium/i.test(html)) sub = "Premium";
+            } catch {}
+            return {
+              email: email || `grok_user_${userId.slice(0, 8)}`,
+              userId,
+              subscription: sub,
+            };
           },
         });
         const info = result?.[0]?.result;
