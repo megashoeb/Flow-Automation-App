@@ -702,9 +702,11 @@ async function grokHandleWork(work) {
     request_id,
     account,
     prompt,
-    // Reference image for image→video (Phase 2; text→video is fine for MVP)
+    // Reference image — for image→video (Approach 2: HTTP upload +
+    // URL-in-text + click send)
     reference_image_base64,
     reference_image_filename,
+    reference_image_mime,
   } = work;
 
   if (grokSubmittedRequestIds.has(request_id)) return;
@@ -725,36 +727,108 @@ async function grokHandleWork(work) {
 
   await grokReportProgress(request_id, "started", `account=${account}`);
 
+  const userPrompt = String(prompt || "").trim();
   const hasReference = !!(reference_image_base64 && reference_image_filename);
-  if (hasReference) {
-    // Image→video via click-based flow would need to simulate the
-    // "+ upload" picker which can't be done headlessly. Report a
-    // clean error for now; Phase 2 will wire it up via a paste
-    // event once we've confirmed text→video works end-to-end.
-    await grokSubmitResult(request_id, {
-      error: "image_to_video_not_supported_yet",
-      detail:
-        "Grok's file picker can't be automated headlessly. Text-to-video " +
-        "works via click-based dispatch — retry without a reference image.",
-    });
-    return;
-  }
 
   // ─────────────────────────────────────────────────────────────
-  // Click-based dispatch — type prompt into textarea and click send.
-  // Grok's own JS then fires /rest/app-chat/conversations/new with a
-  // FRESH x-statsig-id (which is what the backend's anti-bot checks).
-  // We tee the response stream via the content-script fetch patch and
-  // poll for the resulting videoUrl.
+  // Approach 2 (image→video): HTTP-upload the reference image to
+  // Grok's own endpoint, then feed the resulting asset URL into the
+  // textarea as part of the message before clicking send. Grok's
+  // JS will see the grok.com/assets URL in the message body and
+  // (based on observed HAR) attach it as a video reference.
+  //
+  // Upload endpoint isn't anti-bot gated — we've confirmed /rest/
+  // app-chat/upload-file goes through with just cookies. The heavy
+  // gate is conversations/new, which we still route through the
+  // click-based dispatch so Grok's code attaches the fresh
+  // x-statsig-id for us.
   // ─────────────────────────────────────────────────────────────
-  const userPrompt = String(prompt || "").trim();
-  if (!userPrompt) {
+  let messageForClick = userPrompt;
+
+  if (hasReference) {
+    await grokReportProgress(
+      request_id,
+      "uploading_image",
+      reference_image_filename
+    );
+
+    const uploadResult = await grokExecInTab(tabId, async (args) => {
+      try {
+        const r = await fetch("/rest/app-chat/upload-file", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fileName: args.fileName,
+            fileMimeType: args.fileMimeType,
+            fileSource: "IMAGINE_SELF_UPLOAD_FILE_SOURCE",
+            content: args.content,
+          }),
+        });
+        const status = r.status;
+        const text = await r.text();
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch {}
+        return { status, text: parsed ? null : text, data: parsed };
+      } catch (e) {
+        return { status: 0, error: String(e?.message || e) };
+      }
+    }, {
+      fileName: reference_image_filename,
+      fileMimeType: reference_image_mime || "image/jpeg",
+      content: reference_image_base64,
+    });
+
+    if (!uploadResult || uploadResult.status !== 200 || !uploadResult.data) {
+      const errBody =
+        uploadResult?.error ||
+        uploadResult?.text ||
+        JSON.stringify(uploadResult?.data || {});
+      await grokSubmitResult(request_id, {
+        error: `upload_failed_${uploadResult?.status || "?"}`,
+        response_body: String(errBody).slice(0, 500),
+      });
+      return;
+    }
+
+    const fileMetadataId = uploadResult.data.fileMetadataId || "";
+    const fileUri = uploadResult.data.fileUri || "";
+    if (!fileMetadataId || !fileUri) {
+      await grokSubmitResult(request_id, {
+        error: "upload_no_id",
+        response_body: JSON.stringify(uploadResult.data).slice(0, 500),
+      });
+      return;
+    }
+
+    const mediaUrl = `${GROK_ASSETS_ORIGIN}/${fileUri}`;
+    await grokReportProgress(request_id, "image_uploaded", fileMetadataId);
+
+    // Construct the textarea message. Real image-to-video calls use
+    // "<URL>  <verb>" with a double-space separator and a verb like
+    // "animate" (HAR grok.com2.har). If the user supplied a prompt,
+    // use it as the verb; otherwise fall back to "animate".
+    const verb = userPrompt || "animate";
+    messageForClick = `${mediaUrl}  ${verb}`;
+  } else if (!userPrompt) {
     await grokSubmitResult(request_id, { error: "empty_prompt" });
     return;
   }
 
-  await grokReportProgress(request_id, "clicking_send", "");
-  const clickResult = await grokClickSend(tabId, userPrompt);
+  // ─────────────────────────────────────────────────────────────
+  // Click-based dispatch — type the composed message into the
+  // textarea / contenteditable and click send. Grok's own JS then
+  // fires /rest/app-chat/conversations/new with a FRESH x-statsig-id,
+  // which is what the backend's anti-bot check requires. We tee the
+  // response stream via the content-script fetch patch and poll for
+  // the resulting videoUrl.
+  // ─────────────────────────────────────────────────────────────
+  await grokReportProgress(
+    request_id,
+    "clicking_send",
+    hasReference ? "image_mode" : "text_mode"
+  );
+  const clickResult = await grokClickSend(tabId, messageForClick);
   if (!clickResult || clickResult.error) {
     const dbgStr = clickResult?.debug
       ? ` | debug: ${JSON.stringify(clickResult.debug).slice(0, 300)}`
