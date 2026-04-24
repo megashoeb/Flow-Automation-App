@@ -44,9 +44,20 @@ const GROK_MAX_PARALLEL = 15;
 
 // ─── State ───
 let grokBridgeConnected = false;
-let grokAccounts = {};  // email → { email, userId, tab_id, last_seen }
+// grokAccounts is keyed by email. Each account may have ONE OR MORE
+// grok.com/imagine tabs open — that's how the user scales
+// parallelism (one tab per concurrent slot). The structure now holds
+// a `tab_ids` array; `tab_id` is kept as a deprecated alias for
+// backwards compat with any old dispatcher code paths.
+let grokAccounts = {};
 let grokLastPollError = "";
 let grokActiveCount = 0;
+
+// Per-tab busy lock. When a job is mid-click/polling on a tab, set
+// grokTabBusy[tabId] = true so concurrent worker slots don't stomp on
+// each other's window.__grokAutomationVideoUrl / __grokAutomationActive
+// flags. Cleared after the job completes or times out.
+const grokTabBusy = {};
 
 // Dedupe — bridge shouldn't re-dispatch but belt-and-suspenders.
 const grokInFlightRequestIds = new Set();
@@ -882,13 +893,24 @@ async function grokDetectAccounts() {
         });
         const info = result?.[0]?.result;
         if (info && !info.error) {
-          fresh[info.email] = {
-            email: info.email,
-            userId: info.userId,
-            subscription: info.subscription,
-            tab_id: tab.id,
-            last_seen: Date.now(),
-          };
+          const existing = fresh[info.email];
+          if (existing) {
+            // Same account, additional tab — user wants parallelism.
+            if (!existing.tab_ids.includes(tab.id)) {
+              existing.tab_ids.push(tab.id);
+            }
+          } else {
+            fresh[info.email] = {
+              email: info.email,
+              userId: info.userId,
+              subscription: info.subscription,
+              tab_ids: [tab.id],
+              // Deprecated alias — first tab — keeps older code paths
+              // working until they're migrated to tab_ids.
+              tab_id: tab.id,
+              last_seen: Date.now(),
+            };
+          }
           // Install the fetch header capture into this tab's MAIN world.
           // Idempotent — re-runs are no-ops once installed, so safe to
           // call on every detection cycle.
@@ -899,6 +921,15 @@ async function grokDetectAccounts() {
       } catch (e) {
         // Tab closed mid-probe or no access — skip silently.
       }
+    }
+    // Clean up busy flags for tabs that no longer exist (e.g. user
+    // closed one mid-run). Keeps grokTabBusy from growing unbounded.
+    const liveTabIds = new Set();
+    for (const acc of Object.values(fresh)) {
+      for (const tid of acc.tab_ids || []) liveTabIds.add(tid);
+    }
+    for (const k of Object.keys(grokTabBusy)) {
+      if (!liveTabIds.has(Number(k))) delete grokTabBusy[k];
     }
     grokAccounts = fresh;
 
@@ -997,16 +1028,74 @@ async function grokHandleWork(work) {
     await grokSubmitResult(request_id, { error: "account_tab_not_found" });
     return;
   }
-  const tabId = info.tab_id;
 
-  try {
-    await chrome.tabs.get(tabId);
-  } catch {
-    await grokSubmitResult(request_id, { error: "tab_closed" });
+  // ─── Pick a free tab ───
+  // Account may have multiple grok.com/imagine tabs open — each tab
+  // is an independent dispatch slot (1 video generation at a time
+  // per tab, due to Grok's UI lock during render). Pick the first
+  // tab that isn't already handling a job; if all are busy, wait.
+  const tabPool = Array.isArray(info.tab_ids) && info.tab_ids.length
+    ? info.tab_ids
+    : info.tab_id
+    ? [info.tab_id]
+    : [];
+  if (!tabPool.length) {
+    await grokSubmitResult(request_id, { error: "account_tab_not_found" });
     return;
   }
 
-  await grokReportProgress(request_id, "started", `account=${account}`);
+  let tabId = null;
+  const waitStart = Date.now();
+  while (tabId === null) {
+    // Pick the first non-busy tab that's still alive.
+    for (const candidate of tabPool) {
+      if (grokTabBusy[candidate]) continue;
+      try {
+        const t = await chrome.tabs.get(candidate);
+        if (t) { tabId = candidate; break; }
+      } catch { /* tab closed — skip */ }
+    }
+    if (tabId !== null) break;
+    // No free tab — wait, respecting the bridge's 6-min dispatch
+    // lock. Report "tab_wait" so the user can see the hold happening.
+    if (Date.now() - waitStart > 330000) {
+      await grokSubmitResult(request_id, {
+        error: "all_tabs_busy_timeout",
+        detail:
+          `All ${tabPool.length} tab(s) for ${account} stayed busy >5min. ` +
+          "Either increase tab count (open more grok.com/imagine tabs) " +
+          "or reduce concurrent slots in app settings.",
+      });
+      return;
+    }
+    if ((Date.now() - waitStart) % 10000 < 2100) {
+      await grokReportProgress(
+        request_id,
+        "tab_wait",
+        `${tabPool.length} tab(s) busy, waiting...`
+      );
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  grokTabBusy[tabId] = true;
+
+  // Wrap the entire job body in try/finally so the busy flag is
+  // ALWAYS released — even on unexpected errors — so subsequent
+  // jobs don't stall on a phantom lock.
+  try {
+    try {
+      await chrome.tabs.get(tabId);
+    } catch {
+      await grokSubmitResult(request_id, { error: "tab_closed" });
+      return;
+    }
+
+    await grokReportProgress(
+      request_id,
+      "started",
+      `account=${account} tab=${tabId} pool=${tabPool.length}`
+    );
 
   const userPrompt = String(prompt || "").trim();
   const hasReference = !!(reference_image_base64 && reference_image_filename);
@@ -1240,17 +1329,26 @@ async function grokHandleWork(work) {
     return;
   }
 
-  // Success — send video bytes back to bridge
-  await grokSubmitResult(request_id, {
-    success: true,
-    video_url: fullVideoUrl,
-    video_id: animateResult.videoId,
-    post_id: postId,
-    size_bytes: downloadResult.size,
-    content_base64: downloadResult.content_base64,
-    mime_type: "video/mp4",
-  });
-  grokSubmittedRequestIds.add(request_id);
+    // Success — send video bytes back to bridge
+    await grokSubmitResult(request_id, {
+      success: true,
+      video_url: fullVideoUrl,
+      video_id: animateResult.videoId,
+      post_id: postId,
+      size_bytes: downloadResult.size,
+      content_base64: downloadResult.content_base64,
+      mime_type: "video/mp4",
+    });
+    grokSubmittedRequestIds.add(request_id);
+  } finally {
+    // Always release the tab lock so the next job on this tab can
+    // proceed. Also clear the automation flag on the page so stale
+    // capture state from this run doesn't leak into the next.
+    grokTabBusy[tabId] = false;
+    try {
+      await grokClearAutomationFlag(tabId);
+    } catch {}
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
