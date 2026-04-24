@@ -137,6 +137,162 @@ async function grokInstallHeaderCapture(tabId) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Click-based dispatch — sets the textarea value, clicks send, and
+// lets Grok's own code fire the /rest/app-chat/conversations/new
+// call. Grok's SDK attaches a fresh x-statsig-id at call time (we
+// can't replicate that from a replay — each call has its own value),
+// which is why direct fetch() always hits anti-bot. Click-based is
+// HTTP at its core: we just trigger Grok's in-page code path.
+//
+// Returns { ok, buttonInfo } on success or { error } on failure.
+// ═══════════════════════════════════════════════════════════════════
+
+async function grokClickSend(tabId, prompt) {
+  return grokExecInTab(tabId, async (args) => {
+    // Arm automation flags so the fetch wrapper captures the
+    // conversations/new response stream.
+    window.__grokAutomationActive = true;
+    window.__grokAutomationVideoUrl = "";
+    window.__grokAutomationVideoId = "";
+    window.__grokAutomationProgress = 0;
+    window.__grokAutomationError = "";
+    window.__grokAutomationStartedAt = Date.now();
+
+    // Find the prompt textarea. Grok's /imagine page uses a single
+    // visible textarea; we grab the first one that's actually in the
+    // layout (offsetParent != null means not display:none).
+    const textareas = Array.from(document.querySelectorAll("textarea"));
+    const textarea =
+      textareas.find((t) => t.offsetParent !== null) || textareas[0];
+    if (!textarea) {
+      window.__grokAutomationActive = false;
+      return { error: "no_textarea_found" };
+    }
+
+    // Set the value via the native setter so React's onChange fires
+    // (using textarea.value = x directly is swallowed by React's
+    // SyntheticEvent dedup).
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value"
+    ).set;
+    nativeSetter.call(textarea, String(args.prompt || ""));
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.focus();
+
+    // Wait for React to re-render and enable the send button.
+    await new Promise((r) => setTimeout(r, 600));
+
+    // Find the send button. Multiple strategies:
+    // A) form submit button
+    // B) enabled button with SVG nearest textarea (the arrow-up icon)
+    let sendBtn = null;
+    const form = textarea.closest("form");
+    if (form) {
+      sendBtn = form.querySelector("button[type='submit']");
+      if (sendBtn && sendBtn.disabled) sendBtn = null;
+    }
+    if (!sendBtn) {
+      const scope =
+        form ||
+        textarea.closest("[class*='chat']") ||
+        textarea.parentElement?.parentElement?.parentElement ||
+        document.body;
+      const btns = Array.from(scope.querySelectorAll("button"));
+      // Prefer the LAST enabled button with an SVG — that's usually
+      // the arrow-send icon in modern chat UIs.
+      const candidates = btns.filter(
+        (b) => !b.disabled && b.querySelector("svg")
+      );
+      sendBtn = candidates[candidates.length - 1] || null;
+    }
+    if (!sendBtn) {
+      window.__grokAutomationActive = false;
+      return { error: "no_send_button_found" };
+    }
+
+    // Click it!
+    sendBtn.click();
+
+    const label =
+      sendBtn.getAttribute("aria-label") ||
+      sendBtn.title ||
+      sendBtn.textContent.trim().slice(0, 40) ||
+      "svg-btn";
+    return { ok: true, buttonLabel: label };
+  }, { prompt });
+}
+
+async function grokReadAutomationState(tabId) {
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => ({
+        active: !!window.__grokAutomationActive,
+        videoUrl: window.__grokAutomationVideoUrl || "",
+        videoId: window.__grokAutomationVideoId || "",
+        progress: window.__grokAutomationProgress || 0,
+        error: window.__grokAutomationError || "",
+        startedAt: window.__grokAutomationStartedAt || 0,
+        // Also scan for a <video> element with assets.grok.com src
+        // (fallback when fetch stream capture somehow misses).
+        domVideoUrl: (() => {
+          try {
+            const vs = Array.from(document.querySelectorAll("video"));
+            for (const v of vs) {
+              if (v.src && v.src.includes("assets.grok.com/users")) {
+                return v.src;
+              }
+              const srcs = v.querySelectorAll("source");
+              for (const s of srcs) {
+                if (s.src && s.src.includes("assets.grok.com/users")) {
+                  return s.src;
+                }
+              }
+            }
+          } catch {}
+          return "";
+        })(),
+      }),
+    });
+    return (
+      result?.[0]?.result || {
+        active: false,
+        videoUrl: "",
+        videoId: "",
+        progress: 0,
+        error: "",
+        startedAt: 0,
+        domVideoUrl: "",
+      }
+    );
+  } catch {
+    return {
+      active: false,
+      videoUrl: "",
+      videoId: "",
+      progress: 0,
+      error: "",
+      startedAt: 0,
+      domVideoUrl: "",
+    };
+  }
+}
+
+async function grokClearAutomationFlag(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        window.__grokAutomationActive = false;
+      },
+    });
+  } catch {}
+}
+
 async function grokReadCapturedHeaders(tabId) {
   try {
     const result = await chrome.scripting.executeScript({
@@ -418,16 +574,9 @@ async function grokHandleWork(work) {
     request_id,
     account,
     prompt,
-    // Optional — if user supplied a reference image, bridge sends bytes
-    // as base64 + filename + mime so we can POST to /upload-file.
+    // Reference image for image→video (Phase 2; text→video is fine for MVP)
     reference_image_base64,
     reference_image_filename,
-    reference_image_mime,
-    // Video settings
-    aspect_ratio = "16:9",
-    video_length = 10,
-    resolution = "720p",
-    mode = "custom",
   } = work;
 
   if (grokSubmittedRequestIds.has(request_id)) return;
@@ -448,295 +597,120 @@ async function grokHandleWork(work) {
 
   await grokReportProgress(request_id, "started", `account=${account}`);
 
-  // Make sure the fetch header capture is installed, then read the
-  // latest snapshot of anti-bot headers Grok's own code has attached.
-  try {
-    await grokInstallHeaderCapture(tabId);
-  } catch {}
-
-  let captured = await grokReadCapturedHeaders(tabId);
-  if (!captured.headers["x-statsig-id"]) {
-    // No x-statsig-id yet — Grok only attaches this on /rest/app-chat
-    // or /rest/media calls, and those happen only when the user takes
-    // an action. On a freshly-loaded /imagine page with no interaction
-    // we won't see one. Wait briefly in case the page is still booting
-    // (Statsig SDK fires a /initialize call on load in some versions)
-    // then read again.
-    await new Promise((r) => setTimeout(r, 1500));
-    captured = await grokReadCapturedHeaders(tabId);
-  }
-
-  const replayHeaders = grokPickReplayHeaders(captured.headers);
-  const hasAntiBotHeaders = !!replayHeaders["x-statsig-id"];
-  const stats = captured.stats || { totalCalls: 0, restCalls: 0 };
-  const diagDetail = hasAntiBotHeaders
-    ? `ok (from ${stats.restCalls || 0} rest calls)`
-    : `MISSING — patch=${captured.patchInstalled ? "yes" : "no"}, ` +
-      `fetches=${stats.totalCalls || 0}, rest=${stats.restCalls || 0}. ` +
-      `→ generate 1 video manually on grok.com/imagine first, then retry`;
-  await grokReportProgress(request_id, "headers_captured", diagDetail);
-
-  if (!hasAntiBotHeaders) {
-    // Fail fast with an actionable error — no point running upload +
-    // create post just to be rejected at animate.
-    await grokSubmitResult(request_id, {
-      error: "no_antibot_headers_captured",
-      detail:
-        "Open grok.com/imagine and manually generate 1 video (any prompt) " +
-        "so the extension can capture Grok's anti-bot headers. Then click " +
-        "Start Automation again. This warmup is only needed once per tab.",
-    });
-    return;
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Step 1 (optional): Upload reference image
-  // ─────────────────────────────────────────────────────────────
-  let fileMetadataId = "";
-  let mediaUrl = "";
   const hasReference = !!(reference_image_base64 && reference_image_filename);
-
   if (hasReference) {
-    await grokReportProgress(request_id, "uploading_image", reference_image_filename);
-    const uploadResult = await grokExecInTab(tabId, async (args) => {
-      const r = await fetch("/rest/app-chat/upload-file", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", ...(args.replayHeaders || {}) },
-        body: JSON.stringify({
-          fileName: args.fileName,
-          fileMimeType: args.fileMimeType,
-          fileSource: "IMAGINE_SELF_UPLOAD_FILE_SOURCE",
-          content: args.content,
-        }),
-      });
-      const status = r.status;
-      const text = await r.text();
-      let parsed = null;
-      try { parsed = JSON.parse(text); } catch {}
-      return { status, text: parsed ? null : text, data: parsed };
-    }, {
-      fileName: reference_image_filename,
-      fileMimeType: reference_image_mime || "image/jpeg",
-      content: reference_image_base64,
-      replayHeaders,
-    });
-
-    if (!uploadResult || uploadResult.status !== 200 || !uploadResult.data) {
-      const errBody = uploadResult?.text || JSON.stringify(uploadResult?.data || {});
-      await grokSubmitResult(request_id, {
-        error: `upload_failed_${uploadResult?.status || "?"}`,
-        response_body: String(errBody).slice(0, 500),
-      });
-      return;
-    }
-    fileMetadataId = uploadResult.data.fileMetadataId || "";
-    const fileUri = uploadResult.data.fileUri || "";
-    if (!fileMetadataId || !fileUri) {
-      await grokSubmitResult(request_id, {
-        error: "upload_no_id",
-        response_body: JSON.stringify(uploadResult.data).slice(0, 500),
-      });
-      return;
-    }
-    mediaUrl = `${GROK_ASSETS_ORIGIN}/${fileUri}`;
-    await grokReportProgress(request_id, "image_uploaded", fileMetadataId);
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Step 2: Create post
-  // ─────────────────────────────────────────────────────────────
-  await grokReportProgress(request_id, "creating_post", hasReference ? "image" : "video");
-  const createBody = hasReference
-    ? { mediaType: "MEDIA_POST_TYPE_IMAGE", mediaUrl }
-    : { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: String(prompt || "") };
-
-  const createResult = await grokExecInTab(tabId, async (args) => {
-    const r = await fetch("/rest/media/post/create", {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json", ...(args.replayHeaders || {}) },
-      body: JSON.stringify(args.body),
-    });
-    const status = r.status;
-    const text = await r.text();
-    let parsed = null;
-    try { parsed = JSON.parse(text); } catch {}
-    return { status, text: parsed ? null : text, data: parsed };
-  }, { body: createBody, replayHeaders });
-
-  if (!createResult || createResult.status !== 200 || !createResult.data) {
-    const errBody = createResult?.text || JSON.stringify(createResult?.data || {});
+    // Image→video via click-based flow would need to simulate the
+    // "+ upload" picker which can't be done headlessly. Report a
+    // clean error for now; Phase 2 will wire it up via a paste
+    // event once we've confirmed text→video works end-to-end.
     await grokSubmitResult(request_id, {
-      error: `create_post_failed_${createResult?.status || "?"}`,
-      response_body: String(errBody).slice(0, 500),
+      error: "image_to_video_not_supported_yet",
+      detail:
+        "Grok's file picker can't be automated headlessly. Text-to-video " +
+        "works via click-based dispatch — retry without a reference image.",
     });
     return;
   }
-  const postId = createResult.data?.post?.id || fileMetadataId || "";
-  if (!postId) {
-    await grokSubmitResult(request_id, {
-      error: "create_post_no_id",
-      response_body: JSON.stringify(createResult.data).slice(0, 500),
-    });
-    return;
-  }
-  await grokReportProgress(request_id, "post_created", postId);
 
   // ─────────────────────────────────────────────────────────────
-  // Step 3: Animate — POST /rest/app-chat/conversations/new
-  //        Response is streaming NDJSON with progress + final URL
+  // Click-based dispatch — type prompt into textarea and click send.
+  // Grok's own JS then fires /rest/app-chat/conversations/new with a
+  // FRESH x-statsig-id (which is what the backend's anti-bot checks).
+  // We tee the response stream via the content-script fetch patch and
+  // poll for the resulting videoUrl.
   // ─────────────────────────────────────────────────────────────
   const userPrompt = String(prompt || "").trim();
-  let messageField;
-  if (hasReference) {
-    // Image-to-video — URL + prompt (or "animate" fallback) + mode flag
-    const verb = userPrompt || "animate";
-    messageField = `${mediaUrl}  ${verb} --mode=${mode}`;
-  } else {
-    messageField = `${userPrompt} --mode=${mode}`;
+  if (!userPrompt) {
+    await grokSubmitResult(request_id, { error: "empty_prompt" });
+    return;
   }
 
-  const convoBody = {
-    temporary: true,
-    modelName: "imagine-video-gen",
-    message: messageField,
-    ...(hasReference ? { fileAttachments: [postId] } : {}),
-    enableSideBySide: true,
-    responseMetadata: {
-      experiments: [],
-      modelConfigOverride: {
-        modelMap: {
-          videoGenModelConfig: {
-            parentPostId: postId,
-            aspectRatio: String(aspect_ratio),
-            videoLength: Number(video_length),
-            resolutionName: String(resolution),
-          },
-        },
-      },
-    },
-  };
-
-  await grokReportProgress(request_id, "animating", `${aspect_ratio} ${resolution} ${video_length}s`);
-
-  // Refresh captured headers right before the expensive call — Grok
-  // rotates some per-request values and we want the freshest snapshot.
-  try {
-    const freshCap = await grokReadCapturedHeaders(tabId);
-    if (freshCap && freshCap.capturedAt) {
-      const merged = grokPickReplayHeaders(freshCap.headers);
-      Object.assign(replayHeaders, merged);
-    }
-  } catch {}
-
-  // Diagnostic — which anti-bot headers will we send? Report just the
-  // KEYS (not values, which contain sensitive session tokens). Helps
-  // debug when animate still fails after header capture succeeds.
+  await grokReportProgress(request_id, "clicking_send", "");
+  const clickResult = await grokClickSend(tabId, userPrompt);
+  if (!clickResult || clickResult.error) {
+    await grokSubmitResult(request_id, {
+      error: `click_failed_${clickResult?.error || "unknown"}`,
+      detail:
+        "Could not locate textarea or send button on grok.com/imagine. " +
+        "Make sure the tab is open to /imagine and Video mode is selected.",
+    });
+    return;
+  }
   await grokReportProgress(
     request_id,
-    "replay_headers",
-    Object.keys(replayHeaders).sort().join(",") || "<empty>"
+    "clicked",
+    clickResult.buttonLabel || "send"
   );
 
-  // Execute the streaming fetch inside the tab. The result: we read the
-  // whole NDJSON stream (it's bounded — Grok finishes within 60-180s) and
-  // parse out the final videoUrl.
-  const animateResult = await grokExecInTab(tabId, async (args) => {
-    // Replay the full captured header set. Earlier versions stripped
-    // sentry-trace/baggage/x-xai-request-id here on the theory that
-    // stale per-request values would look fishy to anti-bot — but
-    // that was wrong: the backend checks for PRESENCE of these
-    // tracing headers, and absence fails harder than a stale value.
-    // The one field we do override is x-xai-request-id, which is an
-    // idempotency key — each request must have a fresh UUID so Grok
-    // doesn't treat it as a duplicate.
-    const replay = { ...(args.replayHeaders || {}) };
-    replay["x-xai-request-id"] = args.freshRequestId;
+  // Poll for videoUrl — either from the fetch-wrapper's stream capture
+  // (__grokAutomationVideoUrl) or from the DOM (<video> element src).
+  // Grok typically finishes a 10s/720p video in 60-180 seconds.
+  let videoUrl = "";
+  let videoId = "";
+  let progressPct = 0;
+  let domFallbackUrl = "";
+  let errorSeen = "";
+  const pollDeadline = Date.now() + 240000; // 4 min safety cap
+  let lastReportedProgress = -1;
 
-    const r = await fetch("/rest/app-chat/conversations/new", {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json", ...replay },
-      body: JSON.stringify(args.body),
-    });
-    const status = r.status;
-    if (!r.ok) {
-      const errText = await r.text();
-      return { status, error: errText.slice(0, 1000) };
+  while (Date.now() < pollDeadline) {
+    const state = await grokReadAutomationState(tabId);
+    if (state.error) {
+      errorSeen = state.error;
+      break;
     }
-    // Stream the NDJSON body
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let progressPct = 0;
-    let videoUrl = "";
-    let videoId = "";
-    let mediaName = "";
-    let workflowFinal = false;
-    let errorSeen = "";
-
-    // Safety: max 4 minutes of streaming
-    const deadline = Date.now() + 240000;
-
-    while (true) {
-      if (Date.now() > deadline) {
-        return { status, error: "stream_timeout", progress: progressPct };
-      }
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let nl;
-      while ((nl = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        if (!line) continue;
-        let obj;
-        try { obj = JSON.parse(line); } catch { continue; }
-        const resp = obj?.result?.response;
-        if (!resp) continue;
-        // Extract progress
-        const svgr = resp.streamingVideoGenerationResponse;
-        if (svgr) {
-          if (typeof svgr.progress === "number") progressPct = svgr.progress;
-          if (svgr.videoId) videoId = svgr.videoId;
-          if (svgr.videoUrl) videoUrl = svgr.videoUrl;
-          if (svgr.moderated) errorSeen = "moderated";
-        }
-        // Fallback extraction
-        if (resp.modelResponse?.responseId) {
-          workflowFinal = true;
-        }
-        if (resp.finalMetadataMap) {
-          const m = resp.finalMetadataMap?.videoGenModelConfig;
-          if (m?.videoUrl) videoUrl = m.videoUrl;
-        }
-      }
-      if (videoUrl && workflowFinal) break;
+    if (state.videoUrl) {
+      videoUrl = state.videoUrl;
+      videoId = state.videoId;
+      break;
     }
-    return { status, progress: progressPct, videoUrl, videoId, mediaName, error: errorSeen };
-  }, { body: convoBody, replayHeaders, freshRequestId: grokFreshRequestId() });
-
-  if (!animateResult) {
-    await grokSubmitResult(request_id, { error: "animate_no_result" });
-    return;
+    if (state.domVideoUrl && !domFallbackUrl) {
+      domFallbackUrl = state.domVideoUrl;
+    }
+    if (typeof state.progress === "number" && state.progress !== lastReportedProgress) {
+      progressPct = state.progress;
+      lastReportedProgress = state.progress;
+      if (state.progress > 0 && state.progress % 25 === 0) {
+        await grokReportProgress(
+          request_id,
+          "progress",
+          `${state.progress}%`
+        );
+      }
+    }
+    await new Promise((r) => setTimeout(r, 2000));
   }
-  if (animateResult.error && !animateResult.videoUrl) {
+
+  await grokClearAutomationFlag(tabId);
+
+  if (errorSeen) {
     await grokSubmitResult(request_id, {
-      error: `animate_${animateResult.error}`,
-      http_status: animateResult.status,
+      error: `grok_${errorSeen}`,
+      progress: progressPct,
     });
     return;
   }
-  if (!animateResult.videoUrl) {
+  if (!videoUrl && domFallbackUrl) {
+    videoUrl = domFallbackUrl;
+    await grokReportProgress(request_id, "video_ready_from_dom", videoUrl);
+  }
+  if (!videoUrl) {
     await grokSubmitResult(request_id, {
-      error: "no_video_url",
-      progress: animateResult.progress,
+      error: "video_timeout",
+      progress: progressPct,
+      detail:
+        `Waited 4 min but no video URL appeared. Last progress: ${progressPct}%. ` +
+        "Grok may be slow or rate-limited. Try again.",
     });
     return;
   }
 
-  await grokReportProgress(request_id, "video_ready", animateResult.videoUrl);
+  await grokReportProgress(request_id, "video_ready", videoUrl);
+
+  // Capture the postId (parentPostId) from DOM if available — useful
+  // for debugging, not required for download.
+  const postId = videoId || ""; // fallback to videoId
+  const animateResult = { videoUrl, videoId, mediaName: "", progress: progressPct };
 
   // ─────────────────────────────────────────────────────────────
   // Step 4: Fetch the video bytes (done from the tab so cookies work)

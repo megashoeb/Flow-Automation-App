@@ -19,6 +19,18 @@
   window.__grokHeadersCapturedAt = 0;
   window.__grokCaptureStats = { totalCalls: 0, restCalls: 0 };
 
+  // When the extension kicks off a click-based automation, it sets
+  // __grokAutomationActive = true. The fetch patch then tees the
+  // response stream of /rest/app-chat/conversations/new, parses the
+  // NDJSON chunks for videoUrl / videoId / progress, and stores them
+  // in __grokAutomationVideoUrl (and friends). When flag flips off,
+  // we stop teeing to avoid cost on real user activity.
+  window.__grokAutomationActive = false;
+  window.__grokAutomationVideoUrl = "";
+  window.__grokAutomationVideoId = "";
+  window.__grokAutomationProgress = 0;
+  window.__grokAutomationError = "";
+
   const snapshotHeaders = (hdrs) => {
     const snap = {};
     if (!hdrs) return snap;
@@ -40,6 +52,7 @@
     const orig = current;
 
     const patched = async function (input, init) {
+      let isConvoNew = false;
       try {
         window.__grokCaptureStats.totalCalls++;
         const url =
@@ -51,10 +64,6 @@
         if (url && url.includes("/rest/")) {
           window.__grokCaptureStats.restCalls++;
           const snap = snapshotHeaders(init && init.headers);
-          // Merge with prior snapshots so partial-header calls still
-          // contribute to a full picture. x-statsig-id is stable per
-          // session so an old capture still works until a new one
-          // arrives.
           window.__grokLastHeaders = {
             ...window.__grokLastHeaders,
             ...snap,
@@ -62,11 +71,71 @@
           if (Object.keys(snap).length) {
             window.__grokHeadersCapturedAt = Date.now();
           }
+          if (url.includes("/rest/app-chat/conversations/new")) {
+            isConvoNew = true;
+          }
         }
       } catch (e) {
         // Never let instrumentation break the real app.
       }
-      return orig.apply(this, arguments);
+
+      const response = await orig.apply(this, arguments);
+
+      // If automation is active and this was the video-gen call, tee
+      // the response body so we can parse progress/URL while the real
+      // app's code also drains its own copy.
+      if (isConvoNew && window.__grokAutomationActive && response.body && response.ok) {
+        try {
+          const [forApp, forUs] = response.body.tee();
+          // Async-drain our copy, parsing NDJSON line by line.
+          (async () => {
+            const reader = forUs.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                let nl;
+                while ((nl = buffer.indexOf("\n")) !== -1) {
+                  const line = buffer.slice(0, nl).trim();
+                  buffer = buffer.slice(nl + 1);
+                  if (!line) continue;
+                  let obj;
+                  try { obj = JSON.parse(line); } catch { continue; }
+                  const resp = obj?.result?.response;
+                  if (!resp) continue;
+                  const svgr = resp.streamingVideoGenerationResponse;
+                  if (svgr) {
+                    if (typeof svgr.progress === "number") {
+                      window.__grokAutomationProgress = svgr.progress;
+                    }
+                    if (svgr.videoId) window.__grokAutomationVideoId = svgr.videoId;
+                    if (svgr.videoUrl) window.__grokAutomationVideoUrl = svgr.videoUrl;
+                    if (svgr.moderated) window.__grokAutomationError = "moderated";
+                  }
+                  const fin = resp.finalMetadataMap?.videoGenModelConfig;
+                  if (fin?.videoUrl) window.__grokAutomationVideoUrl = fin.videoUrl;
+                }
+              }
+            } catch (e) {
+              // Don't crash if the stream was aborted mid-read.
+            }
+          })();
+          // Return a Response that wraps the app's side of the tee —
+          // Grok's own code drains this, gets identical bytes.
+          return new Response(forApp, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        } catch (e) {
+          // Fall through — hand back original response so app still works.
+        }
+      }
+
+      return response;
     };
     patched.__grokPatched = true;
     try {

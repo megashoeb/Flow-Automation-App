@@ -151,11 +151,24 @@ class GrokModeManager:
                 f"mode={self._mode}, use_ref={self._use_reference}"
             )
 
-            slots_per_account = max(1, min(15, int(self.qm.account_parallel_slots or 3)))
+            # Click-based dispatch (v1.7.0+): each grok.com tab can run
+            # only ONE generation at a time because Grok's UI locks input
+            # while a video is rendering. To get parallelism, open
+            # multiple grok.com/imagine tabs in the SAME account — each
+            # tab becomes an independent dispatch slot. The UI "Parallel"
+            # setting still caps per-account concurrency, but the
+            # physical limit is tab_count. If slots > tabs we'll log a
+            # gentle note.
+            slots_per_account = max(1, min(15, int(self.qm.account_parallel_slots or 1)))
+            self._log(
+                f"[GrokMode] Click-based dispatch — 1 generation per tab at a time.\n"
+                f"  Parallel slots set to {slots_per_account}. For real parallelism, "
+                "open that many grok.com/imagine tabs in the same account."
+            )
             if slots_per_account > 5:
                 self._log(
                     f"[GrokMode] ⚠ Parallel={slots_per_account}/account is high — "
-                    "Grok fair-use throttle may kick in. 3–5 is safer."
+                    "Grok fair-use may throttle. 2–3 is safer."
                 )
 
             self._log(
