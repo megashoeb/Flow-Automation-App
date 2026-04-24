@@ -148,6 +148,168 @@ async function grokInstallHeaderCapture(tabId) {
 // Returns { ok, buttonInfo } on success or { error } on failure.
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+// Image attachment — injects a File into Grok's composer UI so the
+// subsequent send click produces a proper image-to-video request (one
+// with fileAttachments set in the conversations/new body).
+//
+// Two strategies, tried in order:
+//   1. File-input injection — find <input type="file">, set files via
+//      DataTransfer, fire change event. Works for every React
+//      dropzone library since they all hang their "+ upload" button
+//      off a hidden file input under the hood.
+//   2. DragEvent drop — construct a drop event with DataTransfer and
+//      dispatch on the composer. Fallback if no hidden input found.
+//
+// After injection, polls the DOM for the attachment thumbnail to
+// appear (confirms Grok's UI state registered the file) before
+// returning. Caller should then set the prompt text and click send.
+// ═══════════════════════════════════════════════════════════════════
+
+async function grokAttachImage(tabId, base64, filename, mime) {
+  return grokExecInTab(tabId, async (args) => {
+    // Rebuild the File object from base64 bytes.
+    const bin = atob(args.base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const file = new File([bytes], args.filename, {
+      type: args.mime || "image/jpeg",
+    });
+
+    // Find a visible composer input so we can scope our search.
+    const composerInput =
+      document.querySelector('textarea') ||
+      document.querySelector('[contenteditable="true"]') ||
+      document.querySelector('[contenteditable=""]');
+
+    // ─── Strategy 1: hidden <input type="file"> ───
+    const fileInputs = Array.from(
+      document.querySelectorAll('input[type="file"]')
+    );
+    let targetInput = null;
+    if (fileInputs.length === 1) {
+      targetInput = fileInputs[0];
+    } else if (fileInputs.length > 1) {
+      // Prefer the one closest to the composer (in the DOM)
+      if (composerInput) {
+        let best = null;
+        let bestDist = Infinity;
+        for (const fi of fileInputs) {
+          let d = 0;
+          let node = composerInput;
+          while (node) {
+            if (node.contains(fi)) break;
+            node = node.parentElement;
+            d++;
+          }
+          if (node && d < bestDist) {
+            bestDist = d;
+            best = fi;
+          }
+        }
+        targetInput = best || fileInputs[0];
+      } else {
+        targetInput = fileInputs[0];
+      }
+    }
+
+    let strategy = "";
+    if (targetInput) {
+      try {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        // The `files` property on HTMLInputElement has a non-writable
+        // descriptor; use the native setter to bypass.
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          "files"
+        )?.set;
+        if (setter) {
+          setter.call(targetInput, dt.files);
+        } else {
+          targetInput.files = dt.files;
+        }
+        targetInput.dispatchEvent(new Event("input", { bubbles: true }));
+        targetInput.dispatchEvent(new Event("change", { bubbles: true }));
+        strategy = "file_input";
+      } catch (e) {
+        strategy = `file_input_failed: ${String(e?.message || e).slice(0, 120)}`;
+      }
+    }
+
+    // ─── Strategy 2: DragEvent drop (fallback) ───
+    if (strategy !== "file_input") {
+      try {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        const target =
+          composerInput?.closest("form") ||
+          composerInput?.closest("[class*='dropzone']") ||
+          composerInput?.closest("[class*='compose']") ||
+          composerInput?.parentElement ||
+          document.body;
+        for (const type of ["dragenter", "dragover", "drop"]) {
+          target.dispatchEvent(
+            new DragEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: dt,
+            })
+          );
+        }
+        strategy = strategy ? `${strategy}->drop` : "drop";
+      } catch (e) {
+        return {
+          error: "both_strategies_failed",
+          detail: String(e?.message || e).slice(0, 200),
+        };
+      }
+    }
+
+    // ─── Wait for the UI to acknowledge the attachment ───
+    // Heuristics: look for a new <img> with blob: URL (thumbnail
+    // preview), an asset URL, or the filename text appearing anywhere
+    // in the composer region. Up to 12 seconds (upload time + UI tick).
+    const startTs = Date.now();
+    const deadline = startTs + 12000;
+    let attached = false;
+    let attachSignal = "";
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 400));
+      // 1) Blob-URL preview image (most dropzones create these)
+      const blobImg = Array.from(document.querySelectorAll("img")).find(
+        (img) =>
+          img.src &&
+          (img.src.startsWith("blob:") ||
+            img.src.includes("/users/0"))
+      );
+      if (blobImg) {
+        attached = true;
+        attachSignal = "blob_img";
+        break;
+      }
+      // 2) Any new element containing the filename (stripped of ext)
+      const baseName = (args.filename || "").replace(/\.[^.]+$/, "");
+      if (baseName && baseName.length > 3) {
+        const bodyText = (document.body.innerText || "").slice(0, 10000);
+        if (bodyText.includes(baseName)) {
+          attached = true;
+          attachSignal = "filename_text";
+          break;
+        }
+      }
+    }
+
+    return {
+      ok: attached,
+      strategy,
+      attachSignal,
+      waited_ms: Date.now() - startTs,
+      fileInputsFound: fileInputs.length,
+    };
+  }, { base64, filename, mime });
+}
+
 async function grokClickSend(tabId, prompt) {
   return grokExecInTab(tabId, async (args) => {
     // Arm automation flags so the fetch wrapper captures the
@@ -731,85 +893,60 @@ async function grokHandleWork(work) {
   const hasReference = !!(reference_image_base64 && reference_image_filename);
 
   // ─────────────────────────────────────────────────────────────
-  // Approach 2 (image→video): HTTP-upload the reference image to
-  // Grok's own endpoint, then feed the resulting asset URL into the
-  // textarea as part of the message before clicking send. Grok's
-  // JS will see the grok.com/assets URL in the message body and
-  // (based on observed HAR) attach it as a video reference.
+  // Approach 1 (image→video): inject the File object straight into
+  // Grok's hidden <input type="file"> (the one the "+ upload"
+  // button targets). Grok's own UI then uploads, registers the
+  // attachment in React state, and the subsequent click→send fires
+  // /rest/app-chat/conversations/new with fileAttachments correctly
+  // populated — which is what actually makes Grok treat it as
+  // image-to-video. Approach 2 (URL-in-message) was fielded in
+  // 1.7.2 but produced text-to-video because Grok's backend
+  // requires fileAttachments to trigger the image pipeline.
   //
-  // Upload endpoint isn't anti-bot gated — we've confirmed /rest/
-  // app-chat/upload-file goes through with just cookies. The heavy
-  // gate is conversations/new, which we still route through the
-  // click-based dispatch so Grok's code attaches the fresh
-  // x-statsig-id for us.
+  // DragEvent-drop is kept as a fallback for the rare case Grok's
+  // dropzone doesn't ship a hidden file input.
   // ─────────────────────────────────────────────────────────────
   let messageForClick = userPrompt;
 
   if (hasReference) {
     await grokReportProgress(
       request_id,
-      "uploading_image",
+      "attaching_image",
       reference_image_filename
     );
 
-    const uploadResult = await grokExecInTab(tabId, async (args) => {
-      try {
-        const r = await fetch("/rest/app-chat/upload-file", {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            fileName: args.fileName,
-            fileMimeType: args.fileMimeType,
-            fileSource: "IMAGINE_SELF_UPLOAD_FILE_SOURCE",
-            content: args.content,
-          }),
-        });
-        const status = r.status;
-        const text = await r.text();
-        let parsed = null;
-        try { parsed = JSON.parse(text); } catch {}
-        return { status, text: parsed ? null : text, data: parsed };
-      } catch (e) {
-        return { status: 0, error: String(e?.message || e) };
-      }
-    }, {
-      fileName: reference_image_filename,
-      fileMimeType: reference_image_mime || "image/jpeg",
-      content: reference_image_base64,
-    });
+    const attachResult = await grokAttachImage(
+      tabId,
+      reference_image_base64,
+      reference_image_filename,
+      reference_image_mime || "image/jpeg"
+    );
 
-    if (!uploadResult || uploadResult.status !== 200 || !uploadResult.data) {
-      const errBody =
-        uploadResult?.error ||
-        uploadResult?.text ||
-        JSON.stringify(uploadResult?.data || {});
+    if (!attachResult || !attachResult.ok) {
+      const detail = attachResult
+        ? `strategy=${attachResult.strategy || "?"}, ` +
+          `fileInputs=${attachResult.fileInputsFound ?? "?"}, ` +
+          `waited=${attachResult.waited_ms ?? "?"}ms`
+        : "no_response";
       await grokSubmitResult(request_id, {
-        error: `upload_failed_${uploadResult?.status || "?"}`,
-        response_body: String(errBody).slice(0, 500),
+        error: "image_attach_failed",
+        detail,
       });
       return;
     }
 
-    const fileMetadataId = uploadResult.data.fileMetadataId || "";
-    const fileUri = uploadResult.data.fileUri || "";
-    if (!fileMetadataId || !fileUri) {
-      await grokSubmitResult(request_id, {
-        error: "upload_no_id",
-        response_body: JSON.stringify(uploadResult.data).slice(0, 500),
-      });
-      return;
-    }
+    await grokReportProgress(
+      request_id,
+      "image_attached",
+      `via ${attachResult.strategy}${
+        attachResult.attachSignal ? " (" + attachResult.attachSignal + ")" : ""
+      }`
+    );
 
-    const mediaUrl = `${GROK_ASSETS_ORIGIN}/${fileUri}`;
-    await grokReportProgress(request_id, "image_uploaded", fileMetadataId);
-
-    // Construct the textarea message. Real image-to-video calls use
-    // "<URL>  <verb>" with a double-space separator and a verb like
-    // "animate" (HAR grok.com2.har). If the user supplied a prompt,
-    // use it as the verb; otherwise fall back to "animate".
-    const verb = userPrompt || "animate";
-    messageForClick = `${mediaUrl}  ${verb}`;
+    // For image-to-video Grok's UI auto-prepends the media URL +
+    // double-space when the user types. We just type the prompt text;
+    // Grok handles the rest. Fall back to "animate" for empty prompts.
+    messageForClick = userPrompt || "animate";
   } else if (!userPrompt) {
     await grokSubmitResult(request_id, { error: "empty_prompt" });
     return;
