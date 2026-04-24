@@ -103,7 +103,14 @@ class AsyncQueueManager(QThread):
         self.cloak_display = cloak_display_raw
         self.light_warmup_enabled = get_bool_setting("light_warmup", True)
         gen_mode_raw = str(get_setting("generation_mode", "browser_per_slot") or "browser_per_slot").strip().lower()
-        if gen_mode_raw not in {"browser_per_slot", "cdp_shared", "http_shared", "chrome_extension", "chrome_extension_genspark"}:
+        if gen_mode_raw not in {
+            "browser_per_slot",
+            "cdp_shared",
+            "http_shared",
+            "chrome_extension",
+            "chrome_extension_genspark",
+            "chrome_extension_grok",
+        }:
             gen_mode_raw = "browser_per_slot"
         self.generation_mode = gen_mode_raw
         self.scheduler_poll_seconds = 2
