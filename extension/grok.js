@@ -169,37 +169,40 @@ async function grokReadCapturedHeaders(tabId) {
   }
 }
 
-// Headers that Grok checks at the backend for its anti-bot system.
-// These are replayed from the captured snapshot. We deliberately do
-// NOT replay Content-Type (we set our own), Content-Length (browser
-// auto-computes), or Cookie (attached via credentials:"include").
+// Replay EVERY captured header — Grok's anti-bot uses a combination
+// of headers that we can't enumerate reliably (the v1.6.4 whitelist
+// was too narrow: we sent only baggage/sentry-trace/traceparent/
+// x-statsig-id and still got anti-bot rejection). The safer strategy
+// is: replay anything the page attached, except the handful of
+// headers the browser itself is going to add or override.
 //
-// After several rejected animate calls we broadened this list: older
-// version stripped sentry-trace/baggage/x-xai-request-id on the
-// animate call on the theory that stale values would be worse than
-// missing. That was wrong — Grok's anti-bot checks for presence of
-// the tracing headers, and an absent value fails harder than a stale
-// one. We now replay the full set and generate a fresh x-xai-request-
-// id (the one field whose staleness Grok *does* care about, for
-// idempotency).
-const GROK_REPLAY_HEADER_KEYS = [
-  "x-statsig-id",
-  "x-xai-auth",
-  "x-xai-session-id",
-  "sentry-trace",
-  "baggage",
-  "traceparent",
-  "accept-language",
-  "priority",
-];
+// Browser-forbidden / auto-set headers that must be excluded (setting
+// them explicitly causes the fetch to throw or the value to be
+// silently overwritten, so we drop them):
+//   - content-length      (browser auto-computes from body)
+//   - host, connection    (hop-by-hop, browser controls)
+//   - cookie              (attached via credentials:"include")
+//   - content-type        (we set our own application/json)
+const GROK_BLOCKED_REPLAY_HEADERS = new Set([
+  "content-length",
+  "host",
+  "connection",
+  "cookie",
+  "content-type",
+  "transfer-encoding",
+  "upgrade",
+  "keep-alive",
+]);
 
 function grokPickReplayHeaders(captured) {
   const out = {};
   if (!captured) return out;
-  for (const key of GROK_REPLAY_HEADER_KEYS) {
+  for (const key of Object.keys(captured)) {
+    const k = key.toLowerCase();
+    if (GROK_BLOCKED_REPLAY_HEADERS.has(k)) continue;
     const v = captured[key];
     if (v !== undefined && v !== null && String(v).length > 0) {
-      out[key] = String(v);
+      out[k] = String(v);
     }
   }
   return out;
