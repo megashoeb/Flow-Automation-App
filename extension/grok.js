@@ -441,52 +441,82 @@ async function grokClickSend(tabId, prompt) {
     await new Promise((r) => setTimeout(r, 700));
 
     // ─── Find the send button ───
+    // Grok's /imagine composer has many buttons clustered near the
+    // input: "+ upload", "Image/Video" mode toggle, "480p/720p"
+    // resolution, "6s/10s" duration, aspect ratio picker, and the
+    // send arrow (rightmost). Earlier versions picked the last SVG
+    // button in DOM order — that turned out to be the "Video" mode
+    // toggle, not the send arrow, because mode toggles appear AFTER
+    // the send button in source order on some layouts.
+    //
+    // Better strategy: score every enabled button in the composer
+    // region by likelihood of being the SEND button.
     const scope =
       inputEl.closest("form") ||
       inputEl.closest("[class*='chat']") ||
       inputEl.closest("[class*='compose']") ||
-      inputEl.parentElement?.parentElement?.parentElement ||
+      inputEl.parentElement?.parentElement?.parentElement?.parentElement ||
       document.body;
 
-    let sendBtn = null;
+    const allBtns = Array.from(scope.querySelectorAll("button:not([disabled])"));
+    // Also include buttons outside the immediate scope — some
+    // composers render the send button in a sibling container.
+    const inputRect = inputEl.getBoundingClientRect();
+    const docBtns = Array.from(document.querySelectorAll("button:not([disabled])"));
+    const nearbyBtns = docBtns.filter((b) => {
+      try {
+        const r = b.getBoundingClientRect();
+        // Within ~300px of the input vertically
+        return Math.abs(r.top - inputRect.top) < 300 || Math.abs(r.bottom - inputRect.bottom) < 300;
+      } catch {
+        return false;
+      }
+    });
+    const btnsUnique = Array.from(new Set([...allBtns, ...nearbyBtns]));
 
-    // Strategy A: form submit button
-    if (scope.tagName === "FORM") {
-      sendBtn = scope.querySelector("button[type='submit']:not([disabled])");
-    }
+    const MODE_TOKENS = /\b(image|video|photo|audio|480p|720p|1080p|4k|\d+s\b|6s|10s|\d+:\d+|ratio|square|landscape|portrait|widescreen|vertical|horizontal)\b/i;
 
-    // Strategy B: aria-label or title matches send/submit/generate/create
-    if (!sendBtn) {
-      const btns = Array.from(scope.querySelectorAll("button:not([disabled])"));
-      sendBtn = btns.find((b) => {
-        const txt = (
-          (b.getAttribute("aria-label") || "") +
-          " " +
-          (b.title || "") +
-          " " +
-          (b.textContent || "")
-        ).toLowerCase();
-        return /send|submit|generate|create|imagine/.test(txt);
-      });
-    }
+    const scoredBtns = btnsUnique.map((b) => {
+      const text = (b.textContent || "").trim();
+      const ariaLabel = (b.getAttribute("aria-label") || "").toLowerCase();
+      const title = (b.title || "").toLowerCase();
+      const hasSvg = !!b.querySelector("svg");
+      const type = (b.getAttribute("type") || "").toLowerCase();
+      let rect = { right: 0, bottom: 0, width: 0, height: 0 };
+      try { rect = b.getBoundingClientRect(); } catch {}
 
-    // Strategy C: last enabled button with SVG near input
-    if (!sendBtn) {
-      const btns = Array.from(scope.querySelectorAll("button:not([disabled])"));
-      const candidates = btns.filter((b) => b.querySelector("svg"));
-      sendBtn = candidates[candidates.length - 1] || null;
-    }
+      let score = 0;
+      if (type === "submit") score += 25;
+      const combinedLabel = ariaLabel + " " + title;
+      if (/\b(send|submit|generate|create|imagine|post|enter)\b/.test(combinedLabel)) {
+        score += 30;
+      }
+      if (hasSvg && text.length === 0) score += 15;
+      if (text.length > 0) {
+        if (MODE_TOKENS.test(text)) score -= 40;
+        else score -= 3;
+      }
+      if (MODE_TOKENS.test(combinedLabel)) score -= 40;
+      score += ((rect.right || 0) / Math.max(1, window.innerWidth)) * 5;
+      if (rect.width > 0 && rect.width < 60 && rect.height < 60 && hasSvg && text.length === 0) {
+        score += 3;
+      }
+      if (rect.width < 16 || rect.height < 16) score -= 50;
 
-    // Strategy D: broader search from document — any enabled SVG button
-    // whose position is near the bottom of the viewport (typical chat
-    // send button placement).
-    if (!sendBtn) {
-      const docBtns = Array.from(document.querySelectorAll("button:not([disabled])"));
-      const candidates = docBtns.filter(
-        (b) => b.querySelector("svg") && b.offsetParent !== null
-      );
-      sendBtn = candidates[candidates.length - 1] || null;
-    }
+      return { btn: b, score, text, ariaLabel, title, hasSvg, type, rect };
+    });
+
+    scoredBtns.sort((a, b) => b.score - a.score);
+
+    const topCandidates = scoredBtns.slice(0, 5).map((s) => ({
+      text: s.text.slice(0, 30),
+      ariaLabel: s.ariaLabel.slice(0, 30),
+      score: s.score,
+      hasSvg: s.hasSvg,
+      pos: `${Math.round(s.rect.right)},${Math.round(s.rect.bottom)}`,
+    }));
+
+    const sendBtn = scoredBtns[0]?.btn || null;
 
     if (!sendBtn) {
       window.__grokAutomationActive = false;
@@ -496,9 +526,9 @@ async function grokClickSend(tabId, prompt) {
           inputType,
           inputPlaceholder: chosen.placeholder,
           scopeTag: scope?.tagName,
-          buttonsInScope: scope?.querySelectorAll
-            ? scope.querySelectorAll("button").length
-            : 0,
+          buttonsInScope: allBtns.length,
+          nearbyCount: nearbyBtns.length,
+          topCandidates,
         },
       };
     }
@@ -510,7 +540,13 @@ async function grokClickSend(tabId, prompt) {
       sendBtn.title ||
       sendBtn.textContent.trim().slice(0, 40) ||
       "svg-btn";
-    return { ok: true, inputType, buttonLabel: label };
+    return {
+      ok: true,
+      inputType,
+      buttonLabel: label,
+      buttonScore: scoredBtns[0].score,
+      topCandidates,
+    };
   }, { prompt });
 }
 
@@ -979,10 +1015,14 @@ async function grokHandleWork(work) {
     });
     return;
   }
+  const scoreInfo =
+    typeof clickResult.buttonScore === "number"
+      ? ` score=${clickResult.buttonScore.toFixed(1)}`
+      : "";
   await grokReportProgress(
     request_id,
     "clicked",
-    `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"})`
+    `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"}${scoreInfo})`
   );
 
   // Poll for videoUrl — either from the fetch-wrapper's stream capture
