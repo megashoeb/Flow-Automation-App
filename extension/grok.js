@@ -169,17 +169,28 @@ async function grokReadCapturedHeaders(tabId) {
   }
 }
 
-// Headers that Grok checks at the backend for its anti-bot system. Only
-// these are replayed — we deliberately do NOT replay Content-Type (we
-// set our own), Content-Length (browser auto-computes), or cookies
-// (already attached via credentials:"include").
+// Headers that Grok checks at the backend for its anti-bot system.
+// These are replayed from the captured snapshot. We deliberately do
+// NOT replay Content-Type (we set our own), Content-Length (browser
+// auto-computes), or Cookie (attached via credentials:"include").
+//
+// After several rejected animate calls we broadened this list: older
+// version stripped sentry-trace/baggage/x-xai-request-id on the
+// animate call on the theory that stale values would be worse than
+// missing. That was wrong — Grok's anti-bot checks for presence of
+// the tracing headers, and an absent value fails harder than a stale
+// one. We now replay the full set and generate a fresh x-xai-request-
+// id (the one field whose staleness Grok *does* care about, for
+// idempotency).
 const GROK_REPLAY_HEADER_KEYS = [
   "x-statsig-id",
-  "x-xai-request-id",
   "x-xai-auth",
+  "x-xai-session-id",
   "sentry-trace",
   "baggage",
+  "traceparent",
   "accept-language",
+  "priority",
 ];
 
 function grokPickReplayHeaders(captured) {
@@ -192,6 +203,25 @@ function grokPickReplayHeaders(captured) {
     }
   }
   return out;
+}
+
+// Generate a fresh UUIDv4 for x-xai-request-id on every dispatch.
+// Reusing a captured request-id can trigger idempotency dedupe at
+// Grok's backend. Browsers that don't expose crypto.randomUUID fall
+// back to a Math.random-based generator (good enough for this use —
+// the value just needs to be unique per request, not cryptographically
+// strong).
+function grokFreshRequestId() {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+  } catch {}
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -597,18 +627,29 @@ async function grokHandleWork(work) {
     }
   } catch {}
 
+  // Diagnostic — which anti-bot headers will we send? Report just the
+  // KEYS (not values, which contain sensitive session tokens). Helps
+  // debug when animate still fails after header capture succeeds.
+  await grokReportProgress(
+    request_id,
+    "replay_headers",
+    Object.keys(replayHeaders).sort().join(",") || "<empty>"
+  );
+
   // Execute the streaming fetch inside the tab. The result: we read the
   // whole NDJSON stream (it's bounded — Grok finishes within 60-180s) and
   // parse out the final videoUrl.
   const animateResult = await grokExecInTab(tabId, async (args) => {
-    // Strip any x-xai-request-id / sentry-trace / baggage from the
-    // replay headers — those are per-request and stale values fail
-    // anti-bot validation. Keep only the stable ones (x-statsig-id,
-    // x-xai-auth, accept-language).
+    // Replay the full captured header set. Earlier versions stripped
+    // sentry-trace/baggage/x-xai-request-id here on the theory that
+    // stale per-request values would look fishy to anti-bot — but
+    // that was wrong: the backend checks for PRESENCE of these
+    // tracing headers, and absence fails harder than a stale value.
+    // The one field we do override is x-xai-request-id, which is an
+    // idempotency key — each request must have a fresh UUID so Grok
+    // doesn't treat it as a duplicate.
     const replay = { ...(args.replayHeaders || {}) };
-    delete replay["x-xai-request-id"];
-    delete replay["sentry-trace"];
-    delete replay["baggage"];
+    replay["x-xai-request-id"] = args.freshRequestId;
 
     const r = await fetch("/rest/app-chat/conversations/new", {
       method: "POST",
@@ -671,7 +712,7 @@ async function grokHandleWork(work) {
       if (videoUrl && workflowFinal) break;
     }
     return { status, progress: progressPct, videoUrl, videoId, mediaName, error: errorSeen };
-  }, { body: convoBody });
+  }, { body: convoBody, replayHeaders, freshRequestId: grokFreshRequestId() });
 
   if (!animateResult) {
     await grokSubmitResult(request_id, { error: "animate_no_result" });
