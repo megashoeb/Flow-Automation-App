@@ -437,8 +437,11 @@ async function grokClickSend(tabId, prompt) {
       };
     }
 
-    // Wait for React to re-render and enable the send button.
-    await new Promise((r) => setTimeout(r, 700));
+    // Wait longer so React re-renders AND the send button transitions
+    // from disabled (empty composer) to enabled (prompt + optional
+    // attachment). Upload post-processing can take another beat after
+    // the thumbnail appears.
+    await new Promise((r) => setTimeout(r, 1500));
 
     // ─── Find the send button ───
     // Grok's /imagine composer has many buttons clustered near the
@@ -458,30 +461,73 @@ async function grokClickSend(tabId, prompt) {
       inputEl.parentElement?.parentElement?.parentElement?.parentElement ||
       document.body;
 
-    const allBtns = Array.from(scope.querySelectorAll("button:not([disabled])"));
-    // Also include buttons outside the immediate scope — some
-    // composers render the send button in a sibling container.
+    // Widen the candidate pool. Include <button>, divs with role=button
+    // (Grok's composer may use either), and also disabled buttons so we
+    // can SEE them in debug — they're penalized but visible, which
+    // turned out to matter when the real send button was disabled at
+    // detection time on earlier runs.
+    const btnSelector =
+      'button,[role="button"],div[tabindex]:not([tabindex="-1"])';
+    const allBtnsRaw = Array.from(scope.querySelectorAll(btnSelector));
     const inputRect = inputEl.getBoundingClientRect();
-    const docBtns = Array.from(document.querySelectorAll("button:not([disabled])"));
-    const nearbyBtns = docBtns.filter((b) => {
+    const docBtnsRaw = Array.from(document.querySelectorAll(btnSelector));
+    const nearbyBtns = docBtnsRaw.filter((b) => {
       try {
         const r = b.getBoundingClientRect();
-        // Within ~300px of the input vertically
-        return Math.abs(r.top - inputRect.top) < 300 || Math.abs(r.bottom - inputRect.bottom) < 300;
+        return (
+          Math.abs(r.top - inputRect.top) < 300 ||
+          Math.abs(r.bottom - inputRect.bottom) < 300
+        );
       } catch {
         return false;
       }
     });
-    const btnsUnique = Array.from(new Set([...allBtns, ...nearbyBtns]));
+    const btnsUnique = Array.from(new Set([...allBtnsRaw, ...nearbyBtns]));
+
+    // ─── Priority pass: explicit aria-label match ───
+    // If any element's aria-label / title is EXACTLY one of these
+    // send-intent names, prefer it immediately (unless disabled).
+    // This short-circuits the scoring and handles the case where the
+    // heuristics get confused by a cluster of icon-only action
+    // buttons (Save/Share/Download) near the composer.
+    const SEND_INTENT_NAMES = [
+      "submit",
+      "send",
+      "send message",
+      "create video",
+      "create",
+      "generate",
+      "generate video",
+      "imagine",
+      "imagine it",
+      "go",
+      "post",
+    ];
+    let explicitSend = null;
+    for (const b of btnsUnique) {
+      if (
+        b.disabled ||
+        b.getAttribute("aria-disabled") === "true" ||
+        b.getAttribute("disabled") !== null
+      )
+        continue;
+      const a = (b.getAttribute("aria-label") || "").toLowerCase().trim();
+      const t = (b.title || "").toLowerCase().trim();
+      if (!a && !t) continue;
+      if (SEND_INTENT_NAMES.includes(a) || SEND_INTENT_NAMES.includes(t)) {
+        explicitSend = b;
+        break;
+      }
+    }
 
     const MODE_TOKENS = /\b(image|video|photo|audio|480p|720p|1080p|4k|\d+s\b|6s|10s|\d+:\d+|ratio|square|landscape|portrait|widescreen|vertical|horizontal)\b/i;
 
     // Strong negatives — buttons whose label matches any of these are
-    // definitely NOT the send button. Grok's composer region in
-    // image-mode surfaces several of these near the input (Save /
-    // Bookmark / Share thumbnails appear after attachment).
+    // definitely NOT the send button. Dropped word-boundary suffix so
+    // "saved", "saving", "liked", "sharing", "downloaded" etc. ALSO
+    // match (1.8.2's \b...\b let "saved" sneak through as the winner).
     const NOT_SEND_TOKENS =
-      /\b(save|bookmark|favorit|heart|like|unlike|share|download|copy|paste|edit|rename|delete|remove|trash|cancel|close|dismiss|settings|options|menu|more|help|info|profile|user|account|login|logout|sign\s*in|sign\s*up|signin|signup|register|feedback|language|locale|theme|dark|light|attach|upload|file|pick|choose|browse|preview|fullscreen|mute|play|pause|stop|back|forward|next|prev|previous|retry|refresh|reload|expand|collapse|sidebar|drawer|toggle)\b/i;
+      /\b(sav|bookmark|favorit|heart|lik|shar|download|cop|past|edit|renam|delet|remov|trash|cancel|clos|dismiss|setting|option|menu|more|help|info|profil|account|login|logout|sign|register|feedback|language|locale|theme|dark|light|attach|upload|file|pick|choose|brows|preview|fullscreen|mute|play|paus|stop|back|forward|next|prev|retry|refresh|reload|expand|collaps|sidebar|drawer|toggle|avatar|notification|noti)[a-z]*\b/i;
 
     const scoredBtns = btnsUnique.map((b) => {
       const text = (b.textContent || "").trim();
@@ -489,11 +535,17 @@ async function grokClickSend(tabId, prompt) {
       const title = (b.title || "").toLowerCase();
       const hasSvg = !!b.querySelector("svg");
       const type = (b.getAttribute("type") || "").toLowerCase();
+      const isDisabled =
+        b.disabled === true ||
+        b.getAttribute("aria-disabled") === "true" ||
+        b.getAttribute("disabled") !== null;
       let rect = { right: 0, bottom: 0, width: 0, height: 0 };
       try { rect = b.getBoundingClientRect(); } catch {}
 
       let score = 0;
       if (type === "submit") score += 25;
+      // Disabled penalty (include for visibility but rarely click)
+      if (isDisabled) score -= 35;
 
       const combinedLabel = ariaLabel + " " + title + " " + text.toLowerCase();
       // Strong reward for explicit send/submit/generate labels
@@ -533,15 +585,20 @@ async function grokClickSend(tabId, prompt) {
 
     scoredBtns.sort((a, b) => b.score - a.score);
 
-    const topCandidates = scoredBtns.slice(0, 5).map((s) => ({
+    // Debug: show top-8 (not 5) + also include tag + disabled info so
+    // we can see if the real send button was in the pool but disabled.
+    const topCandidates = scoredBtns.slice(0, 8).map((s) => ({
       text: s.text.slice(0, 30),
       ariaLabel: s.ariaLabel.slice(0, 30),
-      score: s.score,
+      score: Math.round(s.score * 10) / 10,
       hasSvg: s.hasSvg,
+      tag: s.btn.tagName.toLowerCase(),
       pos: `${Math.round(s.rect.right)},${Math.round(s.rect.bottom)}`,
     }));
 
-    const sendBtn = scoredBtns[0]?.btn || null;
+    // Winner selection: explicit aria-label match wins (if the priority
+    // pass found one). Otherwise pick the top-scored button.
+    const sendBtn = explicitSend || scoredBtns[0]?.btn || null;
 
     if (!sendBtn) {
       window.__grokAutomationActive = false;
@@ -569,7 +626,8 @@ async function grokClickSend(tabId, prompt) {
       ok: true,
       inputType,
       buttonLabel: label,
-      buttonScore: scoredBtns[0].score,
+      buttonScore: explicitSend ? 999 : scoredBtns[0].score,
+      explicitMatch: !!explicitSend,
       topCandidates,
     };
   }, { prompt });
@@ -1049,17 +1107,22 @@ async function grokHandleWork(work) {
     "clicked",
     `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"}${scoreInfo})`
   );
-  // Low-confidence click — surface top-5 candidates so the user can
-  // eyeball which button was picked vs which SHOULD have been picked.
+  // Always surface top-5 candidates if the score was < 30 (below the
+  // "explicit send match" threshold). Makes it obvious what else was
+  // around. If explicitMatch is true we skip the log.
   if (
+    !clickResult.explicitMatch &&
     typeof clickResult.buttonScore === "number" &&
-    clickResult.buttonScore < 25 &&
+    clickResult.buttonScore < 30 &&
     clickResult.topCandidates
   ) {
     const cands = clickResult.topCandidates
+      .slice(0, 5)
       .map(
         (c) =>
-          `[${c.score.toFixed(0)} "${c.ariaLabel || c.text || "?"}"]`
+          `[${c.score}|${c.tag || "?"}${c.hasSvg ? "+svg" : ""} "${
+            c.ariaLabel || c.text || "-"
+          }"]`
       )
       .join(" ");
     await grokReportProgress(request_id, "low_confidence_click", cands);
