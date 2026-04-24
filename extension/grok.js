@@ -33,6 +33,7 @@
 const GROK_BRIDGE_URL = "http://127.0.0.1:18926";
 const GROK_POLL_INTERVAL = 1500;
 const GROK_ACCOUNT_DETECT_INTERVAL = 15000;
+const GROK_HEADER_CAPTURE_INTERVAL = 20000;  // re-inject capture if lost
 const GROK_ORIGIN = "https://grok.com";
 const GROK_ASSETS_ORIGIN = "https://assets.grok.com";
 
@@ -50,6 +51,121 @@ let grokActiveCount = 0;
 // Dedupe — bridge shouldn't re-dispatch but belt-and-suspenders.
 const grokInFlightRequestIds = new Set();
 const grokSubmittedRequestIds = new Set();
+
+// ═══════════════════════════════════════════════════════════════════
+// Header capture — Grok's backend requires x-statsig-id and similar
+// anti-bot headers on /rest/app-chat/conversations/new. These headers
+// are added by Grok's own app code, NOT by a fetch interceptor, so a
+// plain fetch() from our executeScript misses them and gets rejected
+// with {code: 7, message: "Request rejected by anti-bot rules"}.
+//
+// Workaround: install a fetch monkey-patch in the grok.com tab's MAIN
+// world that captures headers from any real Grok API call. Our
+// automation reads the captured headers and replays them.
+//
+// The patch persists across subsequent chrome.scripting.executeScript
+// calls because MAIN world shares window with the page. We re-inject
+// periodically in case the page navigated/reloaded.
+// ═══════════════════════════════════════════════════════════════════
+
+async function grokInstallHeaderCapture(tabId) {
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        if (window.__grokFetchPatchInstalled) return { ok: true, already: true };
+        window.__grokFetchPatchInstalled = true;
+        window.__grokLastHeaders = {};
+        window.__grokHeadersCapturedAt = 0;
+        const origFetch = window.fetch;
+        window.fetch = async function (input, init) {
+          try {
+            const url =
+              typeof input === "string" ? input : input && input.url ? input.url : "";
+            if (
+              url &&
+              (url.includes("/rest/app-chat/") ||
+                url.includes("/rest/media/"))
+            ) {
+              const hdrs = init && init.headers;
+              const snap = {};
+              if (hdrs) {
+                if (hdrs instanceof Headers) {
+                  hdrs.forEach((v, k) => (snap[k.toLowerCase()] = v));
+                } else if (Array.isArray(hdrs)) {
+                  hdrs.forEach(([k, v]) => (snap[String(k).toLowerCase()] = v));
+                } else if (typeof hdrs === "object") {
+                  Object.keys(hdrs).forEach(
+                    (k) => (snap[k.toLowerCase()] = hdrs[k])
+                  );
+                }
+              }
+              // Merge with any prior capture so partial-header calls
+              // still contribute to a full snapshot.
+              window.__grokLastHeaders = {
+                ...window.__grokLastHeaders,
+                ...snap,
+              };
+              window.__grokHeadersCapturedAt = Date.now();
+            }
+          } catch (e) {
+            // Never let our instrumentation break real app fetches.
+          }
+          return origFetch.apply(this, arguments);
+        };
+        return { ok: true, installed: true };
+      },
+    });
+    return result?.[0]?.result || null;
+  } catch (e) {
+    console.warn("[Grok] installHeaderCapture failed:", e.message);
+    return null;
+  }
+}
+
+async function grokReadCapturedHeaders(tabId) {
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        return {
+          headers: window.__grokLastHeaders || {},
+          capturedAt: window.__grokHeadersCapturedAt || 0,
+        };
+      },
+    });
+    return result?.[0]?.result || { headers: {}, capturedAt: 0 };
+  } catch {
+    return { headers: {}, capturedAt: 0 };
+  }
+}
+
+// Headers that Grok checks at the backend for its anti-bot system. Only
+// these are replayed — we deliberately do NOT replay Content-Type (we
+// set our own), Content-Length (browser auto-computes), or cookies
+// (already attached via credentials:"include").
+const GROK_REPLAY_HEADER_KEYS = [
+  "x-statsig-id",
+  "x-xai-request-id",
+  "x-xai-auth",
+  "sentry-trace",
+  "baggage",
+  "accept-language",
+];
+
+function grokPickReplayHeaders(captured) {
+  const out = {};
+  if (!captured) return out;
+  for (const key of GROK_REPLAY_HEADER_KEYS) {
+    const v = captured[key];
+    if (v !== undefined && v !== null && String(v).length > 0) {
+      out[key] = String(v);
+    }
+  }
+  return out;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Account detection
@@ -135,6 +251,12 @@ async function grokDetectAccounts() {
             tab_id: tab.id,
             last_seen: Date.now(),
           };
+          // Install the fetch header capture into this tab's MAIN world.
+          // Idempotent — re-runs are no-ops once installed, so safe to
+          // call on every detection cycle.
+          try {
+            await grokInstallHeaderCapture(tab.id);
+          } catch {}
         }
       } catch (e) {
         // Tab closed mid-probe or no access — skip silently.
@@ -253,6 +375,43 @@ async function grokHandleWork(work) {
 
   await grokReportProgress(request_id, "started", `account=${account}`);
 
+  // Make sure the fetch header capture is installed in this tab, then
+  // snapshot the latest captured anti-bot headers. If none have been
+  // captured yet (user never hit a real Grok endpoint), nudge the page
+  // by fetching /rest/rate-limits which any logged-in user can call.
+  try {
+    await grokInstallHeaderCapture(tabId);
+  } catch {}
+
+  let captured = await grokReadCapturedHeaders(tabId);
+  if (!captured.capturedAt) {
+    // Trigger a benign real fetch so the page's own code attaches its
+    // anti-bot headers and our patch can capture them. We fire it from
+    // inside the tab so the page's fetch wrapper applies.
+    try {
+      await grokExecInTab(tabId, async () => {
+        try {
+          await fetch("/rest/rate-limits", {
+            method: "GET",
+            credentials: "include",
+            headers: { Accept: "application/json" },
+          });
+        } catch {}
+        // Also try the page's internal polling endpoint to help capture
+        await new Promise((r) => setTimeout(r, 300));
+        return { ok: true };
+      });
+      captured = await grokReadCapturedHeaders(tabId);
+    } catch {}
+  }
+  const replayHeaders = grokPickReplayHeaders(captured.headers);
+  const hasAntiBotHeaders = !!replayHeaders["x-statsig-id"];
+  await grokReportProgress(
+    request_id,
+    "headers_captured",
+    hasAntiBotHeaders ? "ok" : "missing_x-statsig-id"
+  );
+
   // ─────────────────────────────────────────────────────────────
   // Step 1 (optional): Upload reference image
   // ─────────────────────────────────────────────────────────────
@@ -266,7 +425,7 @@ async function grokHandleWork(work) {
       const r = await fetch("/rest/app-chat/upload-file", {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(args.replayHeaders || {}) },
         body: JSON.stringify({
           fileName: args.fileName,
           fileMimeType: args.fileMimeType,
@@ -283,6 +442,7 @@ async function grokHandleWork(work) {
       fileName: reference_image_filename,
       fileMimeType: reference_image_mime || "image/jpeg",
       content: reference_image_base64,
+      replayHeaders,
     });
 
     if (!uploadResult || uploadResult.status !== 200 || !uploadResult.data) {
@@ -318,7 +478,7 @@ async function grokHandleWork(work) {
     const r = await fetch("/rest/media/post/create", {
       method: "POST",
       credentials: "include",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(args.replayHeaders || {}) },
       body: JSON.stringify(args.body),
     });
     const status = r.status;
@@ -326,7 +486,7 @@ async function grokHandleWork(work) {
     let parsed = null;
     try { parsed = JSON.parse(text); } catch {}
     return { status, text: parsed ? null : text, data: parsed };
-  }, { body: createBody });
+  }, { body: createBody, replayHeaders });
 
   if (!createResult || createResult.status !== 200 || !createResult.data) {
     const errBody = createResult?.text || JSON.stringify(createResult?.data || {});
@@ -383,14 +543,33 @@ async function grokHandleWork(work) {
 
   await grokReportProgress(request_id, "animating", `${aspect_ratio} ${resolution} ${video_length}s`);
 
+  // Refresh captured headers right before the expensive call — Grok
+  // rotates some per-request values and we want the freshest snapshot.
+  try {
+    const freshCap = await grokReadCapturedHeaders(tabId);
+    if (freshCap && freshCap.capturedAt) {
+      const merged = grokPickReplayHeaders(freshCap.headers);
+      Object.assign(replayHeaders, merged);
+    }
+  } catch {}
+
   // Execute the streaming fetch inside the tab. The result: we read the
   // whole NDJSON stream (it's bounded — Grok finishes within 60-180s) and
   // parse out the final videoUrl.
   const animateResult = await grokExecInTab(tabId, async (args) => {
+    // Strip any x-xai-request-id / sentry-trace / baggage from the
+    // replay headers — those are per-request and stale values fail
+    // anti-bot validation. Keep only the stable ones (x-statsig-id,
+    // x-xai-auth, accept-language).
+    const replay = { ...(args.replayHeaders || {}) };
+    delete replay["x-xai-request-id"];
+    delete replay["sentry-trace"];
+    delete replay["baggage"];
+
     const r = await fetch("/rest/app-chat/conversations/new", {
       method: "POST",
       credentials: "include",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...replay },
       body: JSON.stringify(args.body),
     });
     const status = r.status;
