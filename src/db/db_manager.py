@@ -81,6 +81,7 @@ def _ensure_db_schema(conn):
             video_ratio TEXT DEFAULT '',
             video_prompt TEXT DEFAULT '',
             video_upscale TEXT DEFAULT 'none',
+            video_length INTEGER DEFAULT 10,
             video_output_count INTEGER DEFAULT 1,
             ref_path TEXT,
             ref_paths TEXT,
@@ -121,6 +122,8 @@ def _ensure_db_schema(conn):
         cursor.execute("ALTER TABLE jobs ADD COLUMN video_prompt TEXT DEFAULT ''")
     if "video_upscale" not in existing_cols:
         cursor.execute("ALTER TABLE jobs ADD COLUMN video_upscale TEXT DEFAULT 'none'")
+    if "video_length" not in existing_cols:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN video_length INTEGER DEFAULT 10")
     if "video_output_count" not in existing_cols:
         cursor.execute("ALTER TABLE jobs ADD COLUMN video_output_count INTEGER DEFAULT 1")
     if "ref_paths" not in existing_cols:
@@ -391,6 +394,7 @@ def _normalize_job_payload(
     video_ratio="",
     video_prompt="",
     video_upscale="none",
+    video_length=10,
     video_output_count=1,
     start_image_path=None,
     end_image_path=None,
@@ -411,6 +415,12 @@ def _normalize_job_payload(
     normalized_video_ratio = str(video_ratio or (aspect_ratio if normalized_job_type == "video" else "")).strip()
     normalized_video_prompt = str(video_prompt or "").strip()
     normalized_video_upscale = str(video_upscale or "none").strip().lower() or "none"
+    try:
+        normalized_video_length = int(video_length or 10)
+    except (TypeError, ValueError):
+        normalized_video_length = 10
+    if normalized_video_length <= 0:
+        normalized_video_length = 10
     normalized_start_image_path = start_image_path if start_image_path else None
     normalized_end_image_path = end_image_path if end_image_path else None
     try:
@@ -429,6 +439,7 @@ def _normalize_job_payload(
         "video_ratio": normalized_video_ratio,
         "video_prompt": normalized_video_prompt,
         "video_upscale": normalized_video_upscale,
+        "video_length": normalized_video_length,
         "video_output_count": normalized_video_output_count,
         "ref_path": normalized_ref_path,
         "ref_paths_json": normalized_ref_paths_json,
@@ -454,6 +465,7 @@ def add_job(
     video_ratio="",
     video_prompt="",
     video_upscale="none",
+    video_length=10,
     video_output_count=1,
     start_image_path=None,
     end_image_path=None,
@@ -476,6 +488,7 @@ def add_job(
         video_ratio=video_ratio,
         video_prompt=video_prompt,
         video_upscale=video_upscale,
+        video_length=video_length,
         video_output_count=video_output_count,
         start_image_path=start_image_path,
         end_image_path=end_image_path,
@@ -493,11 +506,11 @@ def add_job(
             '''
             INSERT INTO jobs (
                 id, prompt, job_type, model, aspect_ratio, output_count,
-                video_model, video_sub_mode, video_ratio, video_prompt, video_upscale, video_output_count,
+                video_model, video_sub_mode, video_ratio, video_prompt, video_upscale, video_length, video_output_count,
                 ref_path, ref_paths, start_image_path, end_image_path,
                 queue_no, output_index, is_retry, retry_source, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''',
             (
                 job_payload["job_id"],
@@ -511,6 +524,7 @@ def add_job(
                 job_payload["video_ratio"],
                 job_payload["video_prompt"],
                 job_payload["video_upscale"],
+                job_payload["video_length"],
                 job_payload["video_output_count"],
                 job_payload["ref_path"],
                 job_payload["ref_paths_json"],
@@ -546,6 +560,7 @@ def add_jobs_bulk(job_specs, progress_cb=None, should_stop=None):
                 video_ratio=spec.get("video_ratio", ""),
                 video_prompt=spec.get("video_prompt", ""),
                 video_upscale=spec.get("video_upscale", "none"),
+                video_length=spec.get("video_length", 10),
                 video_output_count=spec.get("video_output_count", 1),
                 start_image_path=spec.get("start_image_path"),
                 end_image_path=spec.get("end_image_path"),
@@ -575,11 +590,11 @@ def add_jobs_bulk(job_specs, progress_cb=None, should_stop=None):
                 '''
                 INSERT INTO jobs (
                     id, prompt, job_type, model, aspect_ratio, output_count,
-                    video_model, video_sub_mode, video_ratio, video_prompt, video_upscale, video_output_count,
+                    video_model, video_sub_mode, video_ratio, video_prompt, video_upscale, video_length, video_output_count,
                     ref_path, ref_paths, start_image_path, end_image_path,
                     queue_no, output_index, is_retry, retry_source, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     job_payload["job_id"],
@@ -593,6 +608,7 @@ def add_jobs_bulk(job_specs, progress_cb=None, should_stop=None):
                     job_payload["video_ratio"],
                     job_payload["video_prompt"],
                     job_payload["video_upscale"],
+                    job_payload["video_length"],
                     job_payload["video_output_count"],
                     job_payload["ref_path"],
                     job_payload["ref_paths_json"],
@@ -621,7 +637,7 @@ def get_all_jobs():
         "SELECT id, prompt, job_type, model, video_model, queue_no, status, assigned_account, error_message, output_count, video_output_count, "
         "output_path, output_index, is_retry, retry_source, progress_step, progress_poll_count, "
         "aspect_ratio, video_sub_mode, ref_path, ref_paths, start_image_path, video_prompt, "
-        "end_image_path, video_ratio, video_upscale "
+        "end_image_path, video_ratio, video_upscale, video_length "
         "FROM jobs ORDER BY queue_no ASC, created_at ASC"
     )
     jobs = cursor.fetchall()
@@ -654,6 +670,7 @@ def get_all_jobs():
             "end_image_path": j[23],
             "video_ratio": j[24],
             "video_upscale": j[25],
+            "video_length": int(j[26]) if (len(j) > 26 and j[26] is not None) else 10,
         }
         for j in jobs
     ]
@@ -901,6 +918,7 @@ def update_pending_jobs_generation_settings(
     video_ratio="",
     video_prompt="",
     video_upscale="none",
+    video_length=10,
     video_output_count=1,
     start_image_path=None,
     end_image_path=None,
@@ -919,6 +937,12 @@ def update_pending_jobs_generation_settings(
     normalized_video_ratio = str(video_ratio or (aspect_ratio if normalized_job_type == "video" else "")).strip()
     normalized_video_prompt = str(video_prompt or "").strip()
     normalized_video_upscale = str(video_upscale or "none").strip().lower() or "none"
+    try:
+        normalized_video_length = int(video_length or 10)
+    except (TypeError, ValueError):
+        normalized_video_length = 10
+    if normalized_video_length <= 0:
+        normalized_video_length = 10
     normalized_video_output_count = max(1, int(video_output_count or output_count or 1))
     normalized_start_image_path = start_image_path if start_image_path else None
     normalized_end_image_path = end_image_path if end_image_path else None
@@ -930,7 +954,7 @@ def update_pending_jobs_generation_settings(
             '''
             UPDATE jobs
             SET job_type = ?, model = ?, aspect_ratio = ?, output_count = ?,
-                ref_path = ?, ref_paths = ?, video_model = ?, video_sub_mode = ?, video_ratio = ?, video_prompt = ?, video_upscale = ?, video_output_count = ?,
+                ref_path = ?, ref_paths = ?, video_model = ?, video_sub_mode = ?, video_ratio = ?, video_prompt = ?, video_upscale = ?, video_length = ?, video_output_count = ?,
                 start_image_path = ?, end_image_path = ?
             WHERE status = 'pending'
             '''
@@ -947,6 +971,7 @@ def update_pending_jobs_generation_settings(
             normalized_video_ratio,
             normalized_video_prompt,
             normalized_video_upscale,
+            normalized_video_length,
             normalized_video_output_count,
             normalized_start_image_path,
             normalized_end_image_path,

@@ -58,6 +58,12 @@ class GrokBridge:
         self._pending_requests: Dict[str, Dict[str, Any]] = {}
         self._request_counter = 0
 
+        # Last time we saw ANY activity from the extension for a given
+        # request_id (progress event, poll-for-work hit, or dispatch).
+        # Used by wait_for_result to distinguish "extension is working
+        # on it, just slow" from "extension went silent, bail out".
+        self._last_activity: Dict[str, float] = {}
+
         # Accounts reported by extension.
         # Shape: { email: {email, userId, subscription, last_seen} }
         self._connected_accounts: Dict[str, Dict[str, Any]] = {}
@@ -120,14 +126,17 @@ class GrokBridge:
         reference_image_base64: str = "",
         reference_image_filename: str = "",
         reference_image_mime: str = "image/jpeg",
-    ) -> "asyncio.Future[Dict[str, Any]]":
-        """Queue a Grok video generation request. Returns a future that
-        resolves when the extension reports the result (success or error)."""
+    ) -> "tuple[str, asyncio.Future[Dict[str, Any]]]":
+        """Queue a Grok video generation request. Returns (request_id, future).
+        The future resolves when the extension reports the result
+        (success or error). The request_id can be passed to
+        `wait_for_result` / `time_since_last_activity` for smarter waits."""
         self._request_counter += 1
         rid = f"grok-{int(time.time())}-{self._request_counter}"
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
 
+        now = time.time()
         self._pending_requests[rid] = {
             "request_id": rid,
             "account": account,
@@ -140,9 +149,86 @@ class GrokBridge:
             "reference_image_filename": reference_image_filename,
             "reference_image_mime": reference_image_mime,
             "future": fut,
-            "created_at": time.time(),
+            "created_at": now,
         }
-        return fut
+        self._last_activity[rid] = now
+        return rid, fut
+
+    def time_since_last_activity(self, rid: str) -> Optional[float]:
+        """Seconds since the extension last reported ANY activity for
+        this request (dispatch, progress event, etc.). Returns None if
+        the request_id is unknown."""
+        ts = self._last_activity.get(rid)
+        if ts is None:
+            return None
+        return time.time() - ts
+
+    async def wait_for_result(
+        self,
+        rid: str,
+        fut: "asyncio.Future[Dict[str, Any]]",
+        *,
+        idle_timeout_s: float = 300.0,
+        max_total_s: float = 1800.0,
+    ) -> Dict[str, Any]:
+        """Wait for a submitted request's result with an activity-based
+        timeout.
+
+        - Fails if the extension goes idle (no progress/dispatch events)
+          for more than `idle_timeout_s` seconds.
+        - Fails if total wait exceeds `max_total_s` as a hard safety cap.
+        - Succeeds as soon as the extension posts a result.
+
+        Why not a flat wait_for(future, 300)? The 300s countdown starts
+        when Python submits, but the extension may spend minutes waiting
+        for a free tab before it actually begins. Flat 300s causes false
+        timeouts for the tail of a queue even though the extension
+        successfully generates the video — Python abandons the future
+        before the extension posts the result back.
+        """
+        started_at = time.time()
+        while True:
+            if fut.done():
+                return fut.result()
+            idle_for = self.time_since_last_activity(rid)
+            if idle_for is not None and idle_for > idle_timeout_s:
+                # No word from the extension in too long — assume stuck.
+                self._pending_requests.pop(rid, None)
+                self._dispatched.pop(rid, None)
+                self._last_activity.pop(rid, None)
+                if not fut.done():
+                    fut.set_result({
+                        "error": "grok_idle_timeout",
+                        "detail": (
+                            f"No activity from extension for "
+                            f"{int(idle_for)}s. Chrome or the extension "
+                            "may have been closed, or the tab got "
+                            "stuck. Restart Chrome and try again."
+                        ),
+                    })
+                return fut.result()
+            if time.time() - started_at > max_total_s:
+                self._pending_requests.pop(rid, None)
+                self._dispatched.pop(rid, None)
+                self._last_activity.pop(rid, None)
+                if not fut.done():
+                    fut.set_result({
+                        "error": "grok_total_timeout",
+                        "detail": (
+                            f"Job exceeded total {int(max_total_s)}s "
+                            "cap. Too many slots queued on too few "
+                            "Grok tabs — open more grok.com/imagine "
+                            "tabs or reduce slot count."
+                        ),
+                    })
+                return fut.result()
+            try:
+                # Short wait so we can re-check idle/total budget
+                # periodically. 5s is a good balance between
+                # responsiveness and CPU cost.
+                return await asyncio.wait_for(asyncio.shield(fut), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
 
     def get_accounts(self) -> List[Dict[str, Any]]:
         """Snapshot of currently-connected Grok accounts."""
@@ -161,6 +247,7 @@ class GrokBridge:
                 fut.set_result({"error": "cancelled_by_user"})
         self._pending_requests.clear()
         self._dispatched.clear()
+        self._last_activity.clear()
 
     # ═══════════════════════════════════════════════════════════════
     # HTTP handlers
@@ -197,6 +284,10 @@ class GrokBridge:
 
         rid = chosen["request_id"]
         self._dispatched[rid] = now
+        # Extension is about to work on this rid — count that as activity
+        # so wait_for_result doesn't fire an idle timeout while the
+        # extension was still queuing it internally.
+        self._last_activity[rid] = now
 
         # Send everything the extension needs (minus the future)
         payload = {
@@ -227,6 +318,7 @@ class GrokBridge:
 
         req = self._pending_requests.pop(rid, None)
         self._dispatched.pop(rid, None)
+        self._last_activity.pop(rid, None)
         if not req:
             # Extension may have re-submitted — silent OK
             return web.json_response({"ok": True, "stale": True})
@@ -249,6 +341,11 @@ class GrokBridge:
         rid = data.get("request_id", "")
         stage = data.get("stage", "")
         detail = data.get("detail", "")
+        if rid:
+            # Any progress event (including tab_wait) proves the
+            # extension is alive — bump last_activity so wait_for_result
+            # doesn't fire a false idle timeout.
+            self._last_activity[rid] = time.time()
         if rid and stage:
             # Keep log quiet for high-frequency stages
             if stage not in {"started"}:

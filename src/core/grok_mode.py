@@ -86,6 +86,29 @@ def _safe_filename(job_id: str, idx: int, ext: str = "mp4") -> str:
     return f"{safe or 'video'}_{idx}.{ext}"
 
 
+def _queue_output_number(job: Dict[str, Any]) -> Optional[int]:
+    """Return the stable 1-based queue number for a job, mirroring
+    Flow/Chrome Extension mode's naming convention.
+
+    Uses `output_index` (preserved across retries per db_manager) and
+    falls back to `queue_no`. Retries keep their original output_index
+    so a retried job's video overwrites the failed placeholder with the
+    correct sequence-number filename (e.g. `3.mp4`) instead of leaving
+    a gap and creating a new file with a fresh queue_no.
+    """
+    for key in ("output_index", "queue_no"):
+        raw = job.get(key)
+        if raw is None:
+            continue
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    return None
+
+
 class GrokWorker:
     """A worker slot for a single Grok account. Multiple workers per account
     allow parallel generation (up to Grok's fair-use ceiling)."""
@@ -428,6 +451,12 @@ class GrokModeManager:
         per_job_ratio = str(job.get("video_ratio") or "").strip()
         job_aspect = _resolve_aspect_ratio(per_job_ratio) if per_job_ratio else self._aspect
 
+        # Per-job duration — Grok-specific "Dur:" combo writes video_length
+        # (6 or 10). Fall back to the run-wide setting if unset so
+        # Veo-mode queues that didn't populate this field still work.
+        per_job_length = _resolve_video_length(job.get("video_length"))
+        job_length = per_job_length if per_job_length in _ALLOWED_LEN else self._video_length
+
         # Per-job resolution — Video tab's "Upscale" dropdown writes video_upscale.
         # Map Veo-style values ("720p", "1080p", "4k", "none") → Grok resolution.
         # Grok only supports 480p and 720p; anything above 720p falls back to 720p.
@@ -510,17 +539,17 @@ class GrokModeManager:
         # Per-job settings snapshot — so user can verify the UI→Grok mapping
         self._log(
             f"[{worker.slot_id}] Grok config → aspect={job_aspect}, "
-            f"resolution={job_resolution}, length={self._video_length}s, "
+            f"resolution={job_resolution}, length={job_length}s, "
             f"mode={self._mode}, ref={'yes' if ref_b64 else 'no'}"
         )
 
         # Submit to bridge
         try:
-            future = self._bridge.submit_request(
+            rid, future = self._bridge.submit_request(
                 account=worker.account_email,
                 prompt=prompt,
                 aspect_ratio=job_aspect,
-                video_length=self._video_length,
+                video_length=job_length,
                 resolution=job_resolution,
                 mode=self._mode,
                 reference_image_base64=ref_b64,
@@ -544,19 +573,16 @@ class GrokModeManager:
         )
 
         try:
-            # Upper cap 5 min: upload (~5s) + video gen (~2 min) + download (~10s)
-            result = await asyncio.wait_for(future, timeout=300)
-        except asyncio.TimeoutError:
-            self._log(f"[{worker.slot_id}] Timeout waiting for video (>5min)")
-            update_job_status(
-                job_id, "failed", account=worker.account_email,
-                error="grok_timeout_300s",
+            # Activity-based wait: the extension must keep sending
+            # progress/poll signals; a 5-min silence fails the job, a
+            # 30-min hard cap guards against runaway queues. This
+            # replaces the flat 300s timer that used to kill tail-of-
+            # queue jobs even when they were generating fine — the 5-min
+            # Python countdown was starting at Python dispatch, not at
+            # when the extension actually began work.
+            result = await self._bridge.wait_for_result(
+                rid, future, idle_timeout_s=300.0, max_total_s=1800.0,
             )
-            self.qm.signals.job_updated.emit(
-                job_id, "failed", worker.account_email, "grok_timeout"
-            )
-            worker.is_busy = False
-            return
         except asyncio.CancelledError:
             worker.is_busy = False
             raise
@@ -642,9 +668,19 @@ class GrokModeManager:
         except Exception:
             pass
 
-        fname = job.get("output_filename", "") or _safe_filename(
-            job_id, int(job.get("idx", 1) or 1)
-        )
+        # File name: prefer the caller-supplied override, otherwise use
+        # the job's stable queue number (e.g. `3.mp4`) — matches Flow/
+        # Chrome Extension mode and preserves numbering across retries
+        # since output_index is kept when a failed job is requeued.
+        fname = job.get("output_filename", "")
+        if not fname:
+            qno = _queue_output_number(job)
+            if qno is not None:
+                fname = f"{qno}.mp4"
+            else:
+                # Fallback only if we somehow got a job with no queue
+                # number (shouldn't happen for jobs from the DB).
+                fname = _safe_filename(job_id, 1)
         if not fname.lower().endswith(".mp4"):
             fname += ".mp4"
         out_path = os.path.join(out_dir, fname)
@@ -676,11 +712,15 @@ class GrokModeManager:
             worker.is_busy = False
 
     def _pick_reference_for_job(self, job: Dict[str, Any]) -> str:
-        """If the user enabled a reference-folder, match this job to a file.
+        """If the user enabled a reference-folder, match this job to a file
+        by its stable queue number so the upload order matches the order
+        the user added prompts.
+
         Strategy:
-          1. <idx>.jpg / <idx>.png in the folder (most common from pipeline)
-          2. Else pick deterministically by idx modulo entry count
-        Returns absolute path, or "" if nothing usable."""
+          1. <queue_no>.jpg / .png / .jpeg / .webp in the folder
+          2. Else pick the entry at (queue_no - 1) in lexicographic order
+        Returns absolute path, or "" if nothing usable.
+        """
         folder = self._reference_folder
         if not folder or not os.path.isdir(folder):
             return ""
@@ -694,9 +734,15 @@ class GrokModeManager:
             return ""
         if not entries:
             return ""
-        idx = int(job.get("idx", 0) or 0)
+        qno = _queue_output_number(job)
+        if qno is None:
+            # No queue number on the job — fall back to the first entry
+            # deterministically rather than crash.
+            return entries[0]
+        # Preferred: <qno>.<ext> — pairs reference `3.jpg` with job #3.
         for ext in (".jpg", ".jpeg", ".png", ".webp"):
-            p = os.path.join(folder, f"{idx}{ext}")
+            p = os.path.join(folder, f"{qno}{ext}")
             if os.path.isfile(p):
                 return p
-        return entries[idx % len(entries)]
+        # Fallback: positional match (qno is 1-based, list is 0-based)
+        return entries[(qno - 1) % len(entries)]

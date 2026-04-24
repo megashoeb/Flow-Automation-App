@@ -1861,6 +1861,11 @@ class MainWindow(QMainWindow):
         # to the parent scroll area.
         self._install_wheel_filters()
         self._update_runtime_badges()
+        # Final sync now that both the video tabs AND the settings
+        # sidebar's cmb_generation_mode exist — the earlier call at
+        # setup_dashboard time ran before setup_settings so Grok mode
+        # wouldn't apply to the video tabs on startup.
+        self._sync_generation_mode_ui()
         self._pending_settings_sync_ready = True
         self.account_runtime_timer.start()
         self.account_status_timer.start()
@@ -2756,6 +2761,81 @@ class MainWindow(QMainWindow):
         combo.currentIndexChanged.connect(lambda _=None: self._update_runtime_badges())
         return combo
 
+    def _create_grok_res_dur_combos(self):
+        """Build the (resolution, duration) combo pair for Grok mode.
+        Grok Imagine caps at 720p and only accepts 6s or 10s clips —
+        exposing 1080p/4K options would just map down silently and
+        confuse the user. Saved values are stored under grok_* keys so
+        non-Grok runs ignore them entirely. Defaults to 720p / 10s.
+
+        Each combo's change signal triggers `_sync_grok_combos_across_tabs`
+        so all 4 video sub-tabs keep the same grok resolution/duration
+        choice — users almost never want different per-tab values, and
+        a single global choice makes persistence straightforward."""
+        saved_res = str(get_setting("grok_resolution", "720p") or "720p").lower()
+        if saved_res not in ("480p", "720p"):
+            saved_res = "720p"
+        try:
+            saved_dur = int(get_setting("grok_video_length", 10) or 10)
+        except (TypeError, ValueError):
+            saved_dur = 10
+        if saved_dur not in (6, 10):
+            saved_dur = 10
+        res = self._create_setting_combo(
+            [("480p", "480p"), ("720p", "720p")], current_data=saved_res,
+        )
+        dur = self._create_setting_combo(
+            [("6s", 6), ("10s", 10)], current_data=saved_dur,
+        )
+        res.currentIndexChanged.connect(
+            lambda _=None, src=res: self._sync_grok_combos_across_tabs("res", src)
+        )
+        dur.currentIndexChanged.connect(
+            lambda _=None, src=dur: self._sync_grok_combos_across_tabs("dur", src)
+        )
+        return res, dur
+
+    def _sync_grok_combos_across_tabs(self, kind: str, source):
+        """Propagate a change in one tab's grok res/dur combo to the
+        other tabs. Guarded by a reentrancy flag so the propagation
+        doesn't re-fire and loop forever."""
+        if getattr(self, "_syncing_grok_combos", False):
+            return
+        attr = "_cmb_grok_res" if kind == "res" else "_cmb_grok_dur"
+        try:
+            target_data = source.currentData()
+        except Exception:
+            return
+        self._syncing_grok_combos = True
+        try:
+            for prefix in ("t2v", "ref", "frm", "pipe"):
+                other = getattr(self, f"{prefix}{attr}", None)
+                if other is None or other is source:
+                    continue
+                idx = other.findData(target_data)
+                if idx >= 0 and other.currentIndex() != idx:
+                    # blockSignals so the propagated setCurrentIndex
+                    # doesn't re-fire _on_generation_settings_changed
+                    # on every target (which would run the pending-job
+                    # resync 3 extra times per user interaction).
+                    other.blockSignals(True)
+                    try:
+                        other.setCurrentIndex(idx)
+                    finally:
+                        other.blockSignals(False)
+        finally:
+            self._syncing_grok_combos = False
+
+    def _set_grok_row_visible(self, upscale_combo, grok_widgets, upscale_label, is_grok):
+        """Toggle an upscale/grok row between Veo-style (upscale combo)
+        and Grok-style (resolution + duration combos) layout. Keeps
+        Parallel visible either way."""
+        upscale_combo.setVisible(not is_grok)
+        for w in grok_widgets:
+            w.setVisible(is_grok)
+        if upscale_label is not None:
+            upscale_label.setText("Grok:" if is_grok else "Upscale:")
+
     def _make_setting_label(self, text):
         label = QLabel(text)
         label.setObjectName("settingLabel")
@@ -3448,6 +3528,13 @@ class MainWindow(QMainWindow):
             ("1080p (Free)", "1080p"),
             ("4K (+50)", "4k"),
         ], current_data="none")
+        # Grok-specific combos: visible only when generation_mode =
+        # chrome_extension_grok (toggled in _sync_generation_mode_ui).
+        # Grok caps at 720p and only supports 6s / 10s durations.
+        self.t2v_cmb_grok_res, self.t2v_cmb_grok_dur = self._create_grok_res_dur_combos()
+        self.t2v_lbl_grok_res = self._make_setting_label("Res:")
+        self.t2v_lbl_grok_dur = self._make_setting_label("Dur:")
+        self.t2v_lbl_upscale = self._make_setting_label("Upscale:")
         self.t2v_cmb_parallel = self._create_parallel_combo(saved_slots)
 
         form.addRow(self._make_setting_label("Quality:"), self.t2v_cmb_quality)
@@ -3460,12 +3547,21 @@ class MainWindow(QMainWindow):
             ),
         )
         form.addRow(
-            self._make_setting_label("Upscale:"),
+            self.t2v_lbl_upscale,
             self._make_inline_row(
                 self.t2v_cmb_upscale,
+                self.t2v_lbl_grok_res, self.t2v_cmb_grok_res,
+                self.t2v_lbl_grok_dur, self.t2v_cmb_grok_dur,
                 self._make_setting_label("Parallel:"),
                 self.t2v_cmb_parallel,
             ),
+        )
+        self._set_grok_row_visible(
+            self.t2v_cmb_upscale,
+            (self.t2v_lbl_grok_res, self.t2v_cmb_grok_res,
+             self.t2v_lbl_grok_dur, self.t2v_cmb_grok_dur),
+            self.t2v_lbl_upscale,
+            False,
         )
         layout.addLayout(form)
         layout.addStretch()
@@ -3497,6 +3593,10 @@ class MainWindow(QMainWindow):
             ("1080p (Free)", "1080p"),
             ("4K (+50)", "4k"),
         ], current_data="none")
+        self.ref_cmb_grok_res, self.ref_cmb_grok_dur = self._create_grok_res_dur_combos()
+        self.ref_lbl_grok_res = self._make_setting_label("Res:")
+        self.ref_lbl_grok_dur = self._make_setting_label("Dur:")
+        self.ref_lbl_upscale = self._make_setting_label("Upscale:")
         self.ref_cmb_parallel = self._create_parallel_combo(saved_slots)
 
         form.addRow(self._make_setting_label("Quality:"), self.ref_cmb_quality)
@@ -3509,12 +3609,21 @@ class MainWindow(QMainWindow):
             ),
         )
         form.addRow(
-            self._make_setting_label("Upscale:"),
+            self.ref_lbl_upscale,
             self._make_inline_row(
                 self.ref_cmb_upscale,
+                self.ref_lbl_grok_res, self.ref_cmb_grok_res,
+                self.ref_lbl_grok_dur, self.ref_cmb_grok_dur,
                 self._make_setting_label("Parallel:"),
                 self.ref_cmb_parallel,
             ),
+        )
+        self._set_grok_row_visible(
+            self.ref_cmb_upscale,
+            (self.ref_lbl_grok_res, self.ref_cmb_grok_res,
+             self.ref_lbl_grok_dur, self.ref_cmb_grok_dur),
+            self.ref_lbl_upscale,
+            False,
         )
 
         self.ref_single_row, self.btn_ref_single_browse, self.lbl_ref_single, self.btn_ref_single_clear = self._create_path_row(
@@ -3562,6 +3671,10 @@ class MainWindow(QMainWindow):
             ("1080p (Free)", "1080p"),
             ("4K (+50)", "4k"),
         ], current_data="none")
+        self.frm_cmb_grok_res, self.frm_cmb_grok_dur = self._create_grok_res_dur_combos()
+        self.frm_lbl_grok_res = self._make_setting_label("Res:")
+        self.frm_lbl_grok_dur = self._make_setting_label("Dur:")
+        self.frm_lbl_upscale = self._make_setting_label("Upscale:")
         self.frm_cmb_parallel = self._create_parallel_combo(saved_slots)
 
         form.addRow(
@@ -3581,12 +3694,21 @@ class MainWindow(QMainWindow):
             ),
         )
         form.addRow(
-            self._make_setting_label("Upscale:"),
+            self.frm_lbl_upscale,
             self._make_inline_row(
                 self.frm_cmb_upscale,
+                self.frm_lbl_grok_res, self.frm_cmb_grok_res,
+                self.frm_lbl_grok_dur, self.frm_cmb_grok_dur,
                 self._make_setting_label("Parallel:"),
                 self.frm_cmb_parallel,
             ),
+        )
+        self._set_grok_row_visible(
+            self.frm_cmb_upscale,
+            (self.frm_lbl_grok_res, self.frm_cmb_grok_res,
+             self.frm_lbl_grok_dur, self.frm_cmb_grok_dur),
+            self.frm_lbl_upscale,
+            False,
         )
 
         self.start_row, self.btn_start_image, self.lbl_start_image, self.btn_clear_start_image = self._create_path_row(
@@ -3708,6 +3830,10 @@ class MainWindow(QMainWindow):
             ("1080p (Free)", "1080p"),
             ("4K (+50)", "4k"),
         ], current_data="none")
+        self.pipe_cmb_grok_res, self.pipe_cmb_grok_dur = self._create_grok_res_dur_combos()
+        self.pipe_lbl_grok_res = self._make_setting_label("Res:")
+        self.pipe_lbl_grok_dur = self._make_setting_label("Dur:")
+        self.pipe_lbl_upscale = self._make_setting_label("Upscale:")
         # Outputs per video prompt — same semantics as the other tabs.
         # x1 by default to keep credit burn predictable. x2+ multiplies
         # video credits accordingly (estimate updates live).
@@ -3722,12 +3848,21 @@ class MainWindow(QMainWindow):
         form2.addRow(self._make_setting_label("Video Outputs:"), self.pipe_cmb_vid_outputs)
         form2.addRow(self._make_setting_label("Video Prompt:"), self.pipe_txt_vid_prompt)
         form2.addRow(
-            self._make_setting_label("Upscale:"),
+            self.pipe_lbl_upscale,
             self._make_inline_row(
                 self.pipe_cmb_upscale,
+                self.pipe_lbl_grok_res, self.pipe_cmb_grok_res,
+                self.pipe_lbl_grok_dur, self.pipe_cmb_grok_dur,
                 self._make_setting_label("Parallel:"),
                 self.pipe_cmb_parallel,
             ),
+        )
+        self._set_grok_row_visible(
+            self.pipe_cmb_upscale,
+            (self.pipe_lbl_grok_res, self.pipe_cmb_grok_res,
+             self.pipe_lbl_grok_dur, self.pipe_cmb_grok_dur),
+            self.pipe_lbl_upscale,
+            False,
         )
         layout.addLayout(form2)
 
@@ -4875,6 +5010,16 @@ class MainWindow(QMainWindow):
         if gen_mode_idx < 0:
             gen_mode_idx = 0
         self.cmb_generation_mode.setCurrentIndex(gen_mode_idx)
+        # Re-sync the video sub-tabs whenever generation mode flips, so
+        # the Upscale/Resolution/Duration combos swap without needing a
+        # restart. Only bound if the combo isn't already wired (guards
+        # against double-connect on settings dialog re-open).
+        try:
+            self.cmb_generation_mode.currentIndexChanged.connect(
+                lambda _=None: self._sync_generation_mode_ui()
+            )
+        except Exception:
+            pass
         browser_form.addRow(self._settings_label("Generation Mode"), self.cmb_generation_mode)
 
         # Flow account plan — Pro vs Ultra use different Veo model names
@@ -8037,6 +8182,7 @@ class MainWindow(QMainWindow):
             video_ratio=current_settings.get("video_ratio", ""),
             video_prompt=current_settings.get("video_prompt", ""),
             video_upscale=current_settings["video_upscale"],
+            video_length=current_settings.get("video_length", 10),
             video_output_count=current_settings["video_output_count"],
             start_image_path=current_settings["start_image_path"],
             end_image_path=current_settings["end_image_path"],
@@ -8214,6 +8360,19 @@ class MainWindow(QMainWindow):
             "genspark_auto_prompt": "1" if (getattr(self, "img_chk_auto_prompt", None) and self.img_chk_auto_prompt.isChecked()) else "0",
             "flow_account_plan": str(getattr(self, "cmb_flow_plan", None) and self.cmb_flow_plan.currentData() or "ultra"),
         }
+        # Persist Grok-specific resolution/duration from the t2v tab (used
+        # as the shared default across all video sub-tabs). Per-dispatch
+        # the UI still reads each tab's own combo, but the persisted
+        # values keep the dropdowns consistent across restarts.
+        grok_res_cmb = getattr(self, "t2v_cmb_grok_res", None)
+        grok_dur_cmb = getattr(self, "t2v_cmb_grok_dur", None)
+        if grok_res_cmb is not None:
+            settings_payload["grok_resolution"] = str(grok_res_cmb.currentData() or "720p")
+        if grok_dur_cmb is not None:
+            try:
+                settings_payload["grok_video_length"] = str(int(grok_dur_cmb.currentData() or 10))
+            except (TypeError, ValueError):
+                settings_payload["grok_video_length"] = "10"
         self._start_background_task(
             self._persist_settings_payload,
             settings_payload,
@@ -9383,6 +9542,7 @@ class MainWindow(QMainWindow):
                 "video_ratio": current_settings.get("video_ratio", current_settings["aspect_ratio"]),
                 "video_prompt": current_settings.get("video_prompt", ""),
                 "video_upscale": current_settings["video_upscale"],
+                "video_length": current_settings.get("video_length", 10),
                 "video_output_count": current_settings["video_output_count"],
                 "start_image_path": start_image_path,
                 "end_image_path": None,
@@ -9749,6 +9909,7 @@ class MainWindow(QMainWindow):
                 "video_ratio": current_settings.get("video_ratio", current_settings["aspect_ratio"]),
                 "video_prompt": target_video_prompt,
                 "video_upscale": current_settings["video_upscale"],
+                "video_length": current_settings.get("video_length", 10),
                 "video_output_count": current_settings["video_output_count"],
                 "start_image_path": None,
                 "end_image_path": None,
@@ -9905,7 +10066,12 @@ class MainWindow(QMainWindow):
                 "video_sub_mode": "text_to_video",
                 "video_ratio": str(self.t2v_cmb_ratio.currentData() or self.t2v_cmb_ratio.currentText() or "Landscape (16:9)"),
                 "video_prompt": "",
-                "video_upscale": str(self.t2v_cmb_upscale.currentData() or "none"),
+                "video_upscale": self._video_upscale_for_dispatch(
+                    self.t2v_cmb_upscale, getattr(self, "t2v_cmb_grok_res", None),
+                ),
+                "video_length": self._video_length_for_dispatch(
+                    getattr(self, "t2v_cmb_grok_dur", None),
+                ),
                 "video_output_count": output_count,
                 "start_image_path": None,
                 "end_image_path": None,
@@ -9926,7 +10092,12 @@ class MainWindow(QMainWindow):
                 "video_sub_mode": "ingredients",
                 "video_ratio": str(self.ref_cmb_ratio.currentData() or self.ref_cmb_ratio.currentText() or "Landscape (16:9)"),
                 "video_prompt": "",
-                "video_upscale": str(self.ref_cmb_upscale.currentData() or "none"),
+                "video_upscale": self._video_upscale_for_dispatch(
+                    self.ref_cmb_upscale, getattr(self, "ref_cmb_grok_res", None),
+                ),
+                "video_length": self._video_length_for_dispatch(
+                    getattr(self, "ref_cmb_grok_dur", None),
+                ),
                 "video_output_count": output_count,
                 "start_image_path": None,
                 "end_image_path": None,
@@ -9947,7 +10118,12 @@ class MainWindow(QMainWindow):
                 "video_sub_mode": frame_mode,
                 "video_ratio": str(self.frm_cmb_ratio.currentData() or self.frm_cmb_ratio.currentText() or "Landscape (16:9)"),
                 "video_prompt": "",
-                "video_upscale": str(self.frm_cmb_upscale.currentData() or "none"),
+                "video_upscale": self._video_upscale_for_dispatch(
+                    self.frm_cmb_upscale, getattr(self, "frm_cmb_grok_res", None),
+                ),
+                "video_length": self._video_length_for_dispatch(
+                    getattr(self, "frm_cmb_grok_dur", None),
+                ),
                 "video_output_count": output_count,
                 "start_image_path": self.current_start_image_path,
                 "end_image_path": self.current_end_image_path if frame_mode == "frames_start_end" else None,
@@ -9974,15 +10150,74 @@ class MainWindow(QMainWindow):
             "video_sub_mode": str(self.pipe_cmb_vid_mode.currentData() or "ingredients"),
             "video_ratio": str(self.pipe_cmb_vid_ratio.currentData() or self.pipe_cmb_vid_ratio.currentText() or "Landscape (16:9)"),
             "video_prompt": str(self.pipe_txt_vid_prompt.text() or "").strip() or "animate",
-            "video_upscale": str(self.pipe_cmb_upscale.currentData() or "none"),
+            "video_upscale": self._video_upscale_for_dispatch(
+                self.pipe_cmb_upscale, getattr(self, "pipe_cmb_grok_res", None),
+            ),
+            "video_length": self._video_length_for_dispatch(
+                getattr(self, "pipe_cmb_grok_dur", None),
+            ),
             "video_output_count": vid_output_count,
             "start_image_path": None,
             "end_image_path": None,
         }
 
+    def _video_upscale_for_dispatch(self, upscale_combo, grok_res_combo):
+        """Resolve the `video_upscale` job-dict field. In Grok mode this
+        reads the 480p/720p grok-res combo; in every other mode it
+        reads the Veo-style upscale combo (720p/1080p/4K). Keeps job
+        dispatch agnostic of which backend will actually consume it —
+        grok_mode maps 480p/720p literally, extension_mode ignores
+        unknown values and falls back to "none"."""
+        if self._is_grok_generation_mode() and grok_res_combo is not None:
+            return str(grok_res_combo.currentData() or "720p")
+        return str(upscale_combo.currentData() or "none") if upscale_combo is not None else "none"
+
+    def _video_length_for_dispatch(self, grok_dur_combo):
+        """Resolve the `video_length` job-dict field. Grok is the only
+        backend that actually uses this (6s / 10s). Other modes ignore
+        it — still safe to pass through."""
+        if self._is_grok_generation_mode() and grok_dur_combo is not None:
+            try:
+                return int(grok_dur_combo.currentData() or 10)
+            except (TypeError, ValueError):
+                pass
+        return 10
+
+    def _is_grok_generation_mode(self) -> bool:
+        """True when the app settings have Grok Imagine selected as the
+        active generation mode. Used by the video tabs to swap their
+        Upscale combo for a Resolution (480p/720p) + Duration (6s/10s)
+        pair, and by the job-dict builders to feed those values as
+        video_upscale / video_length on dispatched jobs."""
+        cmb = getattr(self, "cmb_generation_mode", None)
+        if cmb is None:
+            return False
+        try:
+            return str(cmb.currentData() or "").lower() == "chrome_extension_grok"
+        except Exception:
+            return False
+
     def _sync_generation_mode_ui(self):
         frame_mode = self._current_video_sub_mode()
         pipeline_active = hasattr(self, "mode_tabs") and self.mode_tabs.currentIndex() == 4
+        # Toggle each video sub-tab's Upscale row between Veo layout
+        # (upscale combo) and Grok layout (resolution + duration).
+        is_grok = self._is_grok_generation_mode()
+        for prefix in ("t2v", "ref", "frm", "pipe"):
+            upscale_cmb = getattr(self, f"{prefix}_cmb_upscale", None)
+            res_cmb = getattr(self, f"{prefix}_cmb_grok_res", None)
+            dur_cmb = getattr(self, f"{prefix}_cmb_grok_dur", None)
+            res_lbl = getattr(self, f"{prefix}_lbl_grok_res", None)
+            dur_lbl = getattr(self, f"{prefix}_lbl_grok_dur", None)
+            up_lbl = getattr(self, f"{prefix}_lbl_upscale", None)
+            if upscale_cmb is None or res_cmb is None or dur_cmb is None:
+                continue  # this tab hasn't been built yet
+            self._set_grok_row_visible(
+                upscale_cmb,
+                (res_lbl, res_cmb, dur_lbl, dur_cmb),
+                up_lbl,
+                is_grok,
+            )
         if hasattr(self, "end_row"):
             self.end_row.setVisible(frame_mode == "frames_start_end")
         if hasattr(self, "frm_bulk_group"):
@@ -10065,6 +10300,7 @@ class MainWindow(QMainWindow):
                 "video_ratio": current_settings.get("video_ratio", current_settings["aspect_ratio"]),
                 "video_prompt": current_settings.get("video_prompt", ""),
                 "video_upscale": current_settings["video_upscale"],
+                "video_length": current_settings.get("video_length", 10),
                 "video_output_count": current_settings["video_output_count"],
                 "start_image_path": current_settings["start_image_path"],
                 "end_image_path": current_settings["end_image_path"],

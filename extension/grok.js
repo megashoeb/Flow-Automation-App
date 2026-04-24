@@ -149,6 +149,88 @@ async function grokInstallHeaderCapture(tabId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Anti-throttle — Chrome heavily throttles background tabs (timers
+// quantized to 1Hz, CPU budget ~1%/min, low-priority network, paused
+// rAF). For Grok this makes background tabs 3-5x slower per video.
+//
+// Workaround: play a silent Web Audio loop so Chrome marks the tab as
+// "audible". Audible tabs skip most background throttling — this is
+// the same trick Discord, Slack, and Meet use to stay responsive when
+// backgrounded. We also override document.hidden/visibilityState so
+// any page code that self-pauses based on visibility keeps running.
+//
+// Idempotent — safe to call on every detection cycle. AudioContext
+// may start in `suspended` state if the page never got a user gesture,
+// so we also attempt resume(). If autoplay policy blocks it, the
+// visibility override alone still helps.
+// ═══════════════════════════════════════════════════════════════════
+async function grokInstallAntiThrottle(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        if (window.__grokAntiThrottleInstalled) return { already: true };
+        window.__grokAntiThrottleInstalled = true;
+
+        // ─── Silent audio loop to keep tab "audible" ───
+        try {
+          const Ctor = window.AudioContext || window.webkitAudioContext;
+          if (Ctor) {
+            const ctx = new Ctor();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            gain.gain.value = 0;            // fully silent
+            osc.frequency.value = 20;       // sub-audible anyway
+            osc.connect(gain).connect(ctx.destination);
+            osc.start();
+            window.__grokAntiThrottleCtx = ctx;
+            // May be suspended until user gesture — try resume. Retry
+            // on click/visibilitychange so we grab the first gesture.
+            const tryResume = () => {
+              if (ctx.state !== "running") ctx.resume().catch(() => {});
+            };
+            tryResume();
+            ["click", "keydown", "touchstart", "visibilitychange"].forEach(
+              (ev) => document.addEventListener(ev, tryResume, {
+                capture: true, passive: true,
+              })
+            );
+          }
+        } catch (e) { /* audio failed — visibility override still helps */ }
+
+        // ─── Override visibility so page JS doesn't self-pause ───
+        try {
+          Object.defineProperty(document, "hidden", {
+            configurable: true,
+            get: () => false,
+          });
+          Object.defineProperty(document, "visibilityState", {
+            configurable: true,
+            get: () => "visible",
+          });
+          Object.defineProperty(document, "webkitHidden", {
+            configurable: true,
+            get: () => false,
+          });
+          Object.defineProperty(document, "webkitVisibilityState", {
+            configurable: true,
+            get: () => "visible",
+          });
+          document.dispatchEvent(new Event("visibilitychange"));
+        } catch (e) { /* properties already overridden */ }
+
+        return { ok: true };
+      },
+    });
+    return true;
+  } catch (e) {
+    console.warn("[Grok] installAntiThrottle failed:", e?.message || e);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Click-based dispatch — sets the textarea value, clicks send, and
 // lets Grok's own code fire the /rest/app-chat/conversations/new
 // call. Grok's SDK attaches a fresh x-statsig-id at call time (we
@@ -299,6 +381,21 @@ async function grokAttachImage(tabId, base64, filename, mime) {
       document.querySelector('[contenteditable="true"]') ||
       document.querySelector('[contenteditable=""]');
 
+    // Snapshot the current set of attachment-preview image srcs BEFORE
+    // we attach. When the race-condition bug caused two workers to
+    // share a tab, the second worker would see the first worker's
+    // thumbnail and falsely report "attached" — sending a merged 2-
+    // image submission. Even without the race, a stale preview from a
+    // prior job can linger during re-navigation. We only consider the
+    // attach successful when a NEW preview src appears.
+    const preExistingSrcs = new Set(
+      Array.from(document.querySelectorAll("img"))
+        .map((img) => img.src || "")
+        .filter(
+          (s) => s && (s.startsWith("blob:") || s.includes("/users/0"))
+        )
+    );
+
     // ─── Strategy 1: hidden <input type="file"> ───
     const fileInputs = Array.from(
       document.querySelectorAll('input[type="file"]')
@@ -393,12 +490,15 @@ async function grokAttachImage(tabId, base64, filename, mime) {
     let attachSignal = "";
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 400));
-      // 1) Blob-URL preview image (most dropzones create these)
+      // 1) Blob-URL preview image (most dropzones create these) — must
+      //    be a NEW src not present before the attach call, otherwise
+      //    we're looking at a stale thumbnail from a prior job.
       const blobImg = Array.from(document.querySelectorAll("img")).find(
         (img) =>
           img.src &&
           (img.src.startsWith("blob:") ||
-            img.src.includes("/users/0"))
+            img.src.includes("/users/0")) &&
+          !preExistingSrcs.has(img.src)
       );
       if (blobImg) {
         attached = true;
@@ -560,6 +660,52 @@ async function grokClickSend(tabId, prompt) {
     // the thumbnail appears.
     await new Promise((r) => setTimeout(r, 1500));
 
+    // ─── Poll for an ENABLED explicit-match send button ───
+    // Failure mode we're guarding against: Grok's upload post-
+    // processing can leave the send button `disabled` for a few
+    // seconds after the attachment thumbnail appears. If we pick the
+    // button at detection time and it's still disabled, `.click()` is
+    // a no-op and `click_no_effect` fires 25s later.
+    //
+    // Strategy: poll up to 8 seconds for a button whose aria-label /
+    // title is an explicit send-intent AND is not disabled. Once
+    // found, remember it so the scoring pass below picks it as the
+    // winner even if the heuristic wants something else. Polling adds
+    // little latency in the common case — explicit match usually
+    // resolves in the first 400ms check.
+    const SEND_NAMES_EARLY = [
+      "submit", "send", "send message", "create video", "create",
+      "generate", "generate video", "imagine", "imagine it", "go", "post",
+    ];
+    let earlyExplicitSend = null;
+    const earlyDeadline = Date.now() + 8000;
+    while (Date.now() < earlyDeadline) {
+      const all = document.querySelectorAll(
+        'button,[role="button"],div[tabindex]:not([tabindex="-1"])'
+      );
+      for (const b of all) {
+        if (
+          b.disabled ||
+          b.getAttribute("aria-disabled") === "true" ||
+          b.getAttribute("disabled") !== null
+        ) continue;
+        try {
+          if (b.offsetParent === null) continue;
+          const r = b.getBoundingClientRect();
+          if (r.width < 8 || r.height < 8) continue;
+        } catch { continue; }
+        const a = (b.getAttribute("aria-label") || "").toLowerCase().trim();
+        const t = (b.title || "").toLowerCase().trim();
+        if (!a && !t) continue;
+        if (SEND_NAMES_EARLY.includes(a) || SEND_NAMES_EARLY.includes(t)) {
+          earlyExplicitSend = b;
+          break;
+        }
+      }
+      if (earlyExplicitSend) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
     // ─── Find the send button ───
     // Grok's /imagine composer has many buttons clustered near the
     // input: "+ upload", "Image/Video" mode toggle, "480p/720p"
@@ -620,20 +766,26 @@ async function grokClickSend(tabId, prompt) {
       "go",
       "post",
     ];
-    let explicitSend = null;
-    for (const b of btnsUnique) {
-      if (
-        b.disabled ||
-        b.getAttribute("aria-disabled") === "true" ||
-        b.getAttribute("disabled") !== null
-      )
-        continue;
-      const a = (b.getAttribute("aria-label") || "").toLowerCase().trim();
-      const t = (b.title || "").toLowerCase().trim();
-      if (!a && !t) continue;
-      if (SEND_INTENT_NAMES.includes(a) || SEND_INTENT_NAMES.includes(t)) {
-        explicitSend = b;
-        break;
+    // Prefer the enabled explicit-match button we found by polling
+    // above — it's already been verified as visible, non-disabled, and
+    // explicitly labeled. If that poll didn't find anything (e.g.
+    // button stayed disabled), fall back to a single-shot scan here.
+    let explicitSend = earlyExplicitSend || null;
+    if (!explicitSend) {
+      for (const b of btnsUnique) {
+        if (
+          b.disabled ||
+          b.getAttribute("aria-disabled") === "true" ||
+          b.getAttribute("disabled") !== null
+        )
+          continue;
+        const a = (b.getAttribute("aria-label") || "").toLowerCase().trim();
+        const t = (b.title || "").toLowerCase().trim();
+        if (!a && !t) continue;
+        if (SEND_INTENT_NAMES.includes(a) || SEND_INTENT_NAMES.includes(t)) {
+          explicitSend = b;
+          break;
+        }
       }
     }
 
@@ -1037,6 +1189,13 @@ async function grokDetectAccounts() {
           try {
             await grokInstallHeaderCapture(tab.id);
           } catch {}
+          // Anti-throttle: silent-audio + visibility override. Makes
+          // background tabs behave more like foreground ones so
+          // streaming/download doesn't crawl at 1Hz when user Alt-Tabs
+          // away. Also idempotent.
+          try {
+            await grokInstallAntiThrottle(tab.id);
+          } catch {}
         }
       } catch (e) {
         // Tab closed mid-probe or no access — skip silently.
@@ -1168,12 +1327,23 @@ async function grokHandleWork(work) {
   const waitStart = Date.now();
   while (tabId === null) {
     // Pick the first non-busy tab that's still alive.
+    //
+    // IMPORTANT: reserve the tab (set busy=true) *synchronously* before
+    // the `await chrome.tabs.get()` call. Otherwise two workers can
+    // both see busy=false, both yield on the await, and both claim the
+    // same tab — resulting in two image attachments merged onto one
+    // composer and a single combined submission. Release the flag if
+    // the tab turns out to be dead.
     for (const candidate of tabPool) {
       if (grokTabBusy[candidate]) continue;
+      grokTabBusy[candidate] = true;   // reserve before awaiting
       try {
         const t = await chrome.tabs.get(candidate);
         if (t) { tabId = candidate; break; }
-      } catch { /* tab closed — skip */ }
+        grokTabBusy[candidate] = false;  // tab missing — release
+      } catch {
+        grokTabBusy[candidate] = false;  // tab closed — release, try next
+      }
     }
     if (tabId !== null) break;
     // No free tab — wait, respecting the bridge's 6-min dispatch
@@ -1198,7 +1368,9 @@ async function grokHandleWork(work) {
     await new Promise((r) => setTimeout(r, 2000));
   }
 
-  grokTabBusy[tabId] = true;
+  // grokTabBusy[tabId] is already true — reserved synchronously inside
+  // the picker loop above to prevent two workers racing into the same
+  // tab (both seeing busy=false during an await yield).
 
   // Wrap the entire job body in try/finally so the busy flag is
   // ALWAYS released — even on unexpected errors — so subsequent
@@ -1442,6 +1614,95 @@ async function grokHandleWork(work) {
 
   await grokClearAutomationFlag(tabId);
 
+  // ─────────────────────────────────────────────────────────────
+  // Retry on click_no_effect — the click landed on a stale/disabled
+  // button (common when Grok's send button hasn't finished its
+  // enable transition, or when the page has leftover buttons from
+  // prior completions). Re-navigate to /imagine, re-attach the
+  // image if one was used, re-type, re-click. Up to 2 retries.
+  // Anything else (click_failed, video_timeout, etc.) still fails
+  // fast — those aren't transient click-placement issues.
+  // ─────────────────────────────────────────────────────────────
+  let retryCount = 0;
+  while (errorSeen === "click_no_effect" && retryCount < 2) {
+    retryCount++;
+    await grokReportProgress(
+      request_id,
+      "click_retry",
+      `attempt ${retryCount + 1} of 3 — bouncing to /imagine`
+    );
+    errorSeen = "";
+    videoUrl = "";
+    videoId = "";
+    progressPct = 0;
+    domFallbackUrl = "";
+    lastReportedProgress = -1;
+
+    const renav = await grokEnsureOnImaginePage(tabId);
+    if (renav.error) { errorSeen = `renav_${renav.error}`; break; }
+
+    if (hasReference) {
+      const reAttach = await grokAttachImage(
+        tabId, reference_image_base64, reference_image_filename,
+        reference_image_mime || "image/jpeg",
+      );
+      if (!reAttach || !reAttach.ok) {
+        errorSeen = "retry_attach_failed";
+        break;
+      }
+    }
+
+    const reClick = await grokClickSend(tabId, messageForClick);
+    if (!reClick || reClick.error) {
+      errorSeen = `retry_click_${reClick?.error || "unknown"}`;
+      break;
+    }
+    await grokReportProgress(
+      request_id, "clicked_retry",
+      `${reClick.buttonLabel || "send"} score=${(reClick.buttonScore || 0).toFixed(1)}`
+    );
+
+    // Re-run the poll loop for this retry attempt.
+    const retryInitialUrl = (await (async () => {
+      try { const t = await chrome.tabs.get(tabId); return t.url || ""; }
+      catch { return ""; }
+    })()) || "";
+    const retryPollDeadline = Date.now() + 240000;
+    const retryClickEffectDeadline = Date.now() + 25000;
+    urlNavigated = false;
+
+    while (Date.now() < retryPollDeadline) {
+      const st = await grokReadAutomationState(tabId);
+      if (st.error) { errorSeen = st.error; break; }
+      if (st.videoUrl) { videoUrl = st.videoUrl; videoId = st.videoId; break; }
+      if (st.domVideoUrl && !domFallbackUrl) domFallbackUrl = st.domVideoUrl;
+      if (typeof st.progress === "number" && st.progress !== lastReportedProgress) {
+        progressPct = st.progress;
+        lastReportedProgress = st.progress;
+        if (st.progress > 0 && st.progress % 25 === 0) {
+          await grokReportProgress(request_id, "progress", `${st.progress}%`);
+        }
+      }
+      if (!urlNavigated) {
+        try {
+          const tb = await chrome.tabs.get(tabId);
+          if (tb.url && tb.url !== retryInitialUrl && tb.url.includes("/imagine/post/")) {
+            urlNavigated = true;
+            await grokReportProgress(request_id, "post_page_reached", tb.url.slice(0, 100));
+          }
+        } catch {}
+      }
+      const hadEffect = urlNavigated || progressPct > 0 || !!domFallbackUrl || !!videoUrl;
+      if (!hadEffect && Date.now() > retryClickEffectDeadline) {
+        errorSeen = "click_no_effect";
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    await grokClearAutomationFlag(tabId);
+    if (videoUrl || domFallbackUrl) break;  // succeeded on retry
+  }
+
   if (errorSeen) {
     await grokSubmitResult(request_id, {
       error: `grok_${errorSeen}`,
@@ -1481,33 +1742,82 @@ async function grokHandleWork(work) {
     fullVideoUrl = `${GROK_ASSETS_ORIGIN}/${fullVideoUrl.replace(/^\/+/, "")}`;
   }
 
-  const downloadResult = await grokExecInTab(tabId, async (args) => {
-    try {
-      const r = await fetch(args.url, {
-        method: "GET",
-        credentials: "include",
-      });
-      if (!r.ok) return { status: r.status, error: "download_http" };
-      const buf = await r.arrayBuffer();
-      // Convert ArrayBuffer → base64 (chunked to avoid call-stack limits)
-      const bytes = new Uint8Array(buf);
-      let binary = "";
-      const CHUNK = 0x8000;
-      for (let i = 0; i < bytes.length; i += CHUNK) {
-        binary += String.fromCharCode.apply(
-          null, bytes.subarray(i, i + CHUNK)
-        );
+  // ─────────────────────────────────────────────────────────────
+  // Pre-download: activate the tab. Chrome throttles background tabs
+  // aggressively (timer quantization, bandwidth caps), and a 10MB
+  // fetch on a throttled tab can stall for minutes with no progress.
+  // `{active: true}` brings the tab to the front of its window; the
+  // SW itself isn't throttled but the in-tab fetch is, so this helps.
+  // Best-effort — swallow errors so a tab-activation failure doesn't
+  // break the download path.
+  // ─────────────────────────────────────────────────────────────
+  try { await chrome.tabs.update(tabId, { active: true }); } catch {}
+
+  // Fire a heartbeat every 30s during the download so the Python-side
+  // bridge's idle-timeout (300s of silence = fail) doesn't trigger
+  // while we're still fetching bytes from a throttled tab.
+  await grokReportProgress(request_id, "downloading", "fetch started");
+  let downloadFinished = false;
+  const heartbeat = (async () => {
+    while (!downloadFinished) {
+      await new Promise((r) => setTimeout(r, 30000));
+      if (!downloadFinished) {
+        try {
+          await grokReportProgress(
+            request_id, "downloading", "still fetching..."
+          );
+        } catch {}
       }
-      const b64 = btoa(binary);
-      return { status: 200, size: bytes.length, content_base64: b64 };
-    } catch (e) {
-      return { status: 0, error: `fetch_exc_${e?.message || e}` };
     }
-  }, { url: fullVideoUrl });
+  })();
+
+  let downloadResult;
+  try {
+    downloadResult = await grokExecInTab(tabId, async (args) => {
+      try {
+        // AbortController guards against indefinite hangs on a heavily
+        // throttled background tab (previously fetch had no timeout,
+        // so the extension could sit forever waiting for bytes).
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), args.timeout_ms);
+        try {
+          const r = await fetch(args.url, {
+            method: "GET",
+            credentials: "include",
+            signal: ctrl.signal,
+          });
+          if (!r.ok) return { status: r.status, error: "download_http" };
+          const buf = await r.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let binary = "";
+          const CHUNK = 0x8000;
+          for (let i = 0; i < bytes.length; i += CHUNK) {
+            binary += String.fromCharCode.apply(
+              null, bytes.subarray(i, i + CHUNK)
+            );
+          }
+          const b64 = btoa(binary);
+          return { status: 200, size: bytes.length, content_base64: b64 };
+        } finally {
+          clearTimeout(tid);
+        }
+      } catch (e) {
+        const name = (e && e.name) || "";
+        const msg = String(e?.message || e);
+        return {
+          status: 0,
+          error: name === "AbortError" ? "download_timeout" : `fetch_exc_${msg}`,
+        };
+      }
+    }, { url: fullVideoUrl, timeout_ms: 180000 });
+  } finally {
+    downloadFinished = true;
+    try { await heartbeat; } catch {}
+  }
 
   if (!downloadResult || downloadResult.status !== 200 || !downloadResult.content_base64) {
     await grokSubmitResult(request_id, {
-      error: `download_failed_${downloadResult?.status || "?"}`,
+      error: `download_failed_${downloadResult?.status || downloadResult?.error || "?"}`,
       video_url: fullVideoUrl,
     });
     return;
