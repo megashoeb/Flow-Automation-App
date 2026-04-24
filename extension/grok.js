@@ -159,60 +159,188 @@ async function grokClickSend(tabId, prompt) {
     window.__grokAutomationError = "";
     window.__grokAutomationStartedAt = Date.now();
 
-    // Find the prompt textarea. Grok's /imagine page uses a single
-    // visible textarea; we grab the first one that's actually in the
-    // layout (offsetParent != null means not display:none).
-    const textareas = Array.from(document.querySelectorAll("textarea"));
-    const textarea =
-      textareas.find((t) => t.offsetParent !== null) || textareas[0];
-    if (!textarea) {
-      window.__grokAutomationActive = false;
-      return { error: "no_textarea_found" };
+    // ─── Find the prompt input ───
+    // Grok's /imagine may use a <textarea>, a contenteditable div
+    // (ProseMirror / Lexical style), or a text <input>. We try all
+    // three, preferring visible inputs whose placeholder / aria-label
+    // / data-placeholder matches "imagine" or "prompt".
+    const candidates = [];
+    for (const el of document.querySelectorAll("textarea")) {
+      candidates.push({ el, type: "textarea" });
+    }
+    for (const el of document.querySelectorAll('[contenteditable="true"],[contenteditable=""]')) {
+      candidates.push({ el, type: "contenteditable" });
+    }
+    for (const el of document.querySelectorAll('input[type="text"],input:not([type])')) {
+      candidates.push({ el, type: "input" });
     }
 
-    // Set the value via the native setter so React's onChange fires
-    // (using textarea.value = x directly is swallowed by React's
-    // SyntheticEvent dedup).
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-      HTMLTextAreaElement.prototype,
-      "value"
-    ).set;
-    nativeSetter.call(textarea, String(args.prompt || ""));
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    textarea.focus();
+    const visible = candidates.filter(({ el }) => {
+      try {
+        if (el.disabled) return false;
+        if (el.offsetParent === null) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 40 && r.height > 15;
+      } catch {
+        return false;
+      }
+    });
+
+    // Score each candidate — prefer placeholder/aria match.
+    const scored = visible.map((c) => {
+      const el = c.el;
+      const ph = (
+        el.placeholder ||
+        el.getAttribute("data-placeholder") ||
+        el.getAttribute("aria-label") ||
+        el.getAttribute("aria-placeholder") ||
+        ""
+      ).toLowerCase();
+      let score = 0;
+      if (/imagine/.test(ph)) score += 10;
+      if (/prompt|type|message|ask/.test(ph)) score += 5;
+      if (c.type === "contenteditable") score += 2;
+      if (c.type === "textarea") score += 1;
+      return { ...c, score, placeholder: ph };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    const chosen = scored[0];
+
+    if (!chosen) {
+      window.__grokAutomationActive = false;
+      return {
+        error: "no_input_found",
+        debug: {
+          totalCandidates: candidates.length,
+          visibleCount: visible.length,
+          sampleTags: candidates.slice(0, 3).map((c) => `${c.type}`).join(","),
+        },
+      };
+    }
+
+    const inputEl = chosen.el;
+    const inputType = chosen.type;
+
+    // ─── Set the value ───
+    try {
+      inputEl.focus();
+      if (inputType === "textarea" || inputType === "input") {
+        const proto =
+          inputType === "textarea" ? HTMLTextAreaElement : HTMLInputElement;
+        const setter = Object.getOwnPropertyDescriptor(
+          proto.prototype,
+          "value"
+        ).set;
+        setter.call(inputEl, String(args.prompt || ""));
+        inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        // contenteditable — clear + insertText via execCommand which
+        // produces a real InputEvent that React/ProseMirror listen to.
+        // This is the robust way to feed text into modern chat inputs.
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(inputEl);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        try {
+          document.execCommand("delete", false);
+        } catch {}
+        try {
+          document.execCommand("insertText", false, String(args.prompt || ""));
+        } catch {
+          // Fallback if execCommand is disabled
+          inputEl.textContent = String(args.prompt || "");
+          inputEl.dispatchEvent(
+            new InputEvent("beforeinput", {
+              bubbles: true,
+              cancelable: true,
+              inputType: "insertText",
+              data: String(args.prompt || ""),
+            })
+          );
+          inputEl.dispatchEvent(
+            new InputEvent("input", {
+              bubbles: true,
+              inputType: "insertText",
+              data: String(args.prompt || ""),
+            })
+          );
+        }
+      }
+    } catch (e) {
+      window.__grokAutomationActive = false;
+      return {
+        error: "set_input_failed",
+        detail: String(e?.message || e).slice(0, 200),
+      };
+    }
 
     // Wait for React to re-render and enable the send button.
-    await new Promise((r) => setTimeout(r, 600));
+    await new Promise((r) => setTimeout(r, 700));
 
-    // Find the send button. Multiple strategies:
-    // A) form submit button
-    // B) enabled button with SVG nearest textarea (the arrow-up icon)
+    // ─── Find the send button ───
+    const scope =
+      inputEl.closest("form") ||
+      inputEl.closest("[class*='chat']") ||
+      inputEl.closest("[class*='compose']") ||
+      inputEl.parentElement?.parentElement?.parentElement ||
+      document.body;
+
     let sendBtn = null;
-    const form = textarea.closest("form");
-    if (form) {
-      sendBtn = form.querySelector("button[type='submit']");
-      if (sendBtn && sendBtn.disabled) sendBtn = null;
+
+    // Strategy A: form submit button
+    if (scope.tagName === "FORM") {
+      sendBtn = scope.querySelector("button[type='submit']:not([disabled])");
     }
+
+    // Strategy B: aria-label or title matches send/submit/generate/create
     if (!sendBtn) {
-      const scope =
-        form ||
-        textarea.closest("[class*='chat']") ||
-        textarea.parentElement?.parentElement?.parentElement ||
-        document.body;
-      const btns = Array.from(scope.querySelectorAll("button"));
-      // Prefer the LAST enabled button with an SVG — that's usually
-      // the arrow-send icon in modern chat UIs.
-      const candidates = btns.filter(
-        (b) => !b.disabled && b.querySelector("svg")
+      const btns = Array.from(scope.querySelectorAll("button:not([disabled])"));
+      sendBtn = btns.find((b) => {
+        const txt = (
+          (b.getAttribute("aria-label") || "") +
+          " " +
+          (b.title || "") +
+          " " +
+          (b.textContent || "")
+        ).toLowerCase();
+        return /send|submit|generate|create|imagine/.test(txt);
+      });
+    }
+
+    // Strategy C: last enabled button with SVG near input
+    if (!sendBtn) {
+      const btns = Array.from(scope.querySelectorAll("button:not([disabled])"));
+      const candidates = btns.filter((b) => b.querySelector("svg"));
+      sendBtn = candidates[candidates.length - 1] || null;
+    }
+
+    // Strategy D: broader search from document — any enabled SVG button
+    // whose position is near the bottom of the viewport (typical chat
+    // send button placement).
+    if (!sendBtn) {
+      const docBtns = Array.from(document.querySelectorAll("button:not([disabled])"));
+      const candidates = docBtns.filter(
+        (b) => b.querySelector("svg") && b.offsetParent !== null
       );
       sendBtn = candidates[candidates.length - 1] || null;
     }
+
     if (!sendBtn) {
       window.__grokAutomationActive = false;
-      return { error: "no_send_button_found" };
+      return {
+        error: "no_send_button_found",
+        debug: {
+          inputType,
+          inputPlaceholder: chosen.placeholder,
+          scopeTag: scope?.tagName,
+          buttonsInScope: scope?.querySelectorAll
+            ? scope.querySelectorAll("button").length
+            : 0,
+        },
+      };
     }
 
-    // Click it!
     sendBtn.click();
 
     const label =
@@ -220,7 +348,7 @@ async function grokClickSend(tabId, prompt) {
       sendBtn.title ||
       sendBtn.textContent.trim().slice(0, 40) ||
       "svg-btn";
-    return { ok: true, buttonLabel: label };
+    return { ok: true, inputType, buttonLabel: label };
   }, { prompt });
 }
 
@@ -628,18 +756,22 @@ async function grokHandleWork(work) {
   await grokReportProgress(request_id, "clicking_send", "");
   const clickResult = await grokClickSend(tabId, userPrompt);
   if (!clickResult || clickResult.error) {
+    const dbgStr = clickResult?.debug
+      ? ` | debug: ${JSON.stringify(clickResult.debug).slice(0, 300)}`
+      : "";
     await grokSubmitResult(request_id, {
       error: `click_failed_${clickResult?.error || "unknown"}`,
       detail:
-        "Could not locate textarea or send button on grok.com/imagine. " +
-        "Make sure the tab is open to /imagine and Video mode is selected.",
+        "Could not locate input or send button on grok.com/imagine. " +
+        "Make sure the tab is open to /imagine and Video mode is selected." +
+        dbgStr,
     });
     return;
   }
   await grokReportProgress(
     request_id,
     "clicked",
-    clickResult.buttonLabel || "send"
+    `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"})`
   );
 
   // Poll for videoUrl — either from the fetch-wrapper's stream capture
