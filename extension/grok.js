@@ -348,6 +348,116 @@ async function grokEnsureOnImaginePage(tabId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Mode toggle — Grok's /imagine composer has Image / Video tabs and
+// remembers the last-used mode per device. On a fresh login the
+// default is Image, so a job that uploads a reference + clicks send
+// generates an IMAGE (image-to-image edit) instead of a video. We
+// must explicitly switch to Video mode before attaching.
+//
+// Detection: scan composer-area buttons for one labeled "Video" that
+// is NOT currently selected (no aria-pressed="true" / no active class
+// signal). If found, click it. Idempotent — if already on Video, the
+// scan returns early without clicking.
+// ═══════════════════════════════════════════════════════════════════
+async function grokEnsureVideoMode(tabId) {
+  return grokExecInTab(tabId, async () => {
+    // Heuristic: an "active" toggle has one of:
+    //   - aria-pressed="true"
+    //   - aria-selected="true"
+    //   - data-state="on" / "active" / "selected"
+    //   - dark/inverted bg class with white text — too brittle to
+    //     match by class names since Grok ships hashed Tailwind
+    //
+    // We focus on aria/data attrs first and fall back to a simple
+    // "is this button labeled Video and not already active" check.
+    const isActive = (b) => {
+      if (!b) return false;
+      if (b.getAttribute("aria-pressed") === "true") return true;
+      if (b.getAttribute("aria-selected") === "true") return true;
+      const ds = (b.getAttribute("data-state") || "").toLowerCase();
+      if (ds === "on" || ds === "active" || ds === "selected") return true;
+      return false;
+    };
+
+    const norm = (s) => (s || "").toLowerCase().trim();
+    const looksLikeVideoBtn = (b) => {
+      const lbl = norm(b.getAttribute("aria-label"));
+      const title = norm(b.title);
+      const txt = norm(b.textContent).slice(0, 30);
+      // Match if any of these tokens appear AND the token isn't
+      // accompanied by extras like "Video Quality" / "Video Length".
+      return (
+        lbl === "video" || title === "video" ||
+        txt === "video" || txt === "🎬 video"
+      );
+    };
+    const looksLikeImageBtn = (b) => {
+      const lbl = norm(b.getAttribute("aria-label"));
+      const title = norm(b.title);
+      const txt = norm(b.textContent).slice(0, 30);
+      return (
+        lbl === "image" || title === "image" ||
+        txt === "image" || txt === "🎨 image"
+      );
+    };
+
+    const all = Array.from(
+      document.querySelectorAll('button,[role="button"],div[tabindex]:not([tabindex="-1"])')
+    ).filter((b) => {
+      try {
+        if (b.offsetParent === null) return false;
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      } catch { return false; }
+    });
+
+    const videoBtn = all.find(looksLikeVideoBtn);
+    const imageBtn = all.find(looksLikeImageBtn);
+
+    // Already on Video? Done.
+    if (videoBtn && isActive(videoBtn)) {
+      return { ok: true, already: true };
+    }
+
+    // If neither toggle is detectable, the page may be a different
+    // variant — just return ok and let the rest of the flow proceed
+    // (it'll fail more loudly downstream if the actual mode is wrong).
+    if (!videoBtn) {
+      return { ok: true, no_toggle_found: true };
+    }
+
+    // Active state inference fallback: if Image button is detectably
+    // active and Video isn't, definitely click Video. If neither is
+    // detectably active (no aria-pressed convention used by this
+    // build), still click Video — it's idempotent in most React
+    // toggle implementations.
+    try {
+      videoBtn.click();
+    } catch (e) {
+      return {
+        ok: false,
+        error: `click_failed: ${String(e?.message || e).slice(0, 120)}`,
+      };
+    }
+
+    // Wait briefly so React re-renders the composer in Video mode
+    // before the caller proceeds to attach/click-send.
+    await new Promise((r) => setTimeout(r, 600));
+
+    // Verify the click took effect — if Video is now active OR Image
+    // is now NOT active, we're good.
+    const stillImage = imageBtn && isActive(imageBtn);
+    const nowVideo = isActive(videoBtn);
+    return {
+      ok: nowVideo || !stillImage,
+      switched: true,
+      verified_active: nowVideo,
+      image_was_active_before: !!imageBtn && !nowVideo && stillImage === false,
+    };
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Image attachment — injects a File into Grok's composer UI so the
 // subsequent send click produces a proper image-to-video request (one
 // with fileAttachments set in the conversations/new body).
@@ -1440,6 +1550,27 @@ async function grokHandleWork(work) {
       await grokReportProgress(request_id, "navigated", "→ /imagine");
     }
 
+    // Ensure the composer is in Video mode. Grok remembers the last-
+    // used mode per device, so a fresh login defaults to Image mode —
+    // submitting a reference there generates an IMAGE (image-to-image
+    // edit), not a video. Click the Video toggle if needed. Best-
+    // effort — if the toggle can't be located the rest of the flow
+    // still runs (legacy variants without a toggle work as before).
+    try {
+      const modeResult = await grokEnsureVideoMode(tabId);
+      if (modeResult?.switched) {
+        await grokReportProgress(
+          request_id, "mode_video", "switched Image → Video"
+        );
+      }
+    } catch (e) {
+      // Don't block dispatch on this — log and continue
+      await grokReportProgress(
+        request_id, "mode_video_warn",
+        `${String(e?.message || e).slice(0, 80)}`
+      );
+    }
+
   const userPrompt = String(prompt || "").trim();
   const hasReference = !!(reference_image_base64 && reference_image_filename);
 
@@ -1689,6 +1820,11 @@ async function grokHandleWork(work) {
 
     const renav = await grokEnsureOnImaginePage(tabId);
     if (renav.error) { errorSeen = `renav_${renav.error}`; break; }
+
+    // Re-ensure Video mode after the bounce-back nav — same reason
+    // as the initial dispatch: if Grok defaulted to Image mode we'd
+    // generate the wrong media type.
+    try { await grokEnsureVideoMode(tabId); } catch {}
 
     if (hasReference) {
       const reAttach = await grokAttachImage(
