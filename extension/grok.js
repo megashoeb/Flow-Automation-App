@@ -361,98 +361,148 @@ async function grokEnsureOnImaginePage(tabId) {
 // ═══════════════════════════════════════════════════════════════════
 async function grokEnsureVideoMode(tabId) {
   return grokExecInTab(tabId, async () => {
-    // Heuristic: an "active" toggle has one of:
-    //   - aria-pressed="true"
-    //   - aria-selected="true"
-    //   - data-state="on" / "active" / "selected"
-    //   - dark/inverted bg class with white text — too brittle to
-    //     match by class names since Grok ships hashed Tailwind
-    //
-    // We focus on aria/data attrs first and fall back to a simple
-    // "is this button labeled Video and not already active" check.
+    const norm = (s) => (s || "").toLowerCase().trim().replace(/\s+/g, " ");
+
+    // Check multiple text sources on a button — Grok may set the
+    // mode label via aria-label, title, textContent, or a data-*
+    // attribute. We accept exact match OR "starts with the token"
+    // (e.g. textContent "Image\n  ⚡" still counts as "image").
+    const buttonHasMode = (b, mode) => {
+      const sources = [
+        b.getAttribute("aria-label"),
+        b.title,
+        b.getAttribute("data-mode"),
+        b.getAttribute("data-value"),
+        b.getAttribute("data-tab"),
+        b.getAttribute("data-state"),
+        // Get only the FIRST text node so a parent's children don't
+        // confuse us with nested labels.
+        b.textContent,
+      ];
+      return sources.some((raw) => {
+        const t = norm(raw);
+        if (!t) return false;
+        // Equality
+        if (t === mode) return true;
+        // Starts with mode followed by space/separator
+        if (t.startsWith(mode + " ") || t.startsWith(mode + "\n")) return true;
+        // Single-word in larger text — "image\n⚡" type
+        if (t.split(/[\s\n,;:|]+/).includes(mode)) return true;
+        return false;
+      });
+    };
+
+    // Active-state detection — try every common React toggle
+    // convention plus a class-name fallback.
     const isActive = (b) => {
       if (!b) return false;
       if (b.getAttribute("aria-pressed") === "true") return true;
       if (b.getAttribute("aria-selected") === "true") return true;
-      const ds = (b.getAttribute("data-state") || "").toLowerCase();
-      if (ds === "on" || ds === "active" || ds === "selected") return true;
+      if (b.getAttribute("aria-current") === "true") return true;
+      const ds = norm(b.getAttribute("data-state"));
+      if (ds === "on" || ds === "active" || ds === "selected" || ds === "checked") return true;
+      const cls = (b.className || "").toString().toLowerCase();
+      if (/(\b|_)(active|selected|on)(\b|_)/.test(cls)) return true;
+      // Computed-style fallback: if bg is much darker than the
+      // sibling and text is light (the visual "selected" pattern
+      // we see in the screenshot), treat as active.
+      try {
+        const cs = window.getComputedStyle(b);
+        const bg = cs.backgroundColor || "";
+        // rgba(0,0,0,...) or very dark rgb — Grok's selected button
+        const m = bg.match(/rgba?\(([^)]+)\)/);
+        if (m) {
+          const parts = m[1].split(",").map((s) => parseFloat(s.trim()));
+          const [r, g, bl] = parts;
+          if (r < 60 && g < 60 && bl < 60) return true; // very dark bg
+        }
+      } catch {}
       return false;
     };
 
-    const norm = (s) => (s || "").toLowerCase().trim();
-    const looksLikeVideoBtn = (b) => {
-      const lbl = norm(b.getAttribute("aria-label"));
-      const title = norm(b.title);
-      const txt = norm(b.textContent).slice(0, 30);
-      // Match if any of these tokens appear AND the token isn't
-      // accompanied by extras like "Video Quality" / "Video Length".
-      return (
-        lbl === "video" || title === "video" ||
-        txt === "video" || txt === "🎬 video"
-      );
-    };
-    const looksLikeImageBtn = (b) => {
-      const lbl = norm(b.getAttribute("aria-label"));
-      const title = norm(b.title);
-      const txt = norm(b.textContent).slice(0, 30);
-      return (
-        lbl === "image" || title === "image" ||
-        txt === "image" || txt === "🎨 image"
-      );
-    };
-
-    const all = Array.from(
-      document.querySelectorAll('button,[role="button"],div[tabindex]:not([tabindex="-1"])')
-    ).filter((b) => {
+    const visible = (b) => {
       try {
         if (b.offsetParent === null) return false;
         const r = b.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
+        return r.width > 8 && r.height > 8;
       } catch { return false; }
-    });
+    };
 
-    const videoBtn = all.find(looksLikeVideoBtn);
-    const imageBtn = all.find(looksLikeImageBtn);
+    const all = Array.from(
+      document.querySelectorAll('button,[role="button"],[role="tab"],div[tabindex]:not([tabindex="-1"]),li[tabindex]:not([tabindex="-1"])')
+    ).filter(visible);
 
-    // Already on Video? Done.
-    if (videoBtn && isActive(videoBtn)) {
-      return { ok: true, already: true };
+    const videoBtns = all.filter((b) => buttonHasMode(b, "video"));
+    const imageBtns = all.filter((b) => buttonHasMode(b, "image"));
+
+    // Pick the smallest (toggle-like, not a "Video Quality" dropdown)
+    // and prefer ones near other mode-label buttons.
+    const pickToggle = (cands) => {
+      if (!cands.length) return null;
+      cands.sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return ar.width * ar.height - br.width * br.height;
+      });
+      return cands[0];
+    };
+    const videoBtn = pickToggle(videoBtns);
+    const imageBtn = pickToggle(imageBtns);
+
+    const debug = {
+      total_buttons_scanned: all.length,
+      video_candidates: videoBtns.length,
+      image_candidates: imageBtns.length,
+      video_active: videoBtn ? isActive(videoBtn) : null,
+      image_active: imageBtn ? isActive(imageBtn) : null,
+      video_label: videoBtn ? (videoBtn.getAttribute("aria-label") || videoBtn.textContent || "").slice(0, 40) : null,
+      image_label: imageBtn ? (imageBtn.getAttribute("aria-label") || imageBtn.textContent || "").slice(0, 40) : null,
+    };
+
+    // Already on Video AND Image is not active? Done.
+    if (videoBtn && isActive(videoBtn) && (!imageBtn || !isActive(imageBtn))) {
+      return { ok: true, already_video: true, debug };
     }
 
-    // If neither toggle is detectable, the page may be a different
-    // variant — just return ok and let the rest of the flow proceed
-    // (it'll fail more loudly downstream if the actual mode is wrong).
     if (!videoBtn) {
-      return { ok: true, no_toggle_found: true };
+      return { ok: true, no_video_btn: true, debug };
     }
 
-    // Active state inference fallback: if Image button is detectably
-    // active and Video isn't, definitely click Video. If neither is
-    // detectably active (no aria-pressed convention used by this
-    // build), still click Video — it's idempotent in most React
-    // toggle implementations.
-    try {
-      videoBtn.click();
-    } catch (e) {
-      return {
-        ok: false,
-        error: `click_failed: ${String(e?.message || e).slice(0, 120)}`,
-      };
-    }
+    // Click via multiple strategies — React event handlers can be
+    // bound to the parent or a child SVG, so a single .click() on
+    // a stale reference may miss. Try synthetic mouse events too.
+    const clickTarget = (el) => {
+      try { el.click(); } catch {}
+      try {
+        for (const type of ["mousedown", "mouseup", "click"]) {
+          el.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, view: window, button: 0,
+          }));
+        }
+      } catch {}
+    };
+    clickTarget(videoBtn);
 
-    // Wait briefly so React re-renders the composer in Video mode
-    // before the caller proceeds to attach/click-send.
     await new Promise((r) => setTimeout(r, 600));
 
-    // Verify the click took effect — if Video is now active OR Image
-    // is now NOT active, we're good.
-    const stillImage = imageBtn && isActive(imageBtn);
     const nowVideo = isActive(videoBtn);
+    const nowImage = imageBtn ? isActive(imageBtn) : false;
+
+    // If first click didn't take, try once more (sometimes the first
+    // click triggers a focus and only the second triggers the toggle).
+    if (!nowVideo && nowImage) {
+      clickTarget(videoBtn);
+      await new Promise((r) => setTimeout(r, 600));
+    }
+
+    const finalVideoActive = isActive(videoBtn);
+    const finalImageActive = imageBtn ? isActive(imageBtn) : false;
     return {
-      ok: nowVideo || !stillImage,
+      ok: finalVideoActive || !finalImageActive,
       switched: true,
-      verified_active: nowVideo,
-      image_was_active_before: !!imageBtn && !nowVideo && stillImage === false,
+      verified_video_active: finalVideoActive,
+      verified_image_active: finalImageActive,
+      debug,
     };
   });
 }
@@ -1553,18 +1603,33 @@ async function grokHandleWork(work) {
     // Ensure the composer is in Video mode. Grok remembers the last-
     // used mode per device, so a fresh login defaults to Image mode —
     // submitting a reference there generates an IMAGE (image-to-image
-    // edit), not a video. Click the Video toggle if needed. Best-
-    // effort — if the toggle can't be located the rest of the flow
-    // still runs (legacy variants without a toggle work as before).
+    // edit), not a video. Click the Video toggle if needed.
+    //
+    // We always emit a status event with the detection summary so
+    // failures here are visible in the user-facing log (silent skips
+    // are exactly what made the original bug go undiagnosed).
     try {
       const modeResult = await grokEnsureVideoMode(tabId);
       if (modeResult?.switched) {
+        const verified = modeResult.verified_video_active ? "verified" : "click_only";
         await grokReportProgress(
-          request_id, "mode_video", "switched Image → Video"
+          request_id, "mode_video",
+          `switched Image → Video (${verified})`
+        );
+      } else if (modeResult?.already_video) {
+        await grokReportProgress(
+          request_id, "mode_video", "already on Video — no switch needed"
+        );
+      } else if (modeResult?.no_video_btn) {
+        const dbg = modeResult.debug
+          ? `scanned=${modeResult.debug.total_buttons_scanned}, video_cands=${modeResult.debug.video_candidates}, image_cands=${modeResult.debug.image_candidates}`
+          : "no_debug";
+        await grokReportProgress(
+          request_id, "mode_video_warn",
+          `Video toggle not found — ${dbg}. If output is an image, send a screenshot of the composer.`
         );
       }
     } catch (e) {
-      // Don't block dispatch on this — log and continue
       await grokReportProgress(
         request_id, "mode_video_warn",
         `${String(e?.message || e).slice(0, 80)}`
