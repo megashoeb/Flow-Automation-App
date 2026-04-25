@@ -508,6 +508,121 @@ async function grokEnsureVideoMode(tabId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Resolution / duration / aspect-ratio toggles — Grok remembers the
+// last-used values per device, so a fresh login generates 480p / 6s
+// videos even when the app config asks for 720p / 10s. We push the
+// requested values onto the composer's toggle row before submit.
+//
+// Returns a summary object so the caller can log what changed.
+// ═══════════════════════════════════════════════════════════════════
+async function grokEnsureMediaSettings(tabId, opts) {
+  return grokExecInTab(tabId, async (args) => {
+    const norm = (s) => (s || "").toLowerCase().trim().replace(/\s+/g, " ");
+    const resWanted = (args.resolution || "").toLowerCase().replace(/\s/g, "");
+    const lenWanted = String(args.video_length || "").toLowerCase().replace(/\s/g, "");
+
+    const visible = (b) => {
+      try {
+        if (b.offsetParent === null) return false;
+        const r = b.getBoundingClientRect();
+        return r.width > 8 && r.height > 8;
+      } catch { return false; }
+    };
+
+    const isActive = (b) => {
+      if (!b) return false;
+      if (b.getAttribute("aria-pressed") === "true") return true;
+      if (b.getAttribute("aria-selected") === "true") return true;
+      if (b.getAttribute("aria-current") === "true") return true;
+      const ds = norm(b.getAttribute("data-state"));
+      if (ds === "on" || ds === "active" || ds === "selected" || ds === "checked") return true;
+      const cls = (b.className || "").toString().toLowerCase();
+      if (/(\b|_)(active|selected|on)(\b|_)/.test(cls)) return true;
+      // Visual fallback: very dark bg = the "selected" pill in
+      // Grok's pill-toggle row.
+      try {
+        const cs = window.getComputedStyle(b);
+        const m = (cs.backgroundColor || "").match(/rgba?\(([^)]+)\)/);
+        if (m) {
+          const p = m[1].split(",").map((s) => parseFloat(s.trim()));
+          if (p[0] < 60 && p[1] < 60 && p[2] < 60) return true;
+        }
+      } catch {}
+      return false;
+    };
+
+    // Token match: textContent / aria-label / title equals the token
+    // exactly (after lowercase + whitespace strip). Matches "480p",
+    // "720p", "6s", "10s" buttons.
+    const buttonForToken = (token) => {
+      const all = Array.from(
+        document.querySelectorAll('button,[role="button"],[role="tab"],div[tabindex]:not([tabindex="-1"])')
+      ).filter(visible);
+      const cands = all.filter((b) => {
+        const sources = [
+          b.getAttribute("aria-label"),
+          b.title,
+          b.textContent,
+        ];
+        return sources.some((raw) => {
+          const t = norm(raw).replace(/\s+/g, "");
+          return t === token;
+        });
+      });
+      // Pick the smallest — toggle pills are small icon-sized buttons
+      cands.sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return ar.width * ar.height - br.width * br.height;
+      });
+      return cands[0] || null;
+    };
+
+    const clickTarget = (el) => {
+      try { el.click(); } catch {}
+      try {
+        for (const type of ["mousedown", "mouseup", "click"]) {
+          el.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, view: window, button: 0,
+          }));
+        }
+      } catch {}
+    };
+
+    const setToggle = async (token) => {
+      if (!token) return { skipped: true };
+      const btn = buttonForToken(token);
+      if (!btn) return { token, found: false };
+      if (isActive(btn)) return { token, found: true, already: true };
+      clickTarget(btn);
+      await new Promise((r) => setTimeout(r, 400));
+      const nowActive = isActive(btn);
+      if (!nowActive) {
+        // One retry — first click may have just focused
+        clickTarget(btn);
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      return {
+        token, found: true, switched: true,
+        verified_active: isActive(btn),
+      };
+    };
+
+    const summary = {};
+    if (resWanted) summary.res = await setToggle(resWanted);
+    if (lenWanted) {
+      // Try with "s" suffix first ("6s", "10s"), fall back to bare
+      // number ("6", "10") in case Grok's UI uses either.
+      const withS = lenWanted.endsWith("s") ? lenWanted : lenWanted + "s";
+      let r = await setToggle(withS);
+      if (r && r.found === false) r = await setToggle(lenWanted.replace(/s$/, ""));
+      summary.len = r;
+    }
+    return summary;
+  }, opts);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Image attachment — injects a File into Grok's composer UI so the
 // subsequent send click produces a proper image-to-video request (one
 // with fileAttachments set in the conversations/new body).
@@ -1484,6 +1599,14 @@ async function grokHandleWork(work) {
     request_id,
     account,
     prompt,
+    // Per-job composer settings — Grok remembers per-device defaults
+    // for resolution / duration / aspect ratio, so we have to push
+    // these onto the UI toggles each dispatch. Otherwise a fresh
+    // login generates whatever Grok picked last (commonly 480p / 6s)
+    // regardless of what the user chose in the app.
+    aspect_ratio,
+    resolution,
+    video_length,
     // Reference image — for image→video (Approach 2: HTTP upload +
     // URL-in-text + click send)
     reference_image_base64,
@@ -1632,6 +1755,38 @@ async function grokHandleWork(work) {
     } catch (e) {
       await grokReportProgress(
         request_id, "mode_video_warn",
+        `${String(e?.message || e).slice(0, 80)}`
+      );
+    }
+
+    // Push resolution + duration onto the composer pills. Grok remembers
+    // these per device so a fresh login defaults to 480p / 6s — without
+    // this step, the user's 720p / 10s app setting would be silently
+    // overridden by Grok's last-used UI state.
+    try {
+      const settingsResult = await grokEnsureMediaSettings(tabId, {
+        resolution: resolution || "",
+        video_length: video_length ? String(video_length) : "",
+      });
+      const fmt = (label, r) => {
+        if (!r || r.skipped) return null;
+        if (!r.found) return `${label}=NOT_FOUND(${r.token})`;
+        if (r.already) return `${label}=${r.token}(already)`;
+        if (r.switched) {
+          return `${label}=${r.token}${r.verified_active ? "(set)" : "(click_only)"}`;
+        }
+        return null;
+      };
+      const parts = [fmt("res", settingsResult?.res), fmt("len", settingsResult?.len)]
+        .filter(Boolean);
+      if (parts.length) {
+        await grokReportProgress(
+          request_id, "media_settings", parts.join(", ")
+        );
+      }
+    } catch (e) {
+      await grokReportProgress(
+        request_id, "media_settings_warn",
         `${String(e?.message || e).slice(0, 80)}`
       );
     }
@@ -1886,10 +2041,16 @@ async function grokHandleWork(work) {
     const renav = await grokEnsureOnImaginePage(tabId);
     if (renav.error) { errorSeen = `renav_${renav.error}`; break; }
 
-    // Re-ensure Video mode after the bounce-back nav — same reason
-    // as the initial dispatch: if Grok defaulted to Image mode we'd
-    // generate the wrong media type.
+    // Re-ensure Video mode + media settings after the bounce-back
+    // nav — same reason as the initial dispatch: if Grok defaulted
+    // to Image mode / 480p / 6s we'd generate the wrong output.
     try { await grokEnsureVideoMode(tabId); } catch {}
+    try {
+      await grokEnsureMediaSettings(tabId, {
+        resolution: resolution || "",
+        video_length: video_length ? String(video_length) : "",
+      });
+    } catch {}
 
     if (hasReference) {
       const reAttach = await grokAttachImage(
