@@ -589,33 +589,100 @@ async function grokEnsureMediaSettings(tabId, opts) {
       } catch {}
     };
 
-    const setToggle = async (token) => {
-      if (!token) return { skipped: true };
-      const btn = buttonForToken(token);
-      if (!btn) return { token, found: false };
-      if (isActive(btn)) return { token, found: true, already: true };
-      clickTarget(btn);
-      await new Promise((r) => setTimeout(r, 400));
-      const nowActive = isActive(btn);
-      if (!nowActive) {
-        // One retry — first click may have just focused
-        clickTarget(btn);
-        await new Promise((r) => setTimeout(r, 400));
+    // Compare two paired buttons by background darkness — the "selected"
+    // pill in Grok's radio row is rendered with a darker fill. This is
+    // the most reliable signal we have because:
+    //   - Grok's classNames are hashed Tailwind, so name-based detection
+    //     varies by build
+    //   - aria-pressed / data-state are inconsistent across builds
+    //   - But the visual contrast between selected/unselected pills
+    //     in a radio row is always present (otherwise users couldn't
+    //     tell which was selected)
+    // Returns the "darker" (selected) button or null on tie/failure.
+    const darkerOf = (a, b) => {
+      try {
+        const sumLuma = (el) => {
+          if (!el) return Infinity;
+          const cs = window.getComputedStyle(el);
+          const m = (cs.backgroundColor || "").match(/rgba?\(([^)]+)\)/);
+          if (!m) return Infinity;
+          const p = m[1].split(",").map((s) => parseFloat(s.trim()));
+          // Lower = darker
+          return (p[0] || 0) + (p[1] || 0) + (p[2] || 0);
+        };
+        const la = sumLuma(a);
+        const lb = sumLuma(b);
+        if (la < lb - 30) return a;
+        if (lb < la - 30) return b;
+        return null; // ambiguous
+      } catch { return null; }
+    };
+
+    // Set a toggle pair to the wanted token. We get BOTH buttons in
+    // the pair (e.g. "480p" and "720p"), figure out which is currently
+    // selected by comparing their backgrounds, and click the wanted
+    // one if it isn't already selected. Always-click is safe in
+    // theory (radio-row click on already-selected = no-op) but on
+    // some React tab implementations it briefly re-fires the change
+    // handler, which we'd rather avoid mid-dispatch.
+    const setRadioPair = async (wanted, alternative) => {
+      if (!wanted) return { skipped: true };
+      const btnWanted = buttonForToken(wanted);
+      const btnAlt = alternative ? buttonForToken(alternative) : null;
+      if (!btnWanted) return { token: wanted, found: false };
+
+      // Decide current state. Priority:
+      //   1. darkerOf(wanted, alternative) — most reliable visual cue
+      //   2. isActive(wanted)             — aria/data convention
+      //   3. !isActive(alternative)       — inverse of the other side
+      let wantedSelected = null;
+      if (btnAlt) {
+        const darker = darkerOf(btnWanted, btnAlt);
+        if (darker) wantedSelected = (darker === btnWanted);
+      }
+      if (wantedSelected === null) {
+        if (isActive(btnWanted)) wantedSelected = true;
+        else if (btnAlt && isActive(btnAlt)) wantedSelected = false;
+      }
+
+      if (wantedSelected === true) {
+        return { token: wanted, found: true, already: true };
+      }
+
+      // Click. Try wanted button + verify. If verification doesn't
+      // confirm, retry once.
+      clickTarget(btnWanted);
+      await new Promise((r) => setTimeout(r, 500));
+      let verifiedNow = btnAlt ? darkerOf(btnWanted, btnAlt) === btnWanted : isActive(btnWanted);
+      if (!verifiedNow) {
+        clickTarget(btnWanted);
+        await new Promise((r) => setTimeout(r, 500));
+        verifiedNow = btnAlt ? darkerOf(btnWanted, btnAlt) === btnWanted : isActive(btnWanted);
       }
       return {
-        token, found: true, switched: true,
-        verified_active: isActive(btn),
+        token: wanted, found: true, switched: true,
+        verified_active: !!verifiedNow,
       };
     };
 
     const summary = {};
-    if (resWanted) summary.res = await setToggle(resWanted);
+    if (resWanted) {
+      // Resolution pair on Grok is 480p ↔ 720p
+      const altRes = resWanted === "720p" ? "480p" : (resWanted === "480p" ? "720p" : null);
+      summary.res = await setRadioPair(resWanted, altRes);
+    }
     if (lenWanted) {
-      // Try with "s" suffix first ("6s", "10s"), fall back to bare
-      // number ("6", "10") in case Grok's UI uses either.
+      // Duration pair: 6s ↔ 10s. Try with "s" suffix first.
       const withS = lenWanted.endsWith("s") ? lenWanted : lenWanted + "s";
-      let r = await setToggle(withS);
-      if (r && r.found === false) r = await setToggle(lenWanted.replace(/s$/, ""));
+      const altLen = withS === "10s" ? "6s" : (withS === "6s" ? "10s" : null);
+      let r = await setRadioPair(withS, altLen);
+      if (r && r.found === false) {
+        // Fall back to bare number variant ("10", "6") if Grok's UI
+        // uses that instead.
+        const bare = lenWanted.replace(/s$/, "");
+        const altBare = bare === "10" ? "6" : (bare === "6" ? "10" : null);
+        r = await setRadioPair(bare, altBare);
+      }
       summary.len = r;
     }
     return summary;
