@@ -551,14 +551,29 @@ async function grokEnsureMediaSettings(tabId, opts) {
       return false;
     };
 
-    // Token match: textContent / aria-label / title equals the token
-    // exactly (after lowercase + whitespace strip). Matches "480p",
-    // "720p", "6s", "10s" buttons.
+    // Token match: find a small toggle pill in the composer footer
+    // whose text/aria/title equals the token exactly (after lowercase
+    // + whitespace strip). Multiple guards prevent matching the
+    // WRONG element (a hidden tooltip, a div elsewhere on the page,
+    // or a list-item in a dropdown menu):
+    //
+    //   1. Element must be in the bottom 50% of the viewport — the
+    //      composer footer always sits near the bottom of the screen
+    //   2. Source text must match EXACTLY (no contains, no partial)
+    //   3. Pick the smallest matching — pills are <60px wide, full
+    //      buttons (e.g., a "10s ⏱ duration" menu item) are larger
+    const composerYThreshold = window.innerHeight * 0.5;
     const buttonForToken = (token) => {
       const all = Array.from(
-        document.querySelectorAll('button,[role="button"],[role="tab"],div[tabindex]:not([tabindex="-1"])')
+        document.querySelectorAll('button,[role="button"],[role="tab"],[role="radio"],div[tabindex]:not([tabindex="-1"])')
       ).filter(visible);
       const cands = all.filter((b) => {
+        // Position guard: must be in the bottom half of the viewport
+        try {
+          const r = b.getBoundingClientRect();
+          if (r.top < composerYThreshold) return false;
+        } catch { return false; }
+        // Exact match against any of the labels
         const sources = [
           b.getAttribute("aria-label"),
           b.title,
@@ -569,13 +584,34 @@ async function grokEnsureMediaSettings(tabId, opts) {
           return t === token;
         });
       });
-      // Pick the smallest — toggle pills are small icon-sized buttons
+      // Pick the smallest match — toggle pills are typically 50-90px
       cands.sort((a, b) => {
         const ar = a.getBoundingClientRect();
         const br = b.getBoundingClientRect();
         return ar.width * ar.height - br.width * br.height;
       });
       return cands[0] || null;
+    };
+
+    // Diagnostic snapshot of a button — included in the result so
+    // the user-facing log can show what we actually matched. Useful
+    // when the visual output disagrees with what we report.
+    const snapshot = (b) => {
+      if (!b) return null;
+      try {
+        const r = b.getBoundingClientRect();
+        const cs = window.getComputedStyle(b);
+        return {
+          tag: (b.tagName || "").toLowerCase(),
+          text: (b.textContent || "").slice(0, 20).trim(),
+          aria: (b.getAttribute("aria-label") || "").slice(0, 20),
+          ariaPressed: b.getAttribute("aria-pressed"),
+          dataState: b.getAttribute("data-state"),
+          bg: (cs.backgroundColor || "").slice(0, 30),
+          x: Math.round(r.x), y: Math.round(r.y),
+          w: Math.round(r.width), h: Math.round(r.height),
+        };
+      } catch { return null; }
     };
 
     const clickTarget = (el) => {
@@ -631,22 +667,44 @@ async function grokEnsureMediaSettings(tabId, opts) {
       const btnAlt = alternative ? buttonForToken(alternative) : null;
       if (!btnWanted) return { token: wanted, found: false };
 
+      const dbg = {
+        wanted_snap: snapshot(btnWanted),
+        alt_snap: snapshot(btnAlt),
+      };
+
       // Decide current state. Priority:
       //   1. darkerOf(wanted, alternative) — most reliable visual cue
       //   2. isActive(wanted)             — aria/data convention
       //   3. !isActive(alternative)       — inverse of the other side
       let wantedSelected = null;
+      let decisionPath = "unknown";
       if (btnAlt) {
         const darker = darkerOf(btnWanted, btnAlt);
-        if (darker) wantedSelected = (darker === btnWanted);
+        if (darker) {
+          wantedSelected = (darker === btnWanted);
+          decisionPath = "luma";
+        }
       }
       if (wantedSelected === null) {
-        if (isActive(btnWanted)) wantedSelected = true;
-        else if (btnAlt && isActive(btnAlt)) wantedSelected = false;
+        if (isActive(btnWanted)) {
+          wantedSelected = true;
+          decisionPath = "isActive(wanted)";
+        } else if (btnAlt && isActive(btnAlt)) {
+          wantedSelected = false;
+          decisionPath = "!isActive(alt)";
+        }
       }
+      // If still ambiguous, ASSUME wanted is NOT selected and click —
+      // safer default than assuming it's selected (clicking an
+      // already-selected radio is usually a no-op).
+      if (wantedSelected === null) {
+        wantedSelected = false;
+        decisionPath = "ambiguous_default_click";
+      }
+      dbg.decision = decisionPath;
 
       if (wantedSelected === true) {
-        return { token: wanted, found: true, already: true };
+        return { token: wanted, found: true, already: true, dbg };
       }
 
       // Click. Try wanted button + verify. If verification doesn't
@@ -659,51 +717,20 @@ async function grokEnsureMediaSettings(tabId, opts) {
         await new Promise((r) => setTimeout(r, 500));
         verifiedNow = btnAlt ? darkerOf(btnWanted, btnAlt) === btnWanted : isActive(btnWanted);
       }
+      dbg.post_click_wanted = snapshot(btnWanted);
+      dbg.post_click_alt = snapshot(btnAlt);
       return {
         token: wanted, found: true, switched: true,
         verified_active: !!verifiedNow,
+        dbg,
       };
     };
 
-    // ─── Primary path: Speed / Quality preset (current Grok UI) ───
-    // Grok's newer composer replaced the explicit 480p/720p and 6s/10s
-    // pills with two preset buttons: "Speed" (480p / 6s, faster) and
-    // "Quality" (720p / 10s, slower). Map the user's resolution +
-    // duration combo to the matching preset and click that.
-    //
-    //   720p OR 10s          → Quality
-    //   480p AND 6s (or one) → Speed
-    //   anything else        → Quality (closer to 720p+10s)
-    const wantQuality = (resWanted === "720p") || (lenWanted.startsWith("10"));
-    const presetWanted = wantQuality ? "quality" : "speed";
-    const presetAlt = wantQuality ? "speed" : "quality";
-
+    // The user's UI ships explicit "480p | 720p" and "6s | 10s" pills
+    // in the composer footer (verified by screenshot). The Speed /
+    // Quality preset path was a misread of an earlier UI variant —
+    // we go straight to per-pill toggles here.
     const summary = {};
-    const presetResult = await setRadioPair(presetWanted, presetAlt);
-    if (presetResult && presetResult.found) {
-      // Preset took. Don't bother with the legacy pill path — Grok's
-      // new UI drives both resolution and duration through the preset.
-      summary.preset = presetResult;
-      // Synthesize res/len entries so the caller's log line still
-      // shows the chosen values rather than going silent.
-      summary.res = {
-        token: resWanted, found: true,
-        ...(presetResult.already ? { already: true } : { switched: true, verified_active: presetResult.verified_active }),
-        via_preset: presetWanted,
-      };
-      summary.len = {
-        token: lenWanted.endsWith("s") ? lenWanted : lenWanted + "s",
-        found: true,
-        ...(presetResult.already ? { already: true } : { switched: true, verified_active: presetResult.verified_active }),
-        via_preset: presetWanted,
-      };
-      return summary;
-    }
-
-    // ─── Fallback path: legacy explicit 480p/720p + 6s/10s pills ───
-    // Older Grok builds (or future variants) may keep the per-axis
-    // pills. Honour those as a fallback so this code keeps working
-    // across UI redeploys.
     if (resWanted) {
       const altRes = resWanted === "720p" ? "480p" : (resWanted === "480p" ? "720p" : null);
       summary.res = await setRadioPair(resWanted, altRes);
@@ -1872,10 +1899,10 @@ async function grokHandleWork(work) {
       const fmt = (label, r) => {
         if (!r || r.skipped) return null;
         if (!r.found) return `${label}=NOT_FOUND(${r.token})`;
-        const viaSuffix = r.via_preset ? `[via ${r.via_preset}]` : "";
-        if (r.already) return `${label}=${r.token}(already)${viaSuffix}`;
+        const path = r.dbg?.decision ? `via=${r.dbg.decision}` : "";
+        if (r.already) return `${label}=${r.token}(already ${path})`.trim();
         if (r.switched) {
-          return `${label}=${r.token}${r.verified_active ? "(set)" : "(click_only)"}${viaSuffix}`;
+          return `${label}=${r.token}${r.verified_active ? "(set" : "(click_only"} ${path})`.trim();
         }
         return null;
       };
@@ -1884,6 +1911,22 @@ async function grokHandleWork(work) {
       if (parts.length) {
         await grokReportProgress(
           request_id, "media_settings", parts.join(", ")
+        );
+      }
+      // Also dump the snapshots when we made a decision based on a
+      // non-luma path — those are the cases where detection might
+      // be wrong and we want raw bytes to triage.
+      const needsTriage = (r) => r && r.dbg?.decision && r.dbg.decision !== "luma";
+      if (needsTriage(settingsResult?.res) || needsTriage(settingsResult?.len)) {
+        const snaps = {
+          res_wanted: settingsResult?.res?.dbg?.wanted_snap,
+          res_alt: settingsResult?.res?.dbg?.alt_snap,
+          len_wanted: settingsResult?.len?.dbg?.wanted_snap,
+          len_alt: settingsResult?.len?.dbg?.alt_snap,
+        };
+        await grokReportProgress(
+          request_id, "media_settings_dbg",
+          JSON.stringify(snaps).slice(0, 500),
         );
       }
     } catch (e) {
