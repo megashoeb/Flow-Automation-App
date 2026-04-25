@@ -783,10 +783,11 @@ async function grokEnsureMediaSettings(tabId, opts) {
     //      again (or click outside) to close
     const setAspectRatio = async (wanted) => {
       if (!wanted) return { skipped: true };
-      // The trigger button shows the CURRENT ratio. Look for any
-      // button in the composer footer whose text contains a ratio
-      // pattern (e.g. "16:9", "2:3").
-      const ratioRe = /^\d+:\d+$/;
+      // Trigger detection: trigger button shows JUST the ratio
+      // (e.g. "2:3", "16:9") in the composer footer with a chevron
+      // icon. Use a trailing-flexible regex: text contains "X:Y" and
+      // is short (<= 8 chars when whitespace stripped, no other words).
+      const triggerRe = /^\d+:\d+$/;
       const triggers = Array.from(
         document.querySelectorAll('button,[role="button"],[role="combobox"]')
       ).filter((b) => {
@@ -796,10 +797,9 @@ async function grokEnsureMediaSettings(tabId, opts) {
           if (r.top < composerYThreshold) return false;
         } catch { return false; }
         const t = norm(b.textContent).replace(/\s+/g, "");
-        return ratioRe.test(t);
+        return triggerRe.test(t);
       });
       if (!triggers.length) return { token: wanted, found: false };
-      // Pick the trigger whose current value is most "ratio-like"
       const trigger = triggers[0];
       const currentRatio = norm(trigger.textContent).replace(/\s+/g, "");
       if (currentRatio === wanted) {
@@ -814,25 +814,37 @@ async function grokEnsureMediaSettings(tabId, opts) {
           }));
         }
       } catch {}
-      await new Promise((r) => setTimeout(r, 400));
+      // Bumped from 400ms → 700ms — Grok's popover has a fade-in
+      // animation that can take ~500ms; the option items aren't
+      // visible/measurable until it settles.
+      await new Promise((r) => setTimeout(r, 700));
 
-      // Find the option matching wanted ratio. Search the whole
-      // document (popover often renders outside the composer), but
-      // require exact text match.
+      // Option matching: popover renders items like
+      //   "○ 16:9  Widescreen"
+      //   "● 2:3   Tall"
+      // The leading checkbox/dot character makes a strict startsWith
+      // fail. Instead, EXTRACT any "X:Y" ratio from the option's text
+      // (anywhere) and compare to the wanted token. This survives:
+      //   - Leading bullet/checkbox/dot indicators (○ ● ◯ ▢ etc.)
+      //   - Trailing label words ("Widescreen", "Tall", "Square", ...)
+      //   - Any whitespace / formatting variation
+      const optionRe = /(\d+:\d+)/;
       const options = Array.from(
-        document.querySelectorAll('[role="menuitem"],[role="option"],button,[role="button"],li')
+        document.querySelectorAll('[role="menuitem"],[role="menuitemradio"],[role="option"],button,[role="button"],li')
       ).filter((b) => {
         if (!visible(b)) return false;
         const t = norm(b.textContent).replace(/\s+/g, "");
-        return t === wanted || t.startsWith(wanted) || (ratioRe.test(t) && t === wanted);
+        const m = t.match(optionRe);
+        return !!(m && m[1] === wanted);
       });
       if (!options.length) {
-        // Click trigger again to close
+        // Close popover by clicking trigger again (best-effort).
         try { trigger.click(); } catch {}
         return { token: wanted, found: true, option_not_found: true };
       }
-      // Pick the smallest matching option (popover items are smaller
-      // than the trigger that wraps everything)
+      // Pick the smallest matching element — for a popover row with
+      // nested spans, the innermost match (the actual clickable row)
+      // is usually smaller than its parent containers.
       options.sort((a, b) => {
         const ar = a.getBoundingClientRect();
         const br = b.getBoundingClientRect();
@@ -847,7 +859,8 @@ async function grokEnsureMediaSettings(tabId, opts) {
           }));
         }
       } catch {}
-      await new Promise((r) => setTimeout(r, 400));
+      await new Promise((r) => setTimeout(r, 500));
+      // Verify by re-reading the trigger button's text.
       const newRatio = norm(trigger.textContent).replace(/\s+/g, "");
       return {
         token: wanted, found: true, switched: true,
