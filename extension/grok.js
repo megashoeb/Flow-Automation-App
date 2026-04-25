@@ -520,6 +520,9 @@ async function grokEnsureMediaSettings(tabId, opts) {
     const norm = (s) => (s || "").toLowerCase().trim().replace(/\s+/g, " ");
     const resWanted = (args.resolution || "").toLowerCase().replace(/\s/g, "");
     const lenWanted = String(args.video_length || "").toLowerCase().replace(/\s/g, "");
+    // Aspect: app sends "16:9" / "9:16" / "1:1" / "2:3" / "3:2".
+    // We click the dropdown and pick the matching option.
+    const aspectWanted = String(args.aspect_ratio || "").toLowerCase().replace(/\s/g, "");
 
     const visible = (b) => {
       try {
@@ -527,6 +530,42 @@ async function grokEnsureMediaSettings(tabId, opts) {
         const r = b.getBoundingClientRect();
         return r.width > 8 && r.height > 8;
       } catch { return false; }
+    };
+
+    // Walk into children up to 3 levels deep to find the FIRST element
+    // with a non-transparent background. Tailwind/React UIs commonly
+    // wrap a styled <div> inside a transparent <button>, so reading
+    // the button's own backgroundColor returns rgba(0,0,0,0) even
+    // when the visual button is clearly filled. Returns the OPAQUE
+    // background color string, or null if everything is transparent.
+    const getEffectiveBg = (el) => {
+      if (!el) return null;
+      const isOpaque = (col) => {
+        const m = col && col.match(/rgba?\(([^)]+)\)/);
+        if (!m) return false;
+        const p = m[1].split(",").map((s) => parseFloat(s.trim()));
+        const alpha = p.length === 4 ? p[3] : 1;
+        return alpha >= 0.1;
+      };
+      try {
+        const own = window.getComputedStyle(el).backgroundColor || "";
+        if (isOpaque(own)) return own;
+        // BFS into children up to depth 3
+        const queue = [[el, 0]];
+        while (queue.length) {
+          const [node, depth] = queue.shift();
+          if (depth > 0) {
+            const bg = window.getComputedStyle(node).backgroundColor || "";
+            if (isOpaque(bg)) return bg;
+          }
+          if (depth < 3) {
+            for (const child of node.children || []) {
+              queue.push([child, depth + 1]);
+            }
+          }
+        }
+      } catch {}
+      return null;
     };
 
     const isActive = (b) => {
@@ -538,16 +577,18 @@ async function grokEnsureMediaSettings(tabId, opts) {
       if (ds === "on" || ds === "active" || ds === "selected" || ds === "checked") return true;
       const cls = (b.className || "").toString().toLowerCase();
       if (/(\b|_)(active|selected|on)(\b|_)/.test(cls)) return true;
-      // Visual fallback: very dark bg = the "selected" pill in
-      // Grok's pill-toggle row.
-      try {
-        const cs = window.getComputedStyle(b);
-        const m = (cs.backgroundColor || "").match(/rgba?\(([^)]+)\)/);
+      // Visual fallback: opaque dark bg in self-or-children. Crucially,
+      // we EXCLUDE rgba(...,0) — a transparent button-element shouldn't
+      // be classified as active just because its rgb happens to be 0,0,0.
+      const bg = getEffectiveBg(b);
+      if (bg) {
+        const m = bg.match(/rgba?\(([^)]+)\)/);
         if (m) {
           const p = m[1].split(",").map((s) => parseFloat(s.trim()));
-          if (p[0] < 60 && p[1] < 60 && p[2] < 60) return true;
+          const alpha = p.length === 4 ? p[3] : 1;
+          if (alpha >= 0.5 && p[0] < 60 && p[1] < 60 && p[2] < 60) return true;
         }
-      } catch {}
+      }
       return false;
     };
 
@@ -626,24 +667,22 @@ async function grokEnsureMediaSettings(tabId, opts) {
     };
 
     // Compare two paired buttons by background darkness — the "selected"
-    // pill in Grok's radio row is rendered with a darker fill. This is
-    // the most reliable signal we have because:
-    //   - Grok's classNames are hashed Tailwind, so name-based detection
-    //     varies by build
-    //   - aria-pressed / data-state are inconsistent across builds
-    //   - But the visual contrast between selected/unselected pills
-    //     in a radio row is always present (otherwise users couldn't
-    //     tell which was selected)
+    // pill in Grok's radio row is rendered with a darker fill. Use
+    // getEffectiveBg to pierce transparent button wrappers (the
+    // styled fill lives on a child div in the current Grok build).
     // Returns the "darker" (selected) button or null on tie/failure.
     const darkerOf = (a, b) => {
       try {
         const sumLuma = (el) => {
-          if (!el) return Infinity;
-          const cs = window.getComputedStyle(el);
-          const m = (cs.backgroundColor || "").match(/rgba?\(([^)]+)\)/);
+          const bg = getEffectiveBg(el);
+          if (!bg) return Infinity; // no opaque bg = unselected pill
+          const m = bg.match(/rgba?\(([^)]+)\)/);
           if (!m) return Infinity;
           const p = m[1].split(",").map((s) => parseFloat(s.trim()));
-          // Lower = darker
+          // Treat alpha < 0.1 as no-fill (returned by isOpaque check
+          // already, but double-guard here).
+          const alpha = p.length === 4 ? p[3] : 1;
+          if (alpha < 0.1) return Infinity;
           return (p[0] || 0) + (p[1] || 0) + (p[2] || 0);
         };
         const la = sumLuma(a);
@@ -726,11 +765,96 @@ async function grokEnsureMediaSettings(tabId, opts) {
       };
     };
 
+    // ─── Aspect ratio dropdown ───
+    // The dropdown trigger shows the current value (e.g. "2:3" or
+    // "16:9") with a chevron. Clicking it opens a popover with the
+    // ratio options. Strategy:
+    //   1. Find the trigger button whose text === current ratio shown
+    //      AND is in the composer footer
+    //   2. If trigger's current text already matches wanted, skip
+    //   3. Otherwise click trigger to open popover, then click the
+    //      option whose text === wanted ratio, then click trigger
+    //      again (or click outside) to close
+    const setAspectRatio = async (wanted) => {
+      if (!wanted) return { skipped: true };
+      // The trigger button shows the CURRENT ratio. Look for any
+      // button in the composer footer whose text contains a ratio
+      // pattern (e.g. "16:9", "2:3").
+      const ratioRe = /^\d+:\d+$/;
+      const triggers = Array.from(
+        document.querySelectorAll('button,[role="button"],[role="combobox"]')
+      ).filter((b) => {
+        if (!visible(b)) return false;
+        try {
+          const r = b.getBoundingClientRect();
+          if (r.top < composerYThreshold) return false;
+        } catch { return false; }
+        const t = norm(b.textContent).replace(/\s+/g, "");
+        return ratioRe.test(t);
+      });
+      if (!triggers.length) return { token: wanted, found: false };
+      // Pick the trigger whose current value is most "ratio-like"
+      const trigger = triggers[0];
+      const currentRatio = norm(trigger.textContent).replace(/\s+/g, "");
+      if (currentRatio === wanted) {
+        return { token: wanted, found: true, already: true };
+      }
+      // Open the popover
+      try { trigger.click(); } catch {}
+      try {
+        for (const type of ["mousedown", "mouseup", "click"]) {
+          trigger.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, view: window, button: 0,
+          }));
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 400));
+
+      // Find the option matching wanted ratio. Search the whole
+      // document (popover often renders outside the composer), but
+      // require exact text match.
+      const options = Array.from(
+        document.querySelectorAll('[role="menuitem"],[role="option"],button,[role="button"],li')
+      ).filter((b) => {
+        if (!visible(b)) return false;
+        const t = norm(b.textContent).replace(/\s+/g, "");
+        return t === wanted || t.startsWith(wanted) || (ratioRe.test(t) && t === wanted);
+      });
+      if (!options.length) {
+        // Click trigger again to close
+        try { trigger.click(); } catch {}
+        return { token: wanted, found: true, option_not_found: true };
+      }
+      // Pick the smallest matching option (popover items are smaller
+      // than the trigger that wraps everything)
+      options.sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return ar.width * ar.height - br.width * br.height;
+      });
+      const opt = options[0];
+      try { opt.click(); } catch {}
+      try {
+        for (const type of ["mousedown", "mouseup", "click"]) {
+          opt.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, view: window, button: 0,
+          }));
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 400));
+      const newRatio = norm(trigger.textContent).replace(/\s+/g, "");
+      return {
+        token: wanted, found: true, switched: true,
+        verified_active: newRatio === wanted,
+      };
+    };
+
     // The user's UI ships explicit "480p | 720p" and "6s | 10s" pills
     // in the composer footer (verified by screenshot). The Speed /
     // Quality preset path was a misread of an earlier UI variant —
     // we go straight to per-pill toggles here.
     const summary = {};
+    if (aspectWanted) summary.aspect = await setAspectRatio(aspectWanted);
     if (resWanted) {
       const altRes = resWanted === "720p" ? "480p" : (resWanted === "480p" ? "720p" : null);
       summary.res = await setRadioPair(resWanted, altRes);
@@ -1893,21 +2017,26 @@ async function grokHandleWork(work) {
     // overridden by Grok's last-used UI state.
     try {
       const settingsResult = await grokEnsureMediaSettings(tabId, {
+        aspect_ratio: aspect_ratio || "",
         resolution: resolution || "",
         video_length: video_length ? String(video_length) : "",
       });
       const fmt = (label, r) => {
         if (!r || r.skipped) return null;
         if (!r.found) return `${label}=NOT_FOUND(${r.token})`;
+        if (r.option_not_found) return `${label}=${r.token}(opt_not_found)`;
         const path = r.dbg?.decision ? `via=${r.dbg.decision}` : "";
-        if (r.already) return `${label}=${r.token}(already ${path})`.trim();
+        if (r.already) return `${label}=${r.token}(already${path ? " " + path : ""})`;
         if (r.switched) {
-          return `${label}=${r.token}${r.verified_active ? "(set" : "(click_only"} ${path})`.trim();
+          return `${label}=${r.token}(${r.verified_active ? "set" : "click_only"}${path ? " " + path : ""})`;
         }
         return null;
       };
-      const parts = [fmt("res", settingsResult?.res), fmt("len", settingsResult?.len)]
-        .filter(Boolean);
+      const parts = [
+        fmt("aspect", settingsResult?.aspect),
+        fmt("res", settingsResult?.res),
+        fmt("len", settingsResult?.len),
+      ].filter(Boolean);
       if (parts.length) {
         await grokReportProgress(
           request_id, "media_settings", parts.join(", ")
@@ -2203,6 +2332,7 @@ async function grokHandleWork(work) {
     try { await grokEnsureVideoMode(tabId); } catch {}
     try {
       await grokEnsureMediaSettings(tabId, {
+        aspect_ratio: aspect_ratio || "",
         resolution: resolution || "",
         video_length: video_length ? String(video_length) : "",
       });
