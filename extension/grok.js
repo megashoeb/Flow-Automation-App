@@ -252,7 +252,13 @@ async function grokInstallAntiThrottle(tabId) {
 // Returns { ok, changed, url } or { error }.
 // ═══════════════════════════════════════════════════════════════════
 
-async function grokEnsureOnImaginePage(tabId) {
+async function grokEnsureOnImaginePage(tabId, opts) {
+  // opts.force=true forces a hard navigation even if the tab is
+  // already on /imagine — needed by the click-retry path because the
+  // composer keeps its attached-image state across nav-less calls,
+  // and re-running grokAttachImage would stack a second/third image
+  // onto the same composer instead of replacing the original.
+  const force = !!(opts && opts.force);
   const pathOf = (url) => {
     try { return new URL(url).pathname; } catch { return ""; }
   };
@@ -264,10 +270,10 @@ async function grokEnsureOnImaginePage(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
     const url = tab.url || "";
-    if (isImagineHome(url)) {
+    if (isImagineHome(url) && !force) {
       return { ok: true, changed: false, url };
     }
-    if (!url.startsWith(GROK_ORIGIN)) {
+    if (!url.startsWith(GROK_ORIGIN) && !isImagineHome(url)) {
       return { error: `unexpected_url: ${url.slice(0, 80)}` };
     }
 
@@ -2323,7 +2329,12 @@ async function grokHandleWork(work) {
     domFallbackUrl = "";
     lastReportedProgress = -1;
 
-    const renav = await grokEnsureOnImaginePage(tabId);
+    // force:true so the composer state is wiped — without this, the
+    // previous attempt's attached image would still be in the composer
+    // and re-attaching here would stack a 2nd/3rd image onto the same
+    // submission. Forcing window.location.replace gives us a fresh
+    // composer with zero attachments every retry.
+    const renav = await grokEnsureOnImaginePage(tabId, { force: true });
     if (renav.error) { errorSeen = `renav_${renav.error}`; break; }
 
     // Re-ensure Video mode + media settings after the bounce-back
