@@ -177,21 +177,33 @@ class GrokModeManager:
             # Click-based dispatch (v1.7.0+): each grok.com tab can run
             # only ONE generation at a time because Grok's UI locks input
             # while a video is rendering. To get parallelism, open
-            # multiple grok.com/imagine tabs in the SAME account — each
-            # tab becomes an independent dispatch slot. The UI "Parallel"
-            # setting still caps per-account concurrency, but the
-            # physical limit is tab_count. If slots > tabs we'll log a
-            # gentle note.
-            slots_per_account = max(1, min(15, int(self.qm.account_parallel_slots or 1)))
+            # In Grok mode the UI's "Parallel tasks" setting is IGNORED.
+            # Real parallelism is bounded by the number of grok.com/
+            # imagine tabs the user has open per account — Grok serial-
+            # izes generation per tab, so spinning up more workers than
+            # tabs just makes the extras sit in tab_wait until they
+            # hit Python's idle timeout.
+            #
+            # Concrete failure user reported: 3 accounts × 3 tabs each
+            # = 9 tabs total, but the UI said parallel=12 → 36 worker
+            # slots dispatched, 27 stuck waiting, tail timed out.
+            #
+            # Fix: workers per account = tab_count reported by the
+            # extension. The UI slider value is logged for transparency
+            # but not used for sizing. Per-account tab counts come from
+            # the bridge accounts payload.
             self._log(
-                f"[GrokMode] Click-based dispatch — 1 generation per tab at a time.\n"
-                f"  Parallel slots set to {slots_per_account}. For real parallelism, "
-                "open that many grok.com/imagine tabs in the same account."
+                "[GrokMode] Click-based dispatch — 1 generation per tab at a time.\n"
+                "  Worker count is auto-sized to match grok.com/imagine\n"
+                "  tabs you have open per account (UI 'Parallel' slider\n"
+                "  is ignored in Grok mode — opening more tabs is the\n"
+                "  only way to get more parallelism)."
             )
-            if slots_per_account > 5:
+            ui_parallel = max(1, int(self.qm.account_parallel_slots or 1))
+            if ui_parallel > 1:
                 self._log(
-                    f"[GrokMode] ⚠ Parallel={slots_per_account}/account is high — "
-                    "Grok fair-use may throttle. 2–3 is safer."
+                    f"[GrokMode] (UI Parallel slider = {ui_parallel}, ignored. "
+                    "Open more grok.com/imagine tabs to scale up.)"
                 )
 
             self._log(
@@ -248,18 +260,22 @@ class GrokModeManager:
                 + ", ".join(account_names)
             )
 
-            # Spin up workers
+            # Spin up workers — one per tab the extension reports for
+            # this account. Hard floor of 1 in case tab_count is missing
+            # or zero (shouldn't happen but defensive).
             for info in connected:
                 email = info["email"]
                 sub = info.get("subscription", "")
+                tab_count = max(1, int(info.get("tab_count", 1) or 1))
                 workers = []
-                for idx in range(1, slots_per_account + 1):
+                for idx in range(1, tab_count + 1):
                     slot_id = f"{email}#gr{idx}"
                     workers.append(GrokWorker(slot_id, email, self._bridge, self._log))
                 self._workers[email] = workers
                 tag = f" [{sub}]" if sub else ""
                 self._log(
-                    f"[GrokMode] {email}{tag}: {len(workers)} worker(s) ready."
+                    f"[GrokMode] {email}{tag}: {len(workers)} worker(s) "
+                    f"ready (matches {tab_count} open tab(s))."
                 )
 
             total_workers = sum(len(w) for w in self._workers.values())
@@ -285,18 +301,22 @@ class GrokModeManager:
                     continue
 
                 # Dynamic account discovery — if new grok.com tabs opened
-                # mid-run, spin up worker slots for them.
+                # mid-run, spin up worker slots for them. Worker count
+                # matches tab_count just like the initial spin-up.
                 current = self._bridge.get_accounts()
                 for info in current:
                     email = info.get("email", "")
                     if email and email not in self._workers:
+                        tab_count = max(1, int(info.get("tab_count", 1) or 1))
                         workers = []
-                        for idx in range(1, slots_per_account + 1):
+                        for idx in range(1, tab_count + 1):
                             slot_id = f"{email}#gr{idx}"
                             workers.append(GrokWorker(slot_id, email, self._bridge, self._log))
                         self._workers[email] = workers
                         self._log(
-                            f"[GrokMode] New account: {email} — {len(workers)} worker(s) added."
+                            f"[GrokMode] New account: {email} — "
+                            f"{len(workers)} worker(s) added "
+                            f"(matches {tab_count} open tab(s))."
                         )
 
                 # Prune finished tasks

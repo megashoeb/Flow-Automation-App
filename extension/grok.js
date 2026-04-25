@@ -1787,6 +1787,12 @@ async function grokDetectAccounts() {
               email: a.email,
               userId: a.userId,
               subscription: a.subscription,
+              // Send the per-account tab count so the Python side can
+              // size its worker pool to match real capacity. With 3
+              // tabs open, no point spinning up 12 workers — they'd
+              // all sit in tab_wait and the tail of the queue would
+              // hit Python's idle timeout before getting a slot.
+              tab_count: Array.isArray(a.tab_ids) ? a.tab_ids.length : 1,
             })),
           }),
         });

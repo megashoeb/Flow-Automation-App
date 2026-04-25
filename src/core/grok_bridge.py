@@ -366,10 +366,15 @@ class GrokBridge:
             email = str(a.get("email") or "").strip()
             if not email:
                 continue
+            try:
+                tab_count = max(1, int(a.get("tab_count") or 1))
+            except (TypeError, ValueError):
+                tab_count = 1
             fresh[email] = {
                 "email": email,
                 "userId": str(a.get("userId") or ""),
                 "subscription": str(a.get("subscription") or ""),
+                "tab_count": tab_count,
                 "last_seen": now,
             }
         self._connected_accounts = fresh
