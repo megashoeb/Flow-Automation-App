@@ -880,19 +880,50 @@ async function grokClickSend(tabId, prompt) {
     }));
 
     // Winner selection: explicit aria-label match wins (if the priority
-    // pass found one). Otherwise pick the top-scored button.
-    const sendBtn = explicitSend || scoredBtns[0]?.btn || null;
+    // pass found one — that pass already filtered out disabled). For
+    // the heuristic fallback we hard-skip disabled candidates AND
+    // require a confidence threshold:
+    //
+    //   - A disabled .click() is a no-op (25s of click_no_effect waste
+    //     before the retry path runs), so disabled is auto-rejected.
+    //   - Even among enabled buttons, if the top score is too low
+    //     (<70) it means the real send is disabled and only misc
+    //     buttons (Save, example-prompt suggestions like "Cuddle a
+    //     Squirrel", aspect-ratio toggle, etc.) are competing for top
+    //     spot. Clicking those would dispatch the wrong action.
+    //
+    // Failing fast with no_enabled_send_button surfaces straight to
+    // the upstream retry path which bounces to /imagine and retries
+    // — by then Grok's server-side upload has finished and the real
+    // send button is enabled, so the explicit-match polling catches
+    // it on the next attempt.
+    const HEURISTIC_MIN_SCORE = 70;
+    const enabledHeuristicWinner = scoredBtns.find((s) => {
+      const b = s.btn;
+      if (!b) return false;
+      if (b.disabled === true) return false;
+      if (b.getAttribute("aria-disabled") === "true") return false;
+      if (b.getAttribute("disabled") !== null) return false;
+      return true;
+    });
+    const heuristicScore = enabledHeuristicWinner?.score ?? 0;
+    const heuristicConfident = heuristicScore >= HEURISTIC_MIN_SCORE;
+    const sendBtn = explicitSend
+      || (heuristicConfident ? enabledHeuristicWinner.btn : null);
 
     if (!sendBtn) {
       window.__grokAutomationActive = false;
       return {
-        error: "no_send_button_found",
+        error: "no_enabled_send_button",
         debug: {
           inputType,
           inputPlaceholder: chosen.placeholder,
           scopeTag: scope?.tagName,
           buttonsInScope: allBtns.length,
           nearbyCount: nearbyBtns.length,
+          allDisabled: scoredBtns.length > 0 && !enabledHeuristicWinner,
+          lowConfidence: !!enabledHeuristicWinner && !heuristicConfident,
+          bestEnabledScore: heuristicScore,
           topCandidates,
         },
       };
@@ -909,7 +940,7 @@ async function grokClickSend(tabId, prompt) {
       ok: true,
       inputType,
       buttonLabel: label,
-      buttonScore: explicitSend ? 999 : scoredBtns[0].score,
+      buttonScore: explicitSend ? 999 : heuristicScore,
       explicitMatch: !!explicitSend,
       topCandidates,
     };
@@ -1485,8 +1516,21 @@ async function grokHandleWork(work) {
     "clicking_send",
     hasReference ? "image_mode" : "text_mode"
   );
+  // "no_enabled_send_button" from grokClickSend is a transient state —
+  // Grok's send button is disabled while server-side image processing
+  // finishes. We treat it like click_no_effect so the existing retry
+  // loop (re-nav + re-attach + re-click) handles it. Other click
+  // errors (no_input_found, set_input_failed, etc.) are non-transient
+  // and fail fast so the user sees a clear error.
+  let skipInitialPoll = false;
   const clickResult = await grokClickSend(tabId, messageForClick);
-  if (!clickResult || clickResult.error) {
+  if (clickResult && clickResult.error === "no_enabled_send_button") {
+    await grokReportProgress(
+      request_id, "send_btn_disabled",
+      "send button still disabled after polling — will retry"
+    );
+    skipInitialPoll = true;
+  } else if (!clickResult || clickResult.error) {
     const dbgStr = clickResult?.debug
       ? ` | debug: ${JSON.stringify(clickResult.debug).slice(0, 300)}`
       : "";
@@ -1499,30 +1543,32 @@ async function grokHandleWork(work) {
     });
     return;
   }
-  const scoreInfo =
-    typeof clickResult.buttonScore === "number"
-      ? ` score=${clickResult.buttonScore.toFixed(1)}`
-      : "";
-  await grokReportProgress(
-    request_id,
-    "clicked",
-    `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"}${scoreInfo})`
-  );
-  // If we DIDN'T hit the explicit-match short-circuit, surface the
-  // top-5 candidates so the log shows what else was competing. Helps
-  // debug when image-mode or other UI variants pick a wrong button
-  // (the "Submit" text button with score 49.9 bug from v1.8.6).
-  if (!clickResult.explicitMatch && clickResult.topCandidates) {
-    const cands = clickResult.topCandidates
-      .slice(0, 5)
-      .map(
-        (c) =>
-          `[${c.score}|${c.tag || "?"}${c.hasSvg ? "+svg" : ""} "${
-            (c.ariaLabel || c.text || "-").slice(0, 20)
-          }"]`
-      )
-      .join(" ");
-    await grokReportProgress(request_id, "click_candidates", cands);
+  if (!skipInitialPoll) {
+    const scoreInfo =
+      typeof clickResult.buttonScore === "number"
+        ? ` score=${clickResult.buttonScore.toFixed(1)}`
+        : "";
+    await grokReportProgress(
+      request_id,
+      "clicked",
+      `${clickResult.buttonLabel || "send"} (input=${clickResult.inputType || "?"}${scoreInfo})`
+    );
+    // If we DIDN'T hit the explicit-match short-circuit, surface the
+    // top-5 candidates so the log shows what else was competing. Helps
+    // debug when image-mode or other UI variants pick a wrong button
+    // (the "Submit" text button with score 49.9 bug from v1.8.6).
+    if (!clickResult.explicitMatch && clickResult.topCandidates) {
+      const cands = clickResult.topCandidates
+        .slice(0, 5)
+        .map(
+          (c) =>
+            `[${c.score}|${c.tag || "?"}${c.hasSvg ? "+svg" : ""} "${
+              (c.ariaLabel || c.text || "-").slice(0, 20)
+            }"]`
+        )
+        .join(" ");
+      await grokReportProgress(request_id, "click_candidates", cands);
+    }
   }
 
   // Poll for videoUrl — either from the fetch-wrapper's stream capture
@@ -1532,7 +1578,10 @@ async function grokHandleWork(work) {
   let videoId = "";
   let progressPct = 0;
   let domFallbackUrl = "";
-  let errorSeen = "";
+  // Pre-seed errorSeen so the no-enabled-send-button case skips the
+  // 4-min poll loop and goes straight to the retry block — no point
+  // polling for a video that was never submitted.
+  let errorSeen = skipInitialPoll ? "click_no_effect" : "";
   const pollDeadline = Date.now() + 240000; // 4 min safety cap
   let lastReportedProgress = -1;
 
@@ -1552,7 +1601,7 @@ async function grokHandleWork(work) {
     catch { return ""; }
   })()) || "";
 
-  while (Date.now() < pollDeadline) {
+  while (Date.now() < pollDeadline && !errorSeen) {
     const state = await grokReadAutomationState(tabId);
     if (state.error) {
       errorSeen = state.error;
