@@ -665,20 +665,54 @@ async function grokEnsureMediaSettings(tabId, opts) {
       };
     };
 
+    // ─── Primary path: Speed / Quality preset (current Grok UI) ───
+    // Grok's newer composer replaced the explicit 480p/720p and 6s/10s
+    // pills with two preset buttons: "Speed" (480p / 6s, faster) and
+    // "Quality" (720p / 10s, slower). Map the user's resolution +
+    // duration combo to the matching preset and click that.
+    //
+    //   720p OR 10s          → Quality
+    //   480p AND 6s (or one) → Speed
+    //   anything else        → Quality (closer to 720p+10s)
+    const wantQuality = (resWanted === "720p") || (lenWanted.startsWith("10"));
+    const presetWanted = wantQuality ? "quality" : "speed";
+    const presetAlt = wantQuality ? "speed" : "quality";
+
     const summary = {};
+    const presetResult = await setRadioPair(presetWanted, presetAlt);
+    if (presetResult && presetResult.found) {
+      // Preset took. Don't bother with the legacy pill path — Grok's
+      // new UI drives both resolution and duration through the preset.
+      summary.preset = presetResult;
+      // Synthesize res/len entries so the caller's log line still
+      // shows the chosen values rather than going silent.
+      summary.res = {
+        token: resWanted, found: true,
+        ...(presetResult.already ? { already: true } : { switched: true, verified_active: presetResult.verified_active }),
+        via_preset: presetWanted,
+      };
+      summary.len = {
+        token: lenWanted.endsWith("s") ? lenWanted : lenWanted + "s",
+        found: true,
+        ...(presetResult.already ? { already: true } : { switched: true, verified_active: presetResult.verified_active }),
+        via_preset: presetWanted,
+      };
+      return summary;
+    }
+
+    // ─── Fallback path: legacy explicit 480p/720p + 6s/10s pills ───
+    // Older Grok builds (or future variants) may keep the per-axis
+    // pills. Honour those as a fallback so this code keeps working
+    // across UI redeploys.
     if (resWanted) {
-      // Resolution pair on Grok is 480p ↔ 720p
       const altRes = resWanted === "720p" ? "480p" : (resWanted === "480p" ? "720p" : null);
       summary.res = await setRadioPair(resWanted, altRes);
     }
     if (lenWanted) {
-      // Duration pair: 6s ↔ 10s. Try with "s" suffix first.
       const withS = lenWanted.endsWith("s") ? lenWanted : lenWanted + "s";
       const altLen = withS === "10s" ? "6s" : (withS === "6s" ? "10s" : null);
       let r = await setRadioPair(withS, altLen);
       if (r && r.found === false) {
-        // Fall back to bare number variant ("10", "6") if Grok's UI
-        // uses that instead.
         const bare = lenWanted.replace(/s$/, "");
         const altBare = bare === "10" ? "6" : (bare === "6" ? "10" : null);
         r = await setRadioPair(bare, altBare);
@@ -1838,9 +1872,10 @@ async function grokHandleWork(work) {
       const fmt = (label, r) => {
         if (!r || r.skipped) return null;
         if (!r.found) return `${label}=NOT_FOUND(${r.token})`;
-        if (r.already) return `${label}=${r.token}(already)`;
+        const viaSuffix = r.via_preset ? `[via ${r.via_preset}]` : "";
+        if (r.already) return `${label}=${r.token}(already)${viaSuffix}`;
         if (r.switched) {
-          return `${label}=${r.token}${r.verified_active ? "(set)" : "(click_only)"}`;
+          return `${label}=${r.token}${r.verified_active ? "(set)" : "(click_only)"}${viaSuffix}`;
         }
         return null;
       };
@@ -1934,26 +1969,37 @@ async function grokHandleWork(work) {
     "clicking_send",
     hasReference ? "image_mode" : "text_mode"
   );
-  // "no_enabled_send_button" from grokClickSend is a transient state —
-  // Grok's send button is disabled while server-side image processing
-  // finishes. We treat it like click_no_effect so the existing retry
-  // loop (re-nav + re-attach + re-click) handles it. Other click
-  // errors (no_input_found, set_input_failed, etc.) are non-transient
-  // and fail fast so the user sees a clear error.
+  // Transient click states — these are page-level conditions that
+  // typically resolve after a re-navigate (Grok's UI was mid-upload,
+  // the script context died because the tab was busy, the send button
+  // was briefly disabled, etc.). Forward them into the retry loop
+  // (re-nav + re-attach + re-click) instead of failing the job.
+  //
+  // Hard failures (no_input_found, set_input_failed) still fail fast
+  // because they're non-transient — the page is in an unrecognized
+  // state and a retry won't help.
   let skipInitialPoll = false;
   const clickResult = await grokClickSend(tabId, messageForClick);
-  if (clickResult && clickResult.error === "no_enabled_send_button") {
+  const isTransientClickFail = (
+    !clickResult                                              // executeScript threw / tab busy
+    || clickResult.error === "no_enabled_send_button"         // send still disabled
+    || clickResult.error === "no_send_button_found"           // legacy variant of same
+  );
+  if (isTransientClickFail) {
+    const reason = !clickResult ? "exec_failed (script context died)"
+      : clickResult.error === "no_enabled_send_button" ? "send button still disabled"
+      : "send button not found";
     await grokReportProgress(
-      request_id, "send_btn_disabled",
-      "send button still disabled after polling — will retry"
+      request_id, "click_transient_fail",
+      `${reason} — will retry`
     );
     skipInitialPoll = true;
-  } else if (!clickResult || clickResult.error) {
-    const dbgStr = clickResult?.debug
+  } else if (clickResult.error) {
+    const dbgStr = clickResult.debug
       ? ` | debug: ${JSON.stringify(clickResult.debug).slice(0, 300)}`
       : "";
     await grokSubmitResult(request_id, {
-      error: `click_failed_${clickResult?.error || "unknown"}`,
+      error: `click_failed_${clickResult.error || "unknown"}`,
       detail:
         "Could not locate input or send button on grok.com/imagine. " +
         "Make sure the tab is open to /imagine and Video mode is selected." +
@@ -2131,8 +2177,29 @@ async function grokHandleWork(work) {
     }
 
     const reClick = await grokClickSend(tabId, messageForClick);
-    if (!reClick || reClick.error) {
-      errorSeen = `retry_click_${reClick?.error || "unknown"}`;
+    // Same transient handling as the initial click — null reClick or
+    // no_enabled_send_button means the retry attempt itself was hit
+    // by the same condition. Loop continues if we still have retries
+    // left (errorSeen stays "click_no_effect"), else surfaces below.
+    const reClickTransient = (
+      !reClick
+      || reClick.error === "no_enabled_send_button"
+      || reClick.error === "no_send_button_found"
+    );
+    if (reClickTransient) {
+      const reason = !reClick ? "exec_failed"
+        : reClick.error || "no_send_button";
+      await grokReportProgress(
+        request_id, "retry_click_transient",
+        `${reason} — will try again if retries remain`
+      );
+      // Keep errorSeen as "click_no_effect" so the outer while loop
+      // continues to the next retry iteration. Don't break.
+      errorSeen = "click_no_effect";
+      continue;
+    }
+    if (reClick.error) {
+      errorSeen = `retry_click_${reClick.error}`;
       break;
     }
     await grokReportProgress(
