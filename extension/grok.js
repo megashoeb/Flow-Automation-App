@@ -354,198 +354,85 @@ async function grokEnsureOnImaginePage(tabId, opts) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Mode toggle — Grok's /imagine composer has Image / Video tabs and
-// remembers the last-used mode per device. On a fresh login the
-// default is Image, so a job that uploads a reference + clicks send
-// generates an IMAGE (image-to-image edit) instead of a video. We
-// must explicitly switch to Video mode before attaching.
+// Mode toggle — Grok's /imagine composer has Image / Video tabs.
+// On fresh devices it defaults to Image; submitting there generates an
+// IMAGE (image-to-image edit) instead of a video. We force Video mode.
 //
-// Detection: scan composer-area buttons for one labeled "Video" that
-// is NOT currently selected (no aria-pressed="true" / no active class
-// signal). If found, click it. Idempotent — if already on Video, the
-// scan returns early without clicking.
+// Detection strategy — SVG path matching (most stable):
+// Each mode button contains a Lucide icon. The icon's <path> element
+// has fixed `d=` data that survives className refactors, aria-label
+// changes, theme switches, and React component restructures. We look
+// for:
+//
+//   Video icon: starts with "M12 4C14.4853 4 16.5 6.01472 16.5 8.5V15.5"
+//   Image icon: starts with "M14.0996 2.5C15.2032 2.5"
+//
+// (Path data comes from the Lucide icon set Grok uses. See competitor
+// extension's remote config — same approach.)
+//
+// Idempotency: clicking an already-selected radio is a no-op in
+// Grok's UI, so we always click. Simpler than tracking active state.
 // ═══════════════════════════════════════════════════════════════════
 async function grokEnsureVideoMode(tabId) {
   return grokExecInTab(tabId, async () => {
-    const norm = (s) => (s || "").toLowerCase().trim().replace(/\s+/g, " ");
-
-    // Check multiple text sources on a button — Grok may set the
-    // mode label via aria-label, title, textContent, or a data-*
-    // attribute. We accept exact match OR "starts with the token"
-    // (e.g. textContent "Image\n  ⚡" still counts as "image").
-    const buttonHasMode = (b, mode) => {
-      const sources = [
-        b.getAttribute("aria-label"),
-        b.title,
-        b.getAttribute("data-mode"),
-        b.getAttribute("data-value"),
-        b.getAttribute("data-tab"),
-        b.getAttribute("data-state"),
-        // Get only the FIRST text node so a parent's children don't
-        // confuse us with nested labels.
-        b.textContent,
-      ];
-      return sources.some((raw) => {
-        const t = norm(raw);
-        if (!t) return false;
-        // Equality
-        if (t === mode) return true;
-        // Starts with mode followed by space/separator
-        if (t.startsWith(mode + " ") || t.startsWith(mode + "\n")) return true;
-        // Single-word in larger text — "image\n⚡" type
-        if (t.split(/[\s\n,;:|]+/).includes(mode)) return true;
-        return false;
-      });
+    // Walk up the DOM from a path element to its containing button.
+    // The Lucide icon SVG sits inside the toggle button — sometimes
+    // wrapped in spans/divs, so we walk up rather than hard-coding
+    // a specific parent depth.
+    const buttonContaining = (pathEl) => {
+      let el = pathEl;
+      for (let i = 0; i < 6 && el; i++) {
+        if (el.tagName === "BUTTON") return el;
+        el = el.parentElement;
+      }
+      return null;
     };
 
-    // Active-state detection — try every common React toggle
-    // convention plus a class-name fallback.
-    const isActive = (b) => {
-      if (!b) return false;
-      if (b.getAttribute("aria-pressed") === "true") return true;
-      if (b.getAttribute("aria-selected") === "true") return true;
-      if (b.getAttribute("aria-current") === "true") return true;
-      const ds = norm(b.getAttribute("data-state"));
-      if (ds === "on" || ds === "active" || ds === "selected" || ds === "checked") return true;
-      const cls = (b.className || "").toString().toLowerCase();
-      if (/(\b|_)(active|selected|on)(\b|_)/.test(cls)) return true;
-      // Computed-style fallback: if bg is much darker than the
-      // sibling and text is light (the visual "selected" pattern
-      // we see in the screenshot), treat as active.
-      try {
-        const cs = window.getComputedStyle(b);
-        const bg = cs.backgroundColor || "";
-        // rgba(0,0,0,...) or very dark rgb — Grok's selected button
-        const m = bg.match(/rgba?\(([^)]+)\)/);
-        if (m) {
-          const parts = m[1].split(",").map((s) => parseFloat(s.trim()));
-          const [r, g, bl] = parts;
-          if (r < 60 && g < 60 && bl < 60) return true; // very dark bg
-        }
-      } catch {}
-      return false;
+    const visible = (el) => {
+      if (!el) return false;
+      if (el.offsetParent === null) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4;
     };
 
-    const visible = (b) => {
-      try {
-        if (b.offsetParent === null) return false;
-        const r = b.getBoundingClientRect();
-        return r.width > 8 && r.height > 8;
-      } catch { return false; }
+    // Find Image/Video buttons by SVG path data. Using prefix match
+    // (^=) instead of exact match because Grok occasionally tweaks
+    // the trailing decimal precision of path coordinates without
+    // changing the icon shape — prefix survives those tweaks.
+    const findByPathPrefix = (prefix) => {
+      const sel = `path[d^="${prefix}"]`;
+      const candidates = document.querySelectorAll(sel);
+      for (const p of candidates) {
+        const btn = buttonContaining(p);
+        if (btn && visible(btn)) return btn;
+      }
+      return null;
     };
 
-    const all = Array.from(
-      document.querySelectorAll('button,[role="button"],[role="tab"],div[tabindex]:not([tabindex="-1"]),li[tabindex]:not([tabindex="-1"])')
-    ).filter(visible);
-
-    const videoBtns = all.filter((b) => buttonHasMode(b, "video"));
-    const imageBtns = all.filter((b) => buttonHasMode(b, "image"));
-
-    // Pick the smallest (toggle-like, not a "Video Quality" dropdown)
-    // and prefer ones near other mode-label buttons.
-    const pickToggle = (cands) => {
-      if (!cands.length) return null;
-      cands.sort((a, b) => {
-        const ar = a.getBoundingClientRect();
-        const br = b.getBoundingClientRect();
-        return ar.width * ar.height - br.width * br.height;
-      });
-      return cands[0];
-    };
-    const videoBtn = pickToggle(videoBtns);
-    const imageBtn = pickToggle(imageBtns);
+    const videoBtn = findByPathPrefix(
+      "M12 4C14.4853 4 16.5 6.01472 16.5 8.5V15.5"
+    );
+    const imageBtn = findByPathPrefix("M14.0996 2.5C15.2032 2.5");
 
     const debug = {
-      total_buttons_scanned: all.length,
-      video_candidates: videoBtns.length,
-      image_candidates: imageBtns.length,
-      video_active: videoBtn ? isActive(videoBtn) : null,
-      image_active: imageBtn ? isActive(imageBtn) : null,
-      video_label: videoBtn ? (videoBtn.getAttribute("aria-label") || videoBtn.textContent || "").slice(0, 40) : null,
-      image_label: imageBtn ? (imageBtn.getAttribute("aria-label") || imageBtn.textContent || "").slice(0, 40) : null,
+      video_found: !!videoBtn,
+      image_found: !!imageBtn,
+      // Diagnostic counts so a failed match tells us the page state
+      total_paths: document.querySelectorAll("path").length,
+      total_buttons: document.querySelectorAll("button").length,
     };
 
-    // Already on Video AND Image is not active? Done.
-    if (videoBtn && isActive(videoBtn) && (!imageBtn || !isActive(imageBtn))) {
-      return { ok: true, already_video: true, debug };
-    }
-
+    // Pure SVG-path failure. The composer either hasn't loaded or
+    // Grok swapped icon set. Fall back caller will log a warning.
     if (!videoBtn) {
       return { ok: true, no_video_btn: true, debug };
     }
 
-    // Click via multiple strategies — React event handlers can be
-    // bound to the parent or a child SVG, so a single .click() on
-    // a stale reference may miss. Try synthetic mouse events too.
-    const clickTarget = (el) => {
-      try { el.click(); } catch {}
-      try {
-        for (const type of ["mousedown", "mouseup", "click"]) {
-          el.dispatchEvent(new MouseEvent(type, {
-            bubbles: true, cancelable: true, view: window, button: 0,
-          }));
-        }
-      } catch {}
-    };
-    clickTarget(videoBtn);
-
-    await new Promise((r) => setTimeout(r, 600));
-
-    const nowVideo = isActive(videoBtn);
-    const nowImage = imageBtn ? isActive(imageBtn) : false;
-
-    // If first click didn't take, try once more (sometimes the first
-    // click triggers a focus and only the second triggers the toggle).
-    if (!nowVideo && nowImage) {
-      clickTarget(videoBtn);
-      await new Promise((r) => setTimeout(r, 600));
-    }
-
-    const finalVideoActive = isActive(videoBtn);
-    const finalImageActive = imageBtn ? isActive(imageBtn) : false;
-    return {
-      ok: finalVideoActive || !finalImageActive,
-      switched: true,
-      verified_video_active: finalVideoActive,
-      verified_image_active: finalImageActive,
-      debug,
-    };
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Resolution / duration / aspect-ratio toggles — Grok remembers the
-// last-used values per device, so a fresh login generates 480p / 6s
-// videos even when the app config asks for 720p / 10s. We push the
-// requested values onto the composer's toggle row before submit.
-//
-// Returns a summary object so the caller can log what changed.
-// ═══════════════════════════════════════════════════════════════════
-async function grokEnsureMediaSettings(tabId, opts) {
-  return grokExecInTab(tabId, async (args) => {
-    const norm = (s) => (s || "").toLowerCase().trim().replace(/\s+/g, " ");
-    const resWanted = (args.resolution || "").toLowerCase().replace(/\s/g, "");
-    const lenWanted = String(args.video_length || "").toLowerCase().replace(/\s/g, "");
-    // Aspect: app sends "16:9" / "9:16" / "1:1" / "2:3" / "3:2".
-    // We click the dropdown and pick the matching option.
-    const aspectWanted = String(args.aspect_ratio || "").toLowerCase().replace(/\s/g, "");
-
-    const visible = (b) => {
-      try {
-        if (b.offsetParent === null) return false;
-        const r = b.getBoundingClientRect();
-        return r.width > 8 && r.height > 8;
-      } catch { return false; }
-    };
-
-    // Walk into children up to 3 levels deep to find the FIRST element
-    // with a non-transparent background. Tailwind/React UIs commonly
-    // wrap a styled <div> inside a transparent <button>, so reading
-    // the button's own backgroundColor returns rgba(0,0,0,0) even
-    // when the visual button is clearly filled. Returns the OPAQUE
-    // background color string, or null if everything is transparent.
+    // Detect active state via background darkness. Grok's selected
+    // mode pill renders with a dark fill on a lighter parent. We
+    // walk into descendants to find the first opaque background
+    // (the styled fill often lives on a child div, not the button).
     const getEffectiveBg = (el) => {
-      if (!el) return null;
       const isOpaque = (col) => {
         const m = col && col.match(/rgba?\(([^)]+)\)/);
         if (!m) return false;
@@ -556,7 +443,6 @@ async function grokEnsureMediaSettings(tabId, opts) {
       try {
         const own = window.getComputedStyle(el).backgroundColor || "";
         if (isOpaque(own)) return own;
-        // BFS into children up to depth 3
         const queue = [[el, 0]];
         while (queue.length) {
           const [node, depth] = queue.shift();
@@ -574,93 +460,28 @@ async function grokEnsureMediaSettings(tabId, opts) {
       return null;
     };
 
-    const isActive = (b) => {
-      if (!b) return false;
-      if (b.getAttribute("aria-pressed") === "true") return true;
-      if (b.getAttribute("aria-selected") === "true") return true;
-      if (b.getAttribute("aria-current") === "true") return true;
-      const ds = norm(b.getAttribute("data-state"));
-      if (ds === "on" || ds === "active" || ds === "selected" || ds === "checked") return true;
-      const cls = (b.className || "").toString().toLowerCase();
-      if (/(\b|_)(active|selected|on)(\b|_)/.test(cls)) return true;
-      // Visual fallback: opaque dark bg in self-or-children. Crucially,
-      // we EXCLUDE rgba(...,0) — a transparent button-element shouldn't
-      // be classified as active just because its rgb happens to be 0,0,0.
-      const bg = getEffectiveBg(b);
-      if (bg) {
-        const m = bg.match(/rgba?\(([^)]+)\)/);
-        if (m) {
-          const p = m[1].split(",").map((s) => parseFloat(s.trim()));
-          const alpha = p.length === 4 ? p[3] : 1;
-          if (alpha >= 0.5 && p[0] < 60 && p[1] < 60 && p[2] < 60) return true;
-        }
-      }
-      return false;
+    // Compare luma of the two pills — selected has lower (darker) luma.
+    const lumaOf = (el) => {
+      const bg = getEffectiveBg(el);
+      if (!bg) return Infinity;
+      const m = bg.match(/rgba?\(([^)]+)\)/);
+      if (!m) return Infinity;
+      const p = m[1].split(",").map((s) => parseFloat(s.trim()));
+      return (p[0] || 0) + (p[1] || 0) + (p[2] || 0);
     };
 
-    // Token match: find a small toggle pill in the composer footer
-    // whose text/aria/title equals the token exactly (after lowercase
-    // + whitespace strip). Multiple guards prevent matching the
-    // WRONG element (a hidden tooltip, a div elsewhere on the page,
-    // or a list-item in a dropdown menu):
-    //
-    //   1. Element must be in the bottom 50% of the viewport — the
-    //      composer footer always sits near the bottom of the screen
-    //   2. Source text must match EXACTLY (no contains, no partial)
-    //   3. Pick the smallest matching — pills are <60px wide, full
-    //      buttons (e.g., a "10s ⏱ duration" menu item) are larger
-    const composerYThreshold = window.innerHeight * 0.5;
-    const buttonForToken = (token) => {
-      const all = Array.from(
-        document.querySelectorAll('button,[role="button"],[role="tab"],[role="radio"],div[tabindex]:not([tabindex="-1"])')
-      ).filter(visible);
-      const cands = all.filter((b) => {
-        // Position guard: must be in the bottom half of the viewport
-        try {
-          const r = b.getBoundingClientRect();
-          if (r.top < composerYThreshold) return false;
-        } catch { return false; }
-        // Exact match against any of the labels
-        const sources = [
-          b.getAttribute("aria-label"),
-          b.title,
-          b.textContent,
-        ];
-        return sources.some((raw) => {
-          const t = norm(raw).replace(/\s+/g, "");
-          return t === token;
-        });
-      });
-      // Pick the smallest match — toggle pills are typically 50-90px
-      cands.sort((a, b) => {
-        const ar = a.getBoundingClientRect();
-        const br = b.getBoundingClientRect();
-        return ar.width * ar.height - br.width * br.height;
-      });
-      return cands[0] || null;
-    };
+    const videoLuma = lumaOf(videoBtn);
+    const imageLuma = imageBtn ? lumaOf(imageBtn) : Infinity;
+    debug.video_luma = videoLuma === Infinity ? null : videoLuma;
+    debug.image_luma = imageLuma === Infinity ? null : imageLuma;
 
-    // Diagnostic snapshot of a button — included in the result so
-    // the user-facing log can show what we actually matched. Useful
-    // when the visual output disagrees with what we report.
-    const snapshot = (b) => {
-      if (!b) return null;
-      try {
-        const r = b.getBoundingClientRect();
-        const cs = window.getComputedStyle(b);
-        return {
-          tag: (b.tagName || "").toLowerCase(),
-          text: (b.textContent || "").slice(0, 20).trim(),
-          aria: (b.getAttribute("aria-label") || "").slice(0, 20),
-          ariaPressed: b.getAttribute("aria-pressed"),
-          dataState: b.getAttribute("data-state"),
-          bg: (cs.backgroundColor || "").slice(0, 30),
-          x: Math.round(r.x), y: Math.round(r.y),
-          w: Math.round(r.width), h: Math.round(r.height),
-        };
-      } catch { return null; }
-    };
+    // Already on Video? (video pill darker than image by luma>30 margin)
+    if (videoLuma + 30 < imageLuma) {
+      return { ok: true, already_video: true, debug };
+    }
 
+    // Click strategy: native + synthetic. React handlers sometimes
+    // bind to a parent or SVG child, so a single .click() can miss.
     const clickTarget = (el) => {
       try { el.click(); } catch {}
       try {
@@ -671,122 +492,136 @@ async function grokEnsureMediaSettings(tabId, opts) {
         }
       } catch {}
     };
+    clickTarget(videoBtn);
+    await new Promise((r) => setTimeout(r, 600));
 
-    // Compare two paired buttons by background darkness — the "selected"
-    // pill in Grok's radio row is rendered with a darker fill. Use
-    // getEffectiveBg to pierce transparent button wrappers (the
-    // styled fill lives on a child div in the current Grok build).
-    // Returns the "darker" (selected) button or null on tie/failure.
-    const darkerOf = (a, b) => {
-      try {
-        const sumLuma = (el) => {
-          const bg = getEffectiveBg(el);
-          if (!bg) return Infinity; // no opaque bg = unselected pill
-          const m = bg.match(/rgba?\(([^)]+)\)/);
-          if (!m) return Infinity;
-          const p = m[1].split(",").map((s) => parseFloat(s.trim()));
-          // Treat alpha < 0.1 as no-fill (returned by isOpaque check
-          // already, but double-guard here).
-          const alpha = p.length === 4 ? p[3] : 1;
-          if (alpha < 0.1) return Infinity;
-          return (p[0] || 0) + (p[1] || 0) + (p[2] || 0);
-        };
-        const la = sumLuma(a);
-        const lb = sumLuma(b);
-        if (la < lb - 30) return a;
-        if (lb < la - 30) return b;
-        return null; // ambiguous
-      } catch { return null; }
+    // Verify post-click. If image is still darker, retry once.
+    let finalVideoLuma = lumaOf(videoBtn);
+    let finalImageLuma = imageBtn ? lumaOf(imageBtn) : Infinity;
+    if (!(finalVideoLuma + 30 < finalImageLuma) && imageBtn) {
+      clickTarget(videoBtn);
+      await new Promise((r) => setTimeout(r, 600));
+      finalVideoLuma = lumaOf(videoBtn);
+      finalImageLuma = lumaOf(imageBtn);
+    }
+
+    return {
+      ok: true,
+      switched: true,
+      verified_video_active: finalVideoLuma + 30 < finalImageLuma,
+      debug,
+    };
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Resolution / duration / aspect-ratio toggles — Grok remembers the
+// last-used values per device, so a fresh login generates 480p / 6s
+// videos even when the app config asks for 720p / 10s. We push the
+// requested values onto the composer's toggle row before submit.
+//
+// Selector strategy (mirrors competitor's chrome ext + remote config):
+//   - Resolution / duration pills:
+//       button:has(span:contains("720p")), etc.
+//     We find the button containing a <span> whose textContent === token.
+//     Always-click (radio buttons are idempotent on click-already-active).
+//   - Aspect ratio:
+//       Trigger: button whose textContent matches /^\d+:\d+$/ in composer
+//       Popover option: any element whose text contains \d+:\d+ matching
+//
+// We DON'T detect "active" state for pills — instead we click
+// unconditionally because Grok's radio buttons handle re-selection as
+// no-ops. This eliminates the false-positive "(already)" bug from
+// 1.9.x where transparent button bg confused the luma comparison.
+//
+// Returns a summary object so the caller can log what changed.
+// ═══════════════════════════════════════════════════════════════════
+async function grokEnsureMediaSettings(tabId, opts) {
+  return grokExecInTab(tabId, async (args) => {
+    const norm = (s) => (s || "").toLowerCase().trim();
+    const stripWs = (s) => norm(s).replace(/\s+/g, "");
+    const resWanted = stripWs(args.resolution);
+    const lenWanted = stripWs(args.video_length);
+    const aspectWanted = stripWs(args.aspect_ratio);
+
+    const visible = (el) => {
+      if (!el) return false;
+      if (el.offsetParent === null) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4;
     };
 
-    // Set a toggle pair to the wanted token. We get BOTH buttons in
-    // the pair (e.g. "480p" and "720p"), figure out which is currently
-    // selected by comparing their backgrounds, and click the wanted
-    // one if it isn't already selected. Always-click is safe in
-    // theory (radio-row click on already-selected = no-op) but on
-    // some React tab implementations it briefly re-fires the change
-    // handler, which we'd rather avoid mid-dispatch.
-    const setRadioPair = async (wanted, alternative) => {
-      if (!wanted) return { skipped: true };
-      const btnWanted = buttonForToken(wanted);
-      const btnAlt = alternative ? buttonForToken(alternative) : null;
-      if (!btnWanted) return { token: wanted, found: false };
+    // Click via native + synthetic events — React handlers sometimes
+    // bind to a parent or SVG child, so a single .click() on the
+    // wrong target misses. Three event types cover most patterns.
+    const clickTarget = (el) => {
+      try { el.click(); } catch {}
+      for (const type of ["mousedown", "mouseup", "click"]) {
+        try {
+          el.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, view: window, button: 0,
+          }));
+        } catch {}
+      }
+    };
 
-      const dbg = {
-        wanted_snap: snapshot(btnWanted),
-        alt_snap: snapshot(btnAlt),
-      };
-
-      // Decide current state. Priority:
-      //   1. darkerOf(wanted, alternative) — most reliable visual cue
-      //   2. isActive(wanted)             — aria/data convention
-      //   3. !isActive(alternative)       — inverse of the other side
-      let wantedSelected = null;
-      let decisionPath = "unknown";
-      if (btnAlt) {
-        const darker = darkerOf(btnWanted, btnAlt);
-        if (darker) {
-          wantedSelected = (darker === btnWanted);
-          decisionPath = "luma";
+    // ─── Pill finder: button containing a span with EXACT text ───
+    // Mirrors competitor's `button:has(span:contains("720p"))` selector.
+    // We walk all buttons and check their descendant spans because
+    // native CSS `:contains` doesn't exist (it's a jQuery extension).
+    //
+    // Strict equality on the span text (after whitespace strip) prevents
+    // matching things like "10s timer" or "in 720p mode" — only standalone
+    // pill labels match. Position guard restricts to lower half of
+    // viewport (where the composer always sits) to avoid menu items
+    // from a popover above the composer.
+    const composerYThreshold = window.innerHeight * 0.45;
+    const findPillByText = (token) => {
+      const target = stripWs(token);
+      if (!target) return null;
+      const buttons = document.querySelectorAll(
+        'button,[role="button"],[role="radio"]'
+      );
+      for (const b of buttons) {
+        if (!visible(b)) continue;
+        try {
+          const r = b.getBoundingClientRect();
+          if (r.top < composerYThreshold) continue;
+        } catch { continue; }
+        // Check direct span descendants. We also accept the button's
+        // own textContent as a fallback for the case where the label
+        // sits directly in the button (no span wrapper).
+        const spans = b.querySelectorAll("span");
+        let matched = false;
+        for (const s of spans) {
+          if (stripWs(s.textContent) === target) { matched = true; break; }
         }
+        if (!matched && stripWs(b.textContent) === target) matched = true;
+        if (matched) return b;
       }
-      if (wantedSelected === null) {
-        if (isActive(btnWanted)) {
-          wantedSelected = true;
-          decisionPath = "isActive(wanted)";
-        } else if (btnAlt && isActive(btnAlt)) {
-          wantedSelected = false;
-          decisionPath = "!isActive(alt)";
-        }
-      }
-      // If still ambiguous, ASSUME wanted is NOT selected and click —
-      // safer default than assuming it's selected (clicking an
-      // already-selected radio is usually a no-op).
-      if (wantedSelected === null) {
-        wantedSelected = false;
-        decisionPath = "ambiguous_default_click";
-      }
-      dbg.decision = decisionPath;
+      return null;
+    };
 
-      if (wantedSelected === true) {
-        return { token: wanted, found: true, already: true, dbg };
-      }
-
-      // Click. Try wanted button + verify. If verification doesn't
-      // confirm, retry once.
-      clickTarget(btnWanted);
-      await new Promise((r) => setTimeout(r, 500));
-      let verifiedNow = btnAlt ? darkerOf(btnWanted, btnAlt) === btnWanted : isActive(btnWanted);
-      if (!verifiedNow) {
-        clickTarget(btnWanted);
-        await new Promise((r) => setTimeout(r, 500));
-        verifiedNow = btnAlt ? darkerOf(btnWanted, btnAlt) === btnWanted : isActive(btnWanted);
-      }
-      dbg.post_click_wanted = snapshot(btnWanted);
-      dbg.post_click_alt = snapshot(btnAlt);
-      return {
-        token: wanted, found: true, switched: true,
-        verified_active: !!verifiedNow,
-        dbg,
-      };
+    // Setting a pill: simply click it. Grok's radio buttons treat a
+    // click-on-already-selected as a no-op, so we don't need to
+    // detect "active" state — that's where v1.9.x got tangled in
+    // false-positive luma comparisons. Always-click is the
+    // competitor's pattern and it's strictly safer.
+    const clickPill = async (token) => {
+      if (!token) return { skipped: true };
+      const btn = findPillByText(token);
+      if (!btn) return { token, found: false };
+      clickTarget(btn);
+      await new Promise((r) => setTimeout(r, 250));
+      return { token, found: true, switched: true };
     };
 
     // ─── Aspect ratio dropdown ───
-    // The dropdown trigger shows the current value (e.g. "2:3" or
-    // "16:9") with a chevron. Clicking it opens a popover with the
-    // ratio options. Strategy:
-    //   1. Find the trigger button whose text === current ratio shown
-    //      AND is in the composer footer
-    //   2. If trigger's current text already matches wanted, skip
-    //   3. Otherwise click trigger to open popover, then click the
-    //      option whose text === wanted ratio, then click trigger
-    //      again (or click outside) to close
+    // Trigger button's textContent is just the ratio (e.g. "16:9").
+    // Click → popover opens → option element contains "X:Y" possibly
+    // alongside a label word ("16:9 Widescreen") — extract via regex.
     const setAspectRatio = async (wanted) => {
       if (!wanted) return { skipped: true };
-      // Trigger detection: trigger button shows JUST the ratio
-      // (e.g. "2:3", "16:9") in the composer footer with a chevron
-      // icon. Use a trailing-flexible regex: text contains "X:Y" and
-      // is short (<= 8 chars when whitespace stripped, no other words).
       const triggerRe = /^\d+:\d+$/;
       const triggers = Array.from(
         document.querySelectorAll('button,[role="button"],[role="combobox"]')
@@ -796,96 +631,61 @@ async function grokEnsureMediaSettings(tabId, opts) {
           const r = b.getBoundingClientRect();
           if (r.top < composerYThreshold) return false;
         } catch { return false; }
-        const t = norm(b.textContent).replace(/\s+/g, "");
-        return triggerRe.test(t);
+        return triggerRe.test(stripWs(b.textContent));
       });
       if (!triggers.length) return { token: wanted, found: false };
       const trigger = triggers[0];
-      const currentRatio = norm(trigger.textContent).replace(/\s+/g, "");
+      const currentRatio = stripWs(trigger.textContent);
       if (currentRatio === wanted) {
         return { token: wanted, found: true, already: true };
       }
-      // Open the popover
-      try { trigger.click(); } catch {}
-      try {
-        for (const type of ["mousedown", "mouseup", "click"]) {
-          trigger.dispatchEvent(new MouseEvent(type, {
-            bubbles: true, cancelable: true, view: window, button: 0,
-          }));
-        }
-      } catch {}
-      // Bumped from 400ms → 700ms — Grok's popover has a fade-in
-      // animation that can take ~500ms; the option items aren't
-      // visible/measurable until it settles.
+      // Open popover
+      clickTarget(trigger);
       await new Promise((r) => setTimeout(r, 700));
-
-      // Option matching: popover renders items like
-      //   "○ 16:9  Widescreen"
-      //   "● 2:3   Tall"
-      // The leading checkbox/dot character makes a strict startsWith
-      // fail. Instead, EXTRACT any "X:Y" ratio from the option's text
-      // (anywhere) and compare to the wanted token. This survives:
-      //   - Leading bullet/checkbox/dot indicators (○ ● ◯ ▢ etc.)
-      //   - Trailing label words ("Widescreen", "Tall", "Square", ...)
-      //   - Any whitespace / formatting variation
+      // Find option — extract X:Y from text (handles "○ 16:9 Widescreen")
       const optionRe = /(\d+:\d+)/;
-      const options = Array.from(
-        document.querySelectorAll('[role="menuitem"],[role="menuitemradio"],[role="option"],button,[role="button"],li')
-      ).filter((b) => {
-        if (!visible(b)) return false;
-        const t = norm(b.textContent).replace(/\s+/g, "");
-        const m = t.match(optionRe);
+      const opts = Array.from(
+        document.querySelectorAll(
+          '[role="menuitem"],[role="menuitemradio"],[role="option"],button,[role="button"],li'
+        )
+      ).filter((el) => {
+        if (!visible(el)) return false;
+        const m = stripWs(el.textContent).match(optionRe);
         return !!(m && m[1] === wanted);
       });
-      if (!options.length) {
-        // Close popover by clicking trigger again (best-effort).
-        try { trigger.click(); } catch {}
+      if (!opts.length) {
+        clickTarget(trigger); // close popover
         return { token: wanted, found: true, option_not_found: true };
       }
-      // Pick the smallest matching element — for a popover row with
-      // nested spans, the innermost match (the actual clickable row)
-      // is usually smaller than its parent containers.
-      options.sort((a, b) => {
+      // Smallest matching = innermost clickable row
+      opts.sort((a, b) => {
         const ar = a.getBoundingClientRect();
         const br = b.getBoundingClientRect();
         return ar.width * ar.height - br.width * br.height;
       });
-      const opt = options[0];
-      try { opt.click(); } catch {}
-      try {
-        for (const type of ["mousedown", "mouseup", "click"]) {
-          opt.dispatchEvent(new MouseEvent(type, {
-            bubbles: true, cancelable: true, view: window, button: 0,
-          }));
-        }
-      } catch {}
+      clickTarget(opts[0]);
       await new Promise((r) => setTimeout(r, 500));
-      // Verify by re-reading the trigger button's text.
-      const newRatio = norm(trigger.textContent).replace(/\s+/g, "");
+      const newRatio = stripWs(trigger.textContent);
       return {
         token: wanted, found: true, switched: true,
         verified_active: newRatio === wanted,
       };
     };
 
-    // The user's UI ships explicit "480p | 720p" and "6s | 10s" pills
-    // in the composer footer (verified by screenshot). The Speed /
-    // Quality preset path was a misread of an earlier UI variant —
-    // we go straight to per-pill toggles here.
+    // Dispatch in sequence: aspect → resolution → duration. Aspect
+    // first because opening/closing the popover may briefly hide
+    // the resolution/duration pills, so we settle that DOM-altering
+    // step before touching the others.
     const summary = {};
     if (aspectWanted) summary.aspect = await setAspectRatio(aspectWanted);
-    if (resWanted) {
-      const altRes = resWanted === "720p" ? "480p" : (resWanted === "480p" ? "720p" : null);
-      summary.res = await setRadioPair(resWanted, altRes);
-    }
+    if (resWanted)    summary.res    = await clickPill(resWanted);
     if (lenWanted) {
+      // Try with "s" suffix first (matches "6s"/"10s" pills), fall
+      // back to bare number ("6"/"10") if Grok ever drops the suffix.
       const withS = lenWanted.endsWith("s") ? lenWanted : lenWanted + "s";
-      const altLen = withS === "10s" ? "6s" : (withS === "6s" ? "10s" : null);
-      let r = await setRadioPair(withS, altLen);
+      let r = await clickPill(withS);
       if (r && r.found === false) {
-        const bare = lenWanted.replace(/s$/, "");
-        const altBare = bare === "10" ? "6" : (bare === "6" ? "10" : null);
-        r = await setRadioPair(bare, altBare);
+        r = await clickPill(lenWanted.replace(/s$/, ""));
       }
       summary.len = r;
     }
@@ -1027,15 +827,35 @@ async function grokAttachImage(tabId, base64, filename, mime) {
     }
 
     // ─── Wait for the UI to acknowledge the attachment ───
-    // Heuristics: look for a new <img> with blob: URL (thumbnail
-    // preview), an asset URL, or the filename text appearing anywhere
-    // in the composer region. Up to 12 seconds (upload time + UI tick).
+    // Two-stage detection:
+    //   Stage 1: thumbnail preview appears (blob: img, /users/0 asset,
+    //            or filename text) — confirms file was registered.
+    //   Stage 2: upload spinner (.animate-pulse / .animate-spin)
+    //            disappears — confirms server-side upload completed.
+    //   Plus: detect upload failure icon (svg.lucide-triangle-alert)
+    //         and bail early so retry can re-attach a fresh image.
+    //
+    // Stage 2 is critical for grokClickSend's "wait for enable"
+    // poll to find an enabled submit button — if we return before
+    // the spinner clears, the click happens against a still-disabled
+    // button and triggers no_enabled_send_button → retry.
     const startTs = Date.now();
-    const deadline = startTs + 12000;
+    const stage1Deadline = startTs + 12000;
     let attached = false;
     let attachSignal = "";
-    while (Date.now() < deadline) {
+    while (Date.now() < stage1Deadline) {
       await new Promise((r) => setTimeout(r, 400));
+      // Upload-failed icon? Bail early so caller can retry attach.
+      const failIcon = document.querySelector("svg.lucide-triangle-alert");
+      if (failIcon && failIcon.offsetParent !== null) {
+        return {
+          ok: false,
+          strategy,
+          attachSignal: "upload_failed_icon",
+          waited_ms: Date.now() - startTs,
+          fileInputsFound: fileInputs.length,
+        };
+      }
       // 1) Blob-URL preview image (most dropzones create these) — must
       //    be a NEW src not present before the attach call, otherwise
       //    we're looking at a stale thumbnail from a prior job.
@@ -1063,10 +883,46 @@ async function grokAttachImage(tabId, base64, filename, mime) {
       }
     }
 
+    if (!attached) {
+      return {
+        ok: false,
+        strategy,
+        attachSignal: "stage1_timeout",
+        waited_ms: Date.now() - startTs,
+        fileInputsFound: fileInputs.length,
+      };
+    }
+
+    // Stage 2: wait for spinner to clear (upload server-side processing
+    // finished). Up to 20s additional — large reference images may take
+    // a while on slow connections. Failure icon check still applies.
+    const stage2Deadline = Date.now() + 20000;
+    let spinnerCleared = false;
+    while (Date.now() < stage2Deadline) {
+      // Bail if upload failed mid-processing
+      const failIcon = document.querySelector("svg.lucide-triangle-alert");
+      if (failIcon && failIcon.offsetParent !== null) {
+        return {
+          ok: false,
+          strategy,
+          attachSignal: "upload_failed_during_processing",
+          waited_ms: Date.now() - startTs,
+          fileInputsFound: fileInputs.length,
+        };
+      }
+      const spinner = document.querySelector(".animate-pulse, .animate-spin");
+      if (!spinner || spinner.offsetParent === null) {
+        spinnerCleared = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
     return {
-      ok: attached,
+      ok: true,
       strategy,
       attachSignal,
+      spinnerCleared,
       waited_ms: Date.now() - startTs,
       fileInputsFound: fileInputs.length,
     };
@@ -1084,112 +940,113 @@ async function grokClickSend(tabId, prompt) {
     window.__grokAutomationError = "";
     window.__grokAutomationStartedAt = Date.now();
 
-    // ─── Find the prompt input ───
-    // Grok's /imagine may use a <textarea>, a contenteditable div
-    // (ProseMirror / Lexical style), or a text <input>. We try all
-    // three, preferring visible inputs whose placeholder / aria-label
-    // / data-placeholder matches "imagine" or "prompt".
-    const candidates = [];
-    for (const el of document.querySelectorAll("textarea")) {
-      candidates.push({ el, type: "textarea" });
-    }
-    for (const el of document.querySelectorAll('[contenteditable="true"],[contenteditable=""]')) {
-      candidates.push({ el, type: "contenteditable" });
-    }
-    for (const el of document.querySelectorAll('input[type="text"],input:not([type])')) {
-      candidates.push({ el, type: "input" });
-    }
-
-    const visible = candidates.filter(({ el }) => {
-      try {
-        if (el.disabled) return false;
-        if (el.offsetParent === null) return false;
-        const r = el.getBoundingClientRect();
-        return r.width > 40 && r.height > 15;
-      } catch {
-        return false;
+    // ─── Helpers ───
+    const visible = (el) => {
+      if (!el) return false;
+      if (el.offsetParent === null) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4;
+    };
+    const isDisabled = (el) => {
+      if (!el) return true;
+      if (el.disabled === true) return true;
+      if (el.getAttribute("aria-disabled") === "true") return true;
+      if (el.getAttribute("disabled") !== null) return true;
+      return false;
+    };
+    const clickTarget = (el) => {
+      try { el.click(); } catch {}
+      for (const t of ["mousedown", "mouseup", "click"]) {
+        try {
+          el.dispatchEvent(new MouseEvent(t, {
+            bubbles: true, cancelable: true, view: window, button: 0,
+          }));
+        } catch {}
       }
-    });
+    };
 
-    // Score each candidate — prefer placeholder/aria match.
-    const scored = visible.map((c) => {
-      const el = c.el;
-      const ph = (
-        el.placeholder ||
-        el.getAttribute("data-placeholder") ||
-        el.getAttribute("aria-label") ||
-        el.getAttribute("aria-placeholder") ||
-        ""
-      ).toLowerCase();
-      let score = 0;
-      if (/imagine/.test(ph)) score += 10;
-      if (/prompt|type|message|ask/.test(ph)) score += 5;
-      if (c.type === "contenteditable") score += 2;
-      if (c.type === "textarea") score += 1;
-      return { ...c, score, placeholder: ph };
-    });
-    scored.sort((a, b) => b.score - a.score);
-    const chosen = scored[0];
+    // ─── Find the prompt input ───
+    // Preferred selector mirrors competitor's remote config:
+    //   form div[contenteditable='true']  → ProseMirror/Lexical composer
+    //   div[data-testid='drop-ui'] textarea → drop-zone variant
+    // Fall back to any visible contenteditable / textarea / text input.
+    const inputCandidates = [];
+    for (const el of document.querySelectorAll(
+      'form div[contenteditable="true"]'
+    )) inputCandidates.push({ el, type: "contenteditable" });
+    for (const el of document.querySelectorAll(
+      'div[data-testid="drop-ui"] textarea'
+    )) inputCandidates.push({ el, type: "textarea" });
+    for (const el of document.querySelectorAll(
+      '[contenteditable="true"],[contenteditable=""]'
+    )) inputCandidates.push({ el, type: "contenteditable" });
+    for (const el of document.querySelectorAll("textarea")) {
+      inputCandidates.push({ el, type: "textarea" });
+    }
+    for (const el of document.querySelectorAll(
+      'input[type="text"],input:not([type])'
+    )) inputCandidates.push({ el, type: "input" });
 
+    const inputVisible = inputCandidates
+      .filter(({ el }) => {
+        try {
+          if (el.disabled) return false;
+          return visible(el);
+        } catch { return false; }
+      })
+      // Dedupe — we may have hit the same element via multiple selectors
+      .filter((c, i, arr) => arr.findIndex((x) => x.el === c.el) === i);
+
+    const chosen = inputVisible[0];
     if (!chosen) {
       window.__grokAutomationActive = false;
       return {
         error: "no_input_found",
         debug: {
-          totalCandidates: candidates.length,
-          visibleCount: visible.length,
-          sampleTags: candidates.slice(0, 3).map((c) => `${c.type}`).join(","),
+          totalCandidates: inputCandidates.length,
+          visibleCount: inputVisible.length,
         },
       };
     }
-
     const inputEl = chosen.el;
     const inputType = chosen.type;
 
-    // ─── Set the value ───
+    // ─── Set the prompt value ───
     try {
       inputEl.focus();
       if (inputType === "textarea" || inputType === "input") {
         const proto =
           inputType === "textarea" ? HTMLTextAreaElement : HTMLInputElement;
         const setter = Object.getOwnPropertyDescriptor(
-          proto.prototype,
-          "value"
+          proto.prototype, "value"
         ).set;
         setter.call(inputEl, String(args.prompt || ""));
         inputEl.dispatchEvent(new Event("input", { bubbles: true }));
       } else {
-        // contenteditable — clear + insertText via execCommand which
-        // produces a real InputEvent that React/ProseMirror listen to.
-        // This is the robust way to feed text into modern chat inputs.
+        // contenteditable — execCommand insertText fires real InputEvents
+        // that React/ProseMirror listen to. Most robust path for modern
+        // chat composers.
         const sel = window.getSelection();
         const range = document.createRange();
         range.selectNodeContents(inputEl);
         sel.removeAllRanges();
         sel.addRange(range);
+        try { document.execCommand("delete", false); } catch {}
         try {
-          document.execCommand("delete", false);
-        } catch {}
-        try {
-          document.execCommand("insertText", false, String(args.prompt || ""));
+          document.execCommand(
+            "insertText", false, String(args.prompt || "")
+          );
         } catch {
           // Fallback if execCommand is disabled
           inputEl.textContent = String(args.prompt || "");
-          inputEl.dispatchEvent(
-            new InputEvent("beforeinput", {
-              bubbles: true,
-              cancelable: true,
-              inputType: "insertText",
-              data: String(args.prompt || ""),
-            })
-          );
-          inputEl.dispatchEvent(
-            new InputEvent("input", {
-              bubbles: true,
-              inputType: "insertText",
-              data: String(args.prompt || ""),
-            })
-          );
+          inputEl.dispatchEvent(new InputEvent("beforeinput", {
+            bubbles: true, cancelable: true,
+            inputType: "insertText", data: String(args.prompt || ""),
+          }));
+          inputEl.dispatchEvent(new InputEvent("input", {
+            bubbles: true,
+            inputType: "insertText", data: String(args.prompt || ""),
+          }));
         }
       }
     } catch (e) {
@@ -1200,295 +1057,124 @@ async function grokClickSend(tabId, prompt) {
       };
     }
 
-    // Wait longer so React re-renders AND the send button transitions
-    // from disabled (empty composer) to enabled (prompt + optional
-    // attachment). Upload post-processing can take another beat after
-    // the thumbnail appears.
-    await new Promise((r) => setTimeout(r, 1500));
+    // Initial settle — let React re-render with the new prompt value.
+    await new Promise((r) => setTimeout(r, 800));
 
-    // ─── Poll for an ENABLED explicit-match send button ───
-    // Failure mode we're guarding against: Grok's upload post-
-    // processing can leave the send button `disabled` for a few
-    // seconds after the attachment thumbnail appears. If we pick the
-    // button at detection time and it's still disabled, `.click()` is
-    // a no-op and `click_no_effect` fires 25s later.
-    //
-    // Strategy: poll up to 8 seconds for a button whose aria-label /
-    // title is an explicit send-intent AND is not disabled. Once
-    // found, remember it so the scoring pass below picks it as the
-    // winner even if the heuristic wants something else. Polling adds
-    // little latency in the common case — explicit match usually
-    // resolves in the first 400ms check.
-    const SEND_NAMES_EARLY = [
-      "submit", "send", "send message", "create video", "create",
-      "generate", "generate video", "imagine", "imagine it", "go", "post",
-    ];
-    let earlyExplicitSend = null;
-    const earlyDeadline = Date.now() + 8000;
-    while (Date.now() < earlyDeadline) {
-      const all = document.querySelectorAll(
-        'button,[role="button"],div[tabindex]:not([tabindex="-1"])'
+    // ─── Wait for upload spinners to clear ───
+    // If a reference image was attached, Grok shows .animate-pulse /
+    // .animate-spin while server-side processing runs. The send
+    // button stays disabled during that window. Polling here
+    // explicitly is much more direct than the old 8s heuristic poll.
+    const uploadDeadline = Date.now() + 20000;
+    while (Date.now() < uploadDeadline) {
+      const spinner = document.querySelector(
+        ".animate-pulse, .animate-spin"
       );
-      for (const b of all) {
-        if (
-          b.disabled ||
-          b.getAttribute("aria-disabled") === "true" ||
-          b.getAttribute("disabled") !== null
-        ) continue;
-        try {
-          if (b.offsetParent === null) continue;
-          const r = b.getBoundingClientRect();
-          if (r.width < 8 || r.height < 8) continue;
-        } catch { continue; }
-        const a = (b.getAttribute("aria-label") || "").toLowerCase().trim();
-        const t = (b.title || "").toLowerCase().trim();
-        if (!a && !t) continue;
-        if (SEND_NAMES_EARLY.includes(a) || SEND_NAMES_EARLY.includes(t)) {
-          earlyExplicitSend = b;
-          break;
-        }
-      }
-      if (earlyExplicitSend) break;
-      await new Promise((r) => setTimeout(r, 400));
+      if (!spinner || !visible(spinner)) break;
+      await new Promise((r) => setTimeout(r, 250));
     }
 
-    // ─── Find the send button ───
-    // Grok's /imagine composer has many buttons clustered near the
-    // input: "+ upload", "Image/Video" mode toggle, "480p/720p"
-    // resolution, "6s/10s" duration, aspect ratio picker, and the
-    // send arrow (rightmost). Earlier versions picked the last SVG
-    // button in DOM order — that turned out to be the "Video" mode
-    // toggle, not the send arrow, because mode toggles appear AFTER
-    // the send button in source order on some layouts.
-    //
-    // Better strategy: score every enabled button in the composer
-    // region by likelihood of being the SEND button.
-    const scope =
-      inputEl.closest("form") ||
-      inputEl.closest("[class*='chat']") ||
-      inputEl.closest("[class*='compose']") ||
-      inputEl.parentElement?.parentElement?.parentElement?.parentElement ||
-      document.body;
-
-    // Widen the candidate pool. Include <button>, divs with role=button
-    // (Grok's composer may use either), and also disabled buttons so we
-    // can SEE them in debug — they're penalized but visible, which
-    // turned out to matter when the real send button was disabled at
-    // detection time on earlier runs.
-    const btnSelector =
-      'button,[role="button"],div[tabindex]:not([tabindex="-1"])';
-    const allBtnsRaw = Array.from(scope.querySelectorAll(btnSelector));
-    const inputRect = inputEl.getBoundingClientRect();
-    const docBtnsRaw = Array.from(document.querySelectorAll(btnSelector));
-    const nearbyBtns = docBtnsRaw.filter((b) => {
-      try {
-        const r = b.getBoundingClientRect();
-        return (
-          Math.abs(r.top - inputRect.top) < 300 ||
-          Math.abs(r.bottom - inputRect.bottom) < 300
-        );
-      } catch {
-        return false;
-      }
-    });
-    const btnsUnique = Array.from(new Set([...allBtnsRaw, ...nearbyBtns]));
-
-    // ─── Priority pass: explicit aria-label match ───
-    // If any element's aria-label / title is EXACTLY one of these
-    // send-intent names, prefer it immediately (unless disabled).
-    // This short-circuits the scoring and handles the case where the
-    // heuristics get confused by a cluster of icon-only action
-    // buttons (Save/Share/Download) near the composer.
-    const SEND_INTENT_NAMES = [
-      "submit",
-      "send",
-      "send message",
-      "create video",
-      "create",
-      "generate",
-      "generate video",
-      "imagine",
-      "imagine it",
-      "go",
-      "post",
-    ];
-    // Prefer the enabled explicit-match button we found by polling
-    // above — it's already been verified as visible, non-disabled, and
-    // explicitly labeled. If that poll didn't find anything (e.g.
-    // button stayed disabled), fall back to a single-shot scan here.
-    let explicitSend = earlyExplicitSend || null;
-    if (!explicitSend) {
-      for (const b of btnsUnique) {
-        if (
-          b.disabled ||
-          b.getAttribute("aria-disabled") === "true" ||
-          b.getAttribute("disabled") !== null
-        )
-          continue;
-        const a = (b.getAttribute("aria-label") || "").toLowerCase().trim();
-        const t = (b.title || "").toLowerCase().trim();
-        if (!a && !t) continue;
-        if (SEND_INTENT_NAMES.includes(a) || SEND_INTENT_NAMES.includes(t)) {
-          explicitSend = b;
-          break;
-        }
-      }
-    }
-
-    const MODE_TOKENS = /\b(image|video|photo|audio|480p|720p|1080p|4k|\d+s\b|6s|10s|\d+:\d+|ratio|square|landscape|portrait|widescreen|vertical|horizontal)\b/i;
-
-    // Strong negatives — buttons whose label matches any of these are
-    // definitely NOT the send button. Dropped word-boundary suffix so
-    // "saved", "saving", "liked", "sharing", "downloaded" etc. ALSO
-    // match (1.8.2's \b...\b let "saved" sneak through as the winner).
-    const NOT_SEND_TOKENS =
-      /\b(sav|bookmark|favorit|heart|lik|shar|download|cop|past|edit|renam|delet|remov|trash|cancel|clos|dismiss|setting|option|menu|more|help|info|profil|account|login|logout|sign|register|feedback|language|locale|theme|dark|light|attach|upload|file|pick|choose|brows|preview|fullscreen|mute|play|paus|stop|back|forward|next|prev|retry|refresh|reload|expand|collaps|sidebar|drawer|toggle|avatar|notification|noti)[a-z]*\b/i;
-
-    const scoredBtns = btnsUnique.map((b) => {
-      const text = (b.textContent || "").trim();
-      const ariaLabel = (b.getAttribute("aria-label") || "").toLowerCase();
-      const title = (b.title || "").toLowerCase();
-      const hasSvg = !!b.querySelector("svg");
-      const type = (b.getAttribute("type") || "").toLowerCase();
-      const isDisabled =
-        b.disabled === true ||
-        b.getAttribute("aria-disabled") === "true" ||
-        b.getAttribute("disabled") !== null;
-      let rect = { right: 0, bottom: 0, width: 0, height: 0 };
-      try { rect = b.getBoundingClientRect(); } catch {}
-
-      let score = 0;
-      if (type === "submit") score += 25;
-      // Disabled penalty (include for visibility but rarely click)
-      if (isDisabled) score -= 35;
-
-      const combinedLabel = ariaLabel + " " + title + " " + text.toLowerCase();
-      // Strong reward for explicit send/submit/generate labels
-      if (/\b(send|submit|generate|create|imagine|post|enter)\b/.test(combinedLabel)) {
-        score += 30;
-      }
-      // STRONG negative for obvious non-send action labels — this is
-      // the fix for 1.8.1 picking "Save" on the image-attached UI.
-      if (NOT_SEND_TOKENS.test(combinedLabel)) {
-        score -= 50;
-      }
-      // Icon-only button (no text, has SVG) is VERY likely the send
-      // arrow in a modern chat composer — bump the reward so it beats
-      // any random "Submit" text button elsewhere on the page.
-      if (hasSvg && text.length === 0) score += 25;
-      if (text.length > 0) {
-        if (MODE_TOKENS.test(text)) score -= 40;
-        else score -= 3;
-      }
-      if (MODE_TOKENS.test(combinedLabel)) score -= 40;
-      score += ((rect.right || 0) / Math.max(1, window.innerWidth)) * 5;
-      if (rect.width > 0 && rect.width < 60 && rect.height < 60 && hasSvg && text.length === 0) {
-        score += 10; // was +3 — small icon in composer is very diagnostic
-      }
-      if (rect.width < 16 || rect.height < 16) score -= 50;
-
-      // STRONG reward for being on the same horizontal row as the input
-      // AND to its right — that's exactly where the send arrow lives
-      // in a chat composer. Previously +8; a "Submit" text button
-      // elsewhere on the page with +30 label match could still beat
-      // the real send. Bumping to +20 puts the composer-row icon
-      // firmly ahead.
-      let inComposerRow = false;
-      try {
-        const inputCenterY = (inputRect.top + inputRect.bottom) / 2;
-        const btnCenterY = (rect.top + rect.bottom) / 2;
-        if (Math.abs(inputCenterY - btnCenterY) < 60 && rect.left >= inputRect.left) {
-          score += 20;
-          inComposerRow = true;
-        }
-      } catch {}
-
-      // Extra "this is almost certainly the send" signal: icon-only
-      // AND in the composer row. Real send buttons always tick both.
-      if (inComposerRow && hasSvg && text.length === 0) {
-        score += 15;
-      }
-
-      return { btn: b, score, text, ariaLabel, title, hasSvg, type, rect };
-    });
-
-    scoredBtns.sort((a, b) => b.score - a.score);
-
-    // Debug: show top-8 (not 5) + also include tag + disabled info so
-    // we can see if the real send button was in the pool but disabled.
-    const topCandidates = scoredBtns.slice(0, 8).map((s) => ({
-      text: s.text.slice(0, 30),
-      ariaLabel: s.ariaLabel.slice(0, 30),
-      score: Math.round(s.score * 10) / 10,
-      hasSvg: s.hasSvg,
-      tag: s.btn.tagName.toLowerCase(),
-      pos: `${Math.round(s.rect.right)},${Math.round(s.rect.bottom)}`,
-    }));
-
-    // Winner selection: explicit aria-label match wins (if the priority
-    // pass found one — that pass already filtered out disabled). For
-    // the heuristic fallback we hard-skip disabled candidates AND
-    // require a confidence threshold:
-    //
-    //   - A disabled .click() is a no-op (25s of click_no_effect waste
-    //     before the retry path runs), so disabled is auto-rejected.
-    //   - Even among enabled buttons, if the top score is too low
-    //     (<70) it means the real send is disabled and only misc
-    //     buttons (Save, example-prompt suggestions like "Cuddle a
-    //     Squirrel", aspect-ratio toggle, etc.) are competing for top
-    //     spot. Clicking those would dispatch the wrong action.
-    //
-    // Failing fast with no_enabled_send_button surfaces straight to
-    // the upstream retry path which bounces to /imagine and retries
-    // — by then Grok's server-side upload has finished and the real
-    // send button is enabled, so the explicit-match polling catches
-    // it on the next attempt.
-    const HEURISTIC_MIN_SCORE = 70;
-    const enabledHeuristicWinner = scoredBtns.find((s) => {
-      const b = s.btn;
-      if (!b) return false;
-      if (b.disabled === true) return false;
-      if (b.getAttribute("aria-disabled") === "true") return false;
-      if (b.getAttribute("disabled") !== null) return false;
-      return true;
-    });
-    const heuristicScore = enabledHeuristicWinner?.score ?? 0;
-    const heuristicConfident = heuristicScore >= HEURISTIC_MIN_SCORE;
-    const sendBtn = explicitSend
-      || (heuristicConfident ? enabledHeuristicWinner.btn : null);
-
-    if (!sendBtn) {
+    // ─── Detect upload failures ───
+    // Grok renders a triangle-alert icon when an upload fails. If we
+    // see one, the composer state is bad — bail so upstream retry
+    // can re-attach (and our 1.9.8 force-reload wipes the failed
+    // attachment first).
+    const failedIcon = document.querySelector("svg.lucide-triangle-alert");
+    if (failedIcon && visible(failedIcon)) {
       window.__grokAutomationActive = false;
       return {
-        error: "no_enabled_send_button",
+        error: "upload_failed",
+        debug: { icon_visible: true },
+      };
+    }
+
+    // ─── Find the Submit button by SVG arrow path ───
+    // The send icon is a Lucide-style up-arrow. Its <path> d-attribute
+    // is the GEOMETRY of the arrow — it survives className refactors,
+    // aria-label changes, theme switches, and React component
+    // reorganization. Only an actual icon redesign would change this
+    // string. Path: "M6 11L12 5M12 5L18 11M12 5V19".
+    //
+    // Compared to v1.9.x heuristic scoring (which broke ~weekly when
+    // class names rebuilt), this is ~10x more stable.
+    const SUBMIT_ICON_PATH = "M6 11L12 5M12 5L18 11M12 5V19";
+
+    const findSubmitButton = () => {
+      const paths = document.querySelectorAll(
+        `path[d="${SUBMIT_ICON_PATH}"]`
+      );
+      for (const p of paths) {
+        let el = p;
+        // Walk up to enclosing button (max 6 levels)
+        for (let i = 0; i < 6 && el; i++) {
+          if (el.tagName === "BUTTON") break;
+          el = el.parentElement;
+        }
+        if (el && el.tagName === "BUTTON" && visible(el)) return el;
+      }
+      return null;
+    };
+
+    let submitBtn = findSubmitButton();
+    if (!submitBtn) {
+      window.__grokAutomationActive = false;
+      // no_send_button_found triggers upstream retry — same as
+      // no_enabled_send_button. Distinct error code helps debug.
+      return {
+        error: "no_send_button_found",
         debug: {
+          svg_paths_total: document.querySelectorAll("path").length,
+          submit_path_count:
+            document.querySelectorAll(`path[d="${SUBMIT_ICON_PATH}"]`).length,
           inputType,
-          inputPlaceholder: chosen.placeholder,
-          scopeTag: scope?.tagName,
-          buttonsInScope: allBtns.length,
-          nearbyCount: nearbyBtns.length,
-          allDisabled: scoredBtns.length > 0 && !enabledHeuristicWinner,
-          lowConfidence: !!enabledHeuristicWinner && !heuristicConfident,
-          bestEnabledScore: heuristicScore,
-          topCandidates,
+          uploadDidComplete: !document.querySelector(
+            ".animate-pulse, .animate-spin"
+          ),
         },
       };
     }
 
-    sendBtn.click();
+    // ─── Wait for submit button to ENABLE ───
+    // After upload completes, Grok briefly keeps the button disabled
+    // while React processes state. Poll up to 8s for the disabled
+    // attribute to clear.
+    const enableDeadline = Date.now() + 8000;
+    while (Date.now() < enableDeadline) {
+      submitBtn = findSubmitButton() || submitBtn;
+      if (!isDisabled(submitBtn)) break;
+      await new Promise((r) => setTimeout(r, 300));
+    }
 
-    const label =
-      sendBtn.getAttribute("aria-label") ||
-      sendBtn.title ||
-      sendBtn.textContent.trim().slice(0, 40) ||
-      "svg-btn";
+    if (isDisabled(submitBtn)) {
+      window.__grokAutomationActive = false;
+      // no_enabled_send_button is the canonical "transient" error —
+      // upstream retry will bounce the composer and try again.
+      return {
+        error: "no_enabled_send_button",
+        debug: {
+          ariaLabel: submitBtn.getAttribute("aria-label") || "",
+          ariaDisabled: submitBtn.getAttribute("aria-disabled") || "",
+          disabledAttr: submitBtn.hasAttribute("disabled"),
+          uploadStillRunning: !!document.querySelector(
+            ".animate-pulse, .animate-spin"
+          ),
+        },
+      };
+    }
+
+    // ─── Click ───
+    clickTarget(submitBtn);
+
     return {
       ok: true,
       inputType,
-      buttonLabel: label,
-      buttonScore: explicitSend ? 999 : heuristicScore,
-      explicitMatch: !!explicitSend,
-      topCandidates,
+      buttonLabel:
+        submitBtn.getAttribute("aria-label") ||
+        submitBtn.title ||
+        "svg-submit-arrow",
+      buttonScore: 999,        // SVG-path match = high confidence
+      explicitMatch: true,     // for upstream logging compatibility
+      topCandidates: [],       // no scoring pass — empty for log compat
     };
   }, { prompt });
 }
