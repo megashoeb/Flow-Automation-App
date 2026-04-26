@@ -893,10 +893,37 @@ async function grokAttachImage(tabId, base64, filename, mime) {
       };
     }
 
-    // Stage 2: wait for spinner to clear (upload server-side processing
-    // finished). Up to 20s additional — large reference images may take
-    // a while on slow connections. Failure icon check still applies.
-    const stage2Deadline = Date.now() + 20000;
+    // Stage 2: wait for COMPOSER spinner to clear (upload server-side
+    // processing finished). Up to 12s additional — large reference
+    // images may take a while on slow connections. Failure icon
+    // check still applies.
+    //
+    // SCOPED selector: only spinners in the bottom half of the viewport
+    // (composer footer area). Without this scope, stray .animate-pulse
+    // elements elsewhere on the page (recent-generations sidebar,
+    // skeleton loaders, mode-switch transitions, etc.) keep this loop
+    // running its full budget on every dispatch and add ~20s of dead
+    // time per submit. The competitor's config uses `span.animate-pulse,
+    // div.animate-spin` which is more specific — we further scope by
+    // viewport position to avoid the recent-generations pulse.
+    const composerYThreshold = window.innerHeight * 0.45;
+    const findComposerSpinner = () => {
+      const spinners = document.querySelectorAll(
+        "span.animate-pulse, div.animate-spin"
+      );
+      for (const s of spinners) {
+        if (s.offsetParent === null) continue;
+        try {
+          const r = s.getBoundingClientRect();
+          if (r.top < composerYThreshold) continue;
+          if (r.width < 4 || r.height < 4) continue;
+          return s;
+        } catch {}
+      }
+      return null;
+    };
+
+    const stage2Deadline = Date.now() + 12000;
     let spinnerCleared = false;
     while (Date.now() < stage2Deadline) {
       // Bail if upload failed mid-processing
@@ -910,12 +937,11 @@ async function grokAttachImage(tabId, base64, filename, mime) {
           fileInputsFound: fileInputs.length,
         };
       }
-      const spinner = document.querySelector(".animate-pulse, .animate-spin");
-      if (!spinner || spinner.offsetParent === null) {
+      if (!findComposerSpinner()) {
         spinnerCleared = true;
         break;
       }
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 200));
     }
 
     return {
@@ -1058,21 +1084,24 @@ async function grokClickSend(tabId, prompt) {
     }
 
     // Initial settle — let React re-render with the new prompt value.
-    await new Promise((r) => setTimeout(r, 800));
+    // 400ms is plenty (React commits in <16ms typically; the extra
+    // budget covers slow systems). Was 1500ms in v1.9.x.
+    await new Promise((r) => setTimeout(r, 400));
 
-    // ─── Wait for upload spinners to clear ───
-    // If a reference image was attached, Grok shows .animate-pulse /
-    // .animate-spin while server-side processing runs. The send
-    // button stays disabled during that window. Polling here
-    // explicitly is much more direct than the old 8s heuristic poll.
-    const uploadDeadline = Date.now() + 20000;
-    while (Date.now() < uploadDeadline) {
-      const spinner = document.querySelector(
-        ".animate-pulse, .animate-spin"
-      );
-      if (!spinner || !visible(spinner)) break;
-      await new Promise((r) => setTimeout(r, 250));
-    }
+    // NOTE: spinner-clear wait was REMOVED here in v2.0.1 because:
+    //   1) grokAttachImage Stage 2 already waits for spinner to clear
+    //      before returning, so by the time we get here the upload is
+    //      done. Re-checking is redundant.
+    //   2) The selector ".animate-pulse, .animate-spin" matches MANY
+    //      unrelated elements on Grok's page (loading skeletons in
+    //      the recent-generations sidebar, typing indicators, etc.).
+    //      A stray pulse element kept this loop running its full 20s
+    //      budget on every dispatch — visible as the "delay between
+    //      attach and submit" the user reported on v2.0.0.
+    //
+    // For text-only mode (no attach), there's no upload spinner to
+    // wait for at all. The submit-button-enable poll below handles
+    // any remaining "still warming up" cases.
 
     // ─── Detect upload failures ───
     // Grok renders a triangle-alert icon when an upload fails. If we
