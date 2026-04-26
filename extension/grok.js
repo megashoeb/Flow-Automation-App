@@ -480,17 +480,29 @@ async function grokEnsureVideoMode(tabId) {
       return { ok: true, already_video: true, debug };
     }
 
-    // Click strategy: native + synthetic. React handlers sometimes
-    // bind to a parent or SVG child, so a single .click() can miss.
+    // Click strategy: native + synthetic, including PointerEvents.
+    // Radix UI components (Grok uses Radix DropdownMenu / RadioGroup)
+    // listen to onPointerDown rather than onClick for opening
+    // dropdowns and toggling selections. Without firing
+    // pointerdown/pointerup, Radix triggers stay closed even though
+    // the button looks clicked. mousedown/mouseup/click cover
+    // non-Radix React handlers — fire all five for portability.
     const clickTarget = (el) => {
       try { el.click(); } catch {}
-      try {
-        for (const type of ["mousedown", "mouseup", "click"]) {
-          el.dispatchEvent(new MouseEvent(type, {
-            bubbles: true, cancelable: true, view: window, button: 0,
-          }));
-        }
-      } catch {}
+      const order = ["pointerdown", "pointerup", "mousedown", "mouseup", "click"];
+      for (const type of order) {
+        try {
+          const isPointer = type.startsWith("pointer");
+          const Ctor = isPointer && typeof PointerEvent !== "undefined"
+            ? PointerEvent : MouseEvent;
+          const init = {
+            bubbles: true, cancelable: true, view: window,
+            button: 0, buttons: type.endsWith("up") ? 0 : 1,
+          };
+          if (isPointer) { init.pointerId = 1; init.pointerType = "mouse"; init.isPrimary = true; }
+          el.dispatchEvent(new Ctor(type, init));
+        } catch {}
+      }
     };
     clickTarget(videoBtn);
     await new Promise((r) => setTimeout(r, 600));
@@ -553,14 +565,25 @@ async function grokEnsureMediaSettings(tabId, opts) {
 
     // Click via native + synthetic events — React handlers sometimes
     // bind to a parent or SVG child, so a single .click() on the
-    // wrong target misses. Three event types cover most patterns.
+    // wrong target misses. The aspect ratio dropdown is Radix UI's
+    // DropdownMenu — its trigger uses onPointerDown (not onClick) to
+    // open. Firing pointerdown/pointerup before mouse events makes
+    // Radix dropdowns open reliably. Five-event sequence covers both
+    // Radix and non-Radix patterns.
     const clickTarget = (el) => {
       try { el.click(); } catch {}
-      for (const type of ["mousedown", "mouseup", "click"]) {
+      const order = ["pointerdown", "pointerup", "mousedown", "mouseup", "click"];
+      for (const type of order) {
         try {
-          el.dispatchEvent(new MouseEvent(type, {
-            bubbles: true, cancelable: true, view: window, button: 0,
-          }));
+          const isPointer = type.startsWith("pointer");
+          const Ctor = isPointer && typeof PointerEvent !== "undefined"
+            ? PointerEvent : MouseEvent;
+          const init = {
+            bubbles: true, cancelable: true, view: window,
+            button: 0, buttons: type.endsWith("up") ? 0 : 1,
+          };
+          if (isPointer) { init.pointerId = 1; init.pointerType = "mouse"; init.isPrimary = true; }
+          el.dispatchEvent(new Ctor(type, init));
         } catch {}
       }
     };
@@ -980,13 +1003,22 @@ async function grokClickSend(tabId, prompt) {
       if (el.getAttribute("disabled") !== null) return true;
       return false;
     };
+    // Five-event click sequence (see grokEnsureMediaSettings for why).
+    // Includes pointer events for Radix UI components.
     const clickTarget = (el) => {
       try { el.click(); } catch {}
-      for (const t of ["mousedown", "mouseup", "click"]) {
+      const order = ["pointerdown", "pointerup", "mousedown", "mouseup", "click"];
+      for (const t of order) {
         try {
-          el.dispatchEvent(new MouseEvent(t, {
-            bubbles: true, cancelable: true, view: window, button: 0,
-          }));
+          const isPointer = t.startsWith("pointer");
+          const Ctor = isPointer && typeof PointerEvent !== "undefined"
+            ? PointerEvent : MouseEvent;
+          const init = {
+            bubbles: true, cancelable: true, view: window,
+            button: 0, buttons: t.endsWith("up") ? 0 : 1,
+          };
+          if (isPointer) { init.pointerId = 1; init.pointerType = "mouse"; init.isPrimary = true; }
+          el.dispatchEvent(new Ctor(t, init));
         } catch {}
       }
     };
