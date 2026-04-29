@@ -765,6 +765,21 @@ async function grokAttachImage(tabId, base64, filename, mime) {
         )
     );
 
+    // ─── Wait for file input to appear (newly-connected tab) ───
+    // On a freshly-opened account tab the composer DOM may not have
+    // mounted its hidden <input type="file"> yet by the time we get
+    // here. Without a wait we'd snapshot zero inputs, fall through to
+    // the (also unrendered) drop target, and emit image_attach_failed.
+    // Poll for up to 5s — once any file input materialises we proceed
+    // with the normal targeting logic below. If the budget elapses
+    // without one appearing we still try the drop fallback so this
+    // change is strictly additive.
+    const inputDeadline = Date.now() + 5000;
+    while (Date.now() < inputDeadline) {
+      if (document.querySelectorAll('input[type="file"]').length > 0) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
     // ─── Strategy 1: hidden <input type="file"> ───
     const fileInputs = Array.from(
       document.querySelectorAll('input[type="file"]')
@@ -1769,7 +1784,7 @@ async function grokHandleWork(work) {
         );
       } else if (modeResult?.no_video_btn) {
         const dbg = modeResult.debug
-          ? `scanned=${modeResult.debug.total_buttons_scanned}, video_cands=${modeResult.debug.video_candidates}, image_cands=${modeResult.debug.image_candidates}`
+          ? `paths=${modeResult.debug.total_paths}, btns=${modeResult.debug.total_buttons}, video_found=${modeResult.debug.video_found}, image_found=${modeResult.debug.image_found}`
           : "no_debug";
         await grokReportProgress(
           request_id, "mode_video_warn",
